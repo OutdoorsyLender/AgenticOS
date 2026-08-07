@@ -1,0 +1,86 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Virtual environments ---
+.venv/
+venv/
+
+# --- AgenticOS runtime (never belongs in the public repo) ---
+.agenticos/
+runtime/
+.runtime/
+state/
+data/
+evidence/
+sessions/
+transcripts/
+approvals/
+incidents/
+artifacts/
+worktrees/
+.worktrees/
+quarantine/
+logs/
+*.jsonl
+*.ndjson
+
+# --- Databases, journals, locks, pids ---
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.wal
+*.shm
+*.pid
+*.lock
+
+# --- Provider state accidentally created in the project ---
+.claude/
+.codex/
+.kimi-code/
+.kimi/
+.gemini/
+.antigravity/
+antigravity/
+
+# --- Credential and secret artifacts ---
+.env
+.env.*
+!.env.example
+*.local
+config.local.*
+settings.local.*
+auth.json
+credentials.json
+cookies.json
+token.json
+tokens.json
+oauth.json
+session*.json
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# --- Research/input artifacts (local-only unless explicitly authorized) ---
+deep-research-report*.md
+
+# --- Editors and operating systems ---
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,20 @@
+[project]
+name = "agenticos"
+version = "0.1.0"
+description = "AgenticOS Phase Zero — synthetic hostile-worker + sandbox conformance harness"
+requires-python = ">=3.12"
+# Runtime code is standard-library only. Do not add runtime dependencies here.
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "jsonschema>=4.20,<5",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "cgroup_linux: integration tests requiring Linux cgroup v2 + systemd user scopes (run inside Ubuntu WSL2)",
+]
