@@ -100,6 +100,7 @@ def test_full_run_against_default_policy_covers_catalog(layout, fixture_env):
     policy = default_policy()
     expected_ids = {
         "FS-01", "FS-02", "FS-03", "FS-04", "FS-05",
+        "FS-06", "FS-07", "FS-08", "FS-09", "FS-10", "FS-11",
         "ENV-01", "ENV-02",
         "PROC-01", "PROC-02", "PROC-03", "PROC-04", "PROC-05",
         "PROC-06", "PROC-07", "PROC-08",

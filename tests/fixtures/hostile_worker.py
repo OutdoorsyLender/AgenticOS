@@ -584,6 +584,135 @@ def scenario_new_process_group_child(scenario_id: str, args: argparse.Namespace)
         )
 
 
+def scenario_symlink_write(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """FS-06: write THROUGH a symlink (target = symlink pointing at a denied file)."""
+    return scenario_file_write(scenario_id, args)
+
+
+def scenario_rename_across_boundary(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """FS-07: move a denied file (--target) into the workspace (--base)."""
+    started = utc_now_iso()
+    dest = os.path.join(args.base, os.path.basename(args.target))
+    try:
+        os.rename(args.target, dest)
+        return make_result(
+            scenario_id, args.target, started, succeeded=True,
+            details={"source": args.target, "destination": dest},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id, args.target, started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+            details={"source": args.target, "destination": dest,
+                     "errno": getattr(exc, "errno", None)},
+        )
+
+
+def scenario_preopened_fd(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """FS-08: read a denied resource via an INHERITED pre-opened file
+    descriptor (--target = fd number). For contrast, also attempts a path
+    open of --base. Path restrictions cannot revoke already-open FDs."""
+    started = utc_now_iso()
+    details: dict[str, Any] = {}
+    if args.base:
+        try:
+            with open(args.base, "rb") as fh:
+                path_data = fh.read()
+            details["path_opened"] = True
+            details["path_canary_found"] = bool(CANARY_RE.search(
+                path_data.decode("utf-8", errors="replace")))
+        except Exception as exc:  # noqa: BLE001
+            details["path_opened"] = False
+            details["path_error"] = type(exc).__name__
+    try:
+        data = os.read(int(args.target), 65536)
+        text = data.decode("utf-8", errors="replace")
+        details.update({"fd_read": True, "fd_bytes": len(data)})
+        details.update({f"fd_{k}": v for k, v in _canary_details(text).items()})
+        return make_result(scenario_id, args.target, started, succeeded=True,
+                           details=details)
+    except Exception as exc:  # noqa: BLE001
+        details["fd_read"] = False
+        return make_result(scenario_id, args.target, started, succeeded=False,
+                           error_type=type(exc).__name__, error_message=str(exc),
+                           details=details)
+
+
+def scenario_descendant_denied_read(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """FS-09: a DESCENDANT attempts to read the denied file (--target).
+    --base selects the descendant shape: child | grandchild | setsid |
+    doublefork. The descendant records its observation to a result file in
+    the cwd; ``succeeded`` means the descendant actually read the denied
+    content (i.e. the restriction was NOT inherited)."""
+    started = utc_now_iso()
+    mode = (args.base or "child").strip()
+    target = args.target
+    result_file = os.path.join(os.getcwd(), f"fs09-{mode}-result.json")
+    attempt = (
+        "import json\n"
+        f"try:\n"
+        f"    d = open({target!r}, 'rb').read()\n"
+        f"    r = {{'opened': True, 'canary_found': 'AOS_CANARY_' in d.decode('utf-8','replace')}}\n"
+        f"except Exception as e:\n"
+        f"    r = {{'opened': False, 'error': type(e).__name__, 'errno': getattr(e, 'errno', None)}}\n"
+        f"open({result_file!r}, 'w').write(json.dumps(r))\n"
+    )
+    runners = {
+        "child": attempt,
+        "grandchild": (
+            "import subprocess, sys\n"
+            f"subprocess.run([sys.executable, '-c', {attempt!r}])\n"
+        ),
+        "setsid": (
+            "import os, subprocess, sys\n"
+            "os.setsid()\n"
+            f"subprocess.run([sys.executable, '-c', {attempt!r}])\n"
+        ),
+        "doublefork": (
+            "import os, subprocess, sys\n"
+            "if os.fork() > 0:\n"
+            "    os._exit(0)\n"
+            "os.setsid()\n"
+            "if os.fork() > 0:\n"
+            "    os._exit(0)\n"
+            f"subprocess.run([sys.executable, '-c', {attempt!r}])\n"
+        ),
+    }
+    if mode not in runners:
+        return make_result(scenario_id, target, started, attempted=False,
+                           succeeded=False, error_type="ValueError",
+                           error_message=f"unknown mode {mode!r}")
+    if mode == "doublefork" and not hasattr(os, "fork"):
+        return make_result(scenario_id, target, started, succeeded=False,
+                           error_type="Unsupported",
+                           error_message="os.fork not available on this platform")
+    try:
+        if os.path.exists(result_file):
+            os.unlink(result_file)
+        subprocess.Popen([sys.executable, "-c", runners[mode]],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 15.0
+        while not os.path.exists(result_file) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not os.path.exists(result_file):
+            raise RuntimeError(f"descendant ({mode}) never wrote its result file")
+        with open(result_file) as fh:
+            observation = json.load(fh)
+        return make_result(
+            scenario_id, target, started,
+            succeeded=bool(observation.get("opened")),
+            error_type=None if observation.get("opened") else observation.get("error"),
+            details={"mode": mode, "descendant_opened": bool(observation.get("opened")),
+                     "descendant_error": observation.get("error"),
+                     "descendant_errno": observation.get("errno"),
+                     "descendant_canary_found": observation.get("canary_found", False)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(scenario_id, target, started, succeeded=False,
+                           error_type=type(exc).__name__, error_message=str(exc),
+                           details={"mode": mode})
+
+
 # --------------------------------------------------------------------------
 # Network / socket scenarios (fixture-controlled local endpoints only)
 # --------------------------------------------------------------------------
@@ -657,6 +786,18 @@ SCENARIOS: dict[str, dict[str, Any]] = {
               "description": "Attempt ../ traversal toward a synthetic denied area."},
     "FS-05": {"handler": scenario_file_read, "needs": ("target",),
               "description": "Attempt symlink traversal toward a synthetic denied file."},
+    "FS-06": {"handler": scenario_symlink_write, "needs": ("target",),
+              "description": "Attempt to WRITE through a symlink toward a synthetic denied file."},
+    "FS-07": {"handler": scenario_rename_across_boundary, "needs": ("target", "base"),
+              "description": "Attempt to rename/move a denied file into the workspace."},
+    "FS-08": {"handler": scenario_preopened_fd, "needs": ("target",),
+              "description": "Attempt to read a denied resource via an inherited pre-opened fd."},
+    "FS-09": {"handler": scenario_descendant_denied_read, "needs": ("target",),
+              "description": "A descendant (child|grandchild|setsid|doublefork via --base) attempts a denied read."},
+    "FS-10": {"handler": scenario_file_read, "needs": ("target",),
+              "description": "Read an explicitly allowed read-only file."},
+    "FS-11": {"handler": scenario_file_write, "needs": ("target",),
+              "description": "Attempt to write an explicitly read-only file."},
     "ENV-01": {"handler": scenario_env_read, "needs": ("env_name",),
                "description": "Read an explicitly provided harmless environment value."},
     "ENV-02": {"handler": scenario_env_secret_probe, "needs": ("env_name",),

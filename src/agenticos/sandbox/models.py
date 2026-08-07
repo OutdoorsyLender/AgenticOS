@@ -288,6 +288,8 @@ class FixtureLayout:
     fake_state_file: Path
     fake_ssh_key: Path
     fake_credentials_file: Path
+    readonly_dir: Path
+    readonly_file: Path
     env_secret_name: str
     harmless_env_name: str
     canaries: dict[str, str]

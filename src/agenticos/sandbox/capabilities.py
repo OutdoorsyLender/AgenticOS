@@ -169,6 +169,7 @@ class HostCapabilityDetector:
         self._check_cgroups(report)
         self._check_user_namespaces(report)
         self._check_landlock(report)
+        self._check_sandbox_helpers(report)
         self._check_repo_location(report)
         return report
 
@@ -405,6 +406,22 @@ class HostCapabilityDetector:
         except Exception as exc:  # noqa: BLE001 - detection must never crash
             report.add("landlock_abi", CapabilityStatus.UNVERIFIED,
                        f"ABI probe raised {type(exc).__name__}: {exc}")
+
+    def _check_sandbox_helpers(self, report: HostCapabilityReport) -> None:
+        """Presence only — NOT usability. Usability requires a real bounded
+        probe (see agenticos.sandbox.isolation probes)."""
+        bwrap = shutil.which("bwrap")
+        report.add(
+            "bubblewrap_available",
+            CapabilityStatus.SUPPORTED if bwrap else CapabilityStatus.UNSUPPORTED,
+            "bwrap found on PATH" if bwrap else "bwrap not found on PATH",
+        )
+        unshare = shutil.which("unshare")
+        report.add(
+            "unshare_available",
+            CapabilityStatus.SUPPORTED if unshare else CapabilityStatus.UNSUPPORTED,
+            "unshare found on PATH" if unshare else "unshare not found on PATH",
+        )
 
     def _check_repo_location(self, report: HostCapabilityReport) -> None:
         """The repo must run from a Linux filesystem, not /mnt/<drive>."""

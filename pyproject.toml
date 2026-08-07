@@ -17,4 +17,5 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
     "cgroup_linux: integration tests requiring Linux cgroup v2 + systemd user scopes (run inside Ubuntu WSL2)",
+    "fs_isolation_linux: filesystem-isolation experiments requiring Linux (Landlock and/or bubblewrap + namespaces)",
 ]

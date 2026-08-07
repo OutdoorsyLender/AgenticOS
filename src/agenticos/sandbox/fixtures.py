@@ -30,7 +30,7 @@ from pathlib import Path
 
 from .models import FixtureLayout
 
-CANARY_TAGS = ("permitted", "sibling", "credential", "state", "env")
+CANARY_TAGS = ("permitted", "sibling", "credential", "state", "env", "readonly")
 
 ENV_SECRET_NAME = "AOS_FAKE_SECRET"
 HARMLESS_ENV_NAME = "AOS_HARMLESS"
@@ -71,6 +71,7 @@ class FixtureBuilder:
         fake_home = root / "fake-home"
         task_tmp = root / "task-tmp"
         sockets = root / "sockets"
+        readonly = root / "readonly"
         for d in (
             assigned,
             sibling,
@@ -79,6 +80,7 @@ class FixtureBuilder:
             fake_home / ".config" / "provider",
             task_tmp,
             sockets,
+            readonly,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -100,6 +102,9 @@ class FixtureBuilder:
         credentials = fake_home / ".config" / "provider" / "credentials.fake"
         credentials.write_text(f"[fake-provider]\ntoken = {canaries['credential']}\n")
 
+        readonly_file = readonly / "readonly-canary.txt"
+        readonly_file.write_text(f"read-only reference data\n{canaries['readonly']}\n")
+
         symlink_supported = self._probe_symlink(root)
 
         self.layout = FixtureLayout(
@@ -116,6 +121,8 @@ class FixtureBuilder:
             fake_state_file=state_file,
             fake_ssh_key=ssh_key,
             fake_credentials_file=credentials,
+            readonly_dir=readonly,
+            readonly_file=readonly_file,
             env_secret_name=ENV_SECRET_NAME,
             harmless_env_name=HARMLESS_ENV_NAME,
             canaries=canaries,
