@@ -110,6 +110,47 @@ scopes, `check_support()` returns concrete reasons, `run()` raises
 `ContainmentUnavailableError`, and integration tests skip with reasons —
 nothing is faked.
 
+## 7a. Real-host verification record (Milestone 2B, observed)
+
+Tested environment: Ubuntu 26.04 LTS on WSL2, kernel
+`6.6.87.2-microsoft-standard-WSL2`, systemd 259 (PID 1), systemd user
+manager + bus operational, unified cgroup v2, Python 3.14.4.
+
+Observed on this environment:
+
+- Transient user scopes (`systemd-run --user --scope --collect`) created
+  and collected successfully, both manually and through
+  `CgroupProcessRunner.probe()`.
+- Task cgroup membership is proven from `/proc/<pid>/cgroup` of the scope
+  process (suffix match on the exact scope name), with the unit's
+  `ControlGroup` property as fallback. Unit lookups use the full
+  `<name>.scope` name — a bare name resolves to `<name>.service` and finds
+  nothing (defect found and fixed during real-host verification).
+- Real cancellation escalation executed: a child ignoring both SIGINT and
+  SIGTERM was terminated by the full sequence SIGINT → grace → SIGTERM →
+  grace → **`cgroup.kill`** → recursive `cgroup.events populated 0` →
+  `CONTAINMENT_DESTROYED`.
+- `cgroup.kill`: present in non-root cgroups, usable by the current user on
+  AgenticOS-created task scopes, and genuinely exercised (no fallback was
+  needed on this host; the systemd-SIGKILL fallback remains documented as
+  NOT equivalent).
+- Hostile scenarios PROC-01 through PROC-08 executed through
+  `CgroupProcessRunner`; session changes (PROC-04), new process groups
+  (PROC-08), parent exit (PROC-05), and double-fork reparenting (PROC-06)
+  all remained inside the task cgroup and were removed during cancellation.
+  PROC-07 stayed within its strict finite bound (5 children, all reaped).
+- After every run: no surviving task-attributable descendant PIDs, no
+  populated task cgroups, no persistent `aos-*` units.
+- Full Linux suite: 100 passed, 1 skipped, stable across three consecutive
+  runs.
+
+One evidence cosmetic: after a timeout cancellation, `CGROUP_EMPTY_VERIFIED`
+may be recorded twice (once after the forced kill, once re-verified after
+reaping). Both records are accurate.
+
+These results describe the tested environment only; they are not a claim
+about arbitrary Linux hosts.
+
 ## 8. What remains unproven
 
 - Any filesystem, network, socket, or credential isolation.

@@ -37,7 +37,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, Sequence
 
-from .capabilities import CapabilityStatus, HostCapabilityDetector, parse_cgroup_events
+from .capabilities import (
+    CapabilityStatus,
+    HostCapabilityDetector,
+    parse_cgroup_events,
+    parse_proc_cgroup,
+)
 from .evidence import EvidenceCollector
 from .models import ProcessIdentity, ProcessResult, utc_now_iso
 from .runner import DEFAULT_TIMEOUT_SECONDS, SandboxRunner
@@ -277,6 +282,7 @@ class CgroupProcessRunner(SandboxRunner):
         collector: Optional[EvidenceCollector] = None,
         backend: Optional[SystemdScopeBackend] = None,
         cgroup_root: str | Path = "/sys/fs/cgroup",
+        proc_root: str | Path = "/proc",
     ) -> None:
         self.worker_path = Path(worker_path)
         if not self.worker_path.is_file():
@@ -285,6 +291,7 @@ class CgroupProcessRunner(SandboxRunner):
         self.cancellation = cancellation or CancellationConfig()
         self.collector = collector
         self.cgroup_root = Path(cgroup_root)
+        self.proc_root = Path(proc_root)
         self.backend = backend or SystemdScopeBackend(cgroup_root=self.cgroup_root)
         self._support: Optional[ContainmentSupport] = None
 
@@ -345,7 +352,7 @@ class CgroupProcessRunner(SandboxRunner):
                 capture_output=True, text=True, env=backend._ctl_env, timeout=15.0,
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
-            backend.stop_unit(unit)
+            backend.stop_unit(f"{unit}.scope")
             return ContainmentSupport(False, [f"scope probe raised {type(exc).__name__}: {exc}"])
         if proc.returncode != 0:
             return ContainmentSupport(
@@ -353,8 +360,8 @@ class CgroupProcessRunner(SandboxRunner):
                 ["transient user scope creation failed: "
                  f"rc={proc.returncode} stderr={proc.stderr.strip()[:200]!r}"],
             )
-        if backend.unit_active(unit):
-            backend.stop_unit(unit)
+        if backend.unit_active(f"{unit}.scope"):
+            backend.stop_unit(f"{unit}.scope")
             return ContainmentSupport(False, ["probe scope did not self-collect"])
         return ContainmentSupport(True, ["transient user scope created and collected"])
 
@@ -377,6 +384,10 @@ class CgroupProcessRunner(SandboxRunner):
         argv = [str(a) for a in argv]
         timeout = self.default_timeout if timeout is None else float(timeout)
         unit = f"aos-task-{uuid.uuid4().hex[:12]}"
+        # systemd-run names the unit '<unit>.scope'; every systemctl lookup
+        # must use the FULL name — a bare name resolves to '<unit>.service'
+        # and silently finds nothing.
+        scope = f"{unit}.scope"
         full_argv = [
             self.backend.systemd_run, "--user", "--scope", "--quiet", "--collect",
             f"--unit={unit}", "--", *argv,
@@ -398,10 +409,10 @@ class CgroupProcessRunner(SandboxRunner):
             start_new_session=True,
         )
         identity = ProcessIdentity.from_pid(proc.pid)
-        cgroup_path = self._discover_cgroup(unit)
-        self._emit(EV_CONTAINMENT_CREATED, unit=unit,
+        cgroup_path = self._discover_cgroup(scope, proc.pid)
+        self._emit(EV_CONTAINMENT_CREATED, unit=scope,
                    cgroup_path=str(cgroup_path) if cgroup_path else None)
-        self._emit(EV_PROCESS_STARTED, unit=unit, pid=proc.pid,
+        self._emit(EV_PROCESS_STARTED, unit=scope, pid=proc.pid,
                    start_time_ticks=identity.start_time_ticks)
 
         containment_state = ContainmentState.RUNNING.value
@@ -410,7 +421,7 @@ class CgroupProcessRunner(SandboxRunner):
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            state = self._cancel(unit, cgroup_path, proc)
+            state = self._cancel(scope, cgroup_path, proc)
             containment_state = state.value
             stdout, stderr = proc.communicate()
 
@@ -419,7 +430,7 @@ class CgroupProcessRunner(SandboxRunner):
         if cgroup_path is not None and not wait_cgroup_empty(
             self.backend, cgroup_path, 0.2, self.cancellation.poll_interval
         ):
-            state = self._cancel(unit, cgroup_path, proc)
+            state = self._cancel(scope, cgroup_path, proc)
             containment_state = state.value
         elif cgroup_path is not None:
             containment_state = (
@@ -427,20 +438,20 @@ class CgroupProcessRunner(SandboxRunner):
                 if containment_state == ContainmentState.RUNNING.value
                 else containment_state
             )
-            self._emit(EV_CGROUP_EMPTY_VERIFIED, unit=unit, after="clean exit")
+            self._emit(EV_CGROUP_EMPTY_VERIFIED, unit=scope, after="clean exit")
         else:
             containment_state = ContainmentState.FAILED.value
-            self._emit(EV_CONTAINMENT_FAILURE, unit=unit,
+            self._emit(EV_CONTAINMENT_FAILURE, unit=scope,
                        reason="cgroup path could not be discovered; "
                               "termination invariant cannot be verified")
 
-        self.backend.stop_unit(unit)
-        if self.backend.unit_active(unit):
+        self.backend.stop_unit(scope)
+        if self.backend.unit_active(scope):
             containment_state = ContainmentState.FAILED.value
-            self._emit(EV_CONTAINMENT_FAILURE, unit=unit,
+            self._emit(EV_CONTAINMENT_FAILURE, unit=scope,
                        reason="unit still active after cleanup")
         else:
-            self._emit(EV_CONTAINMENT_DESTROYED, unit=unit)
+            self._emit(EV_CONTAINMENT_DESTROYED, unit=scope)
 
         finished_at = utc_now_iso()
         rc = proc.returncode
@@ -458,7 +469,7 @@ class CgroupProcessRunner(SandboxRunner):
             finished_at=finished_at,
             process_group_id=identity.process_group_id,
             identity=identity,
-            containment_unit=unit,
+            containment_unit=scope,
             containment_cgroup=str(cgroup_path) if cgroup_path else None,
             containment_state=containment_state,
         )
@@ -487,15 +498,35 @@ class CgroupProcessRunner(SandboxRunner):
         )
         return state
 
-    def _discover_cgroup(self, unit: str, timeout: float = 5.0) -> Optional[Path]:
+    def _discover_cgroup(
+        self, scope: str, pid: int, timeout: float = 5.0
+    ) -> Optional[Path]:
+        """Discover the task cgroup path dynamically — never assumed.
+
+        Primary source is /proc/<pid>/cgroup of the scope process itself:
+        it proves actual containment membership and is available the instant
+        the process exists, unlike `systemctl show`, which races with
+        collection of very short-lived scopes. Falls back to the unit's
+        ControlGroup property. Returns None only if neither source confirms
+        membership before the deadline (caller treats that as FAILED).
+        """
+        suffix = "/" + scope
+        proc_cgroup = self.proc_root / str(pid) / "cgroup"
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            path = self.backend.control_group(unit)
+            try:
+                rel = parse_proc_cgroup(proc_cgroup.read_text())
+            except OSError:
+                rel = None
+            if rel and rel.endswith(suffix):
+                candidate = self.cgroup_root / rel.lstrip("/")
+                if candidate.exists():
+                    return candidate
+            path = self.backend.control_group(scope)
             if path is not None and path.exists():
                 return path
-            time.sleep(0.05)
-        path = self.backend.control_group(unit)
-        return path  # may be None; caller treats as containment failure
+            time.sleep(0.01)
+        return None
 
     def _emit(self, kind: str, **payload) -> None:
         if self.collector is not None:

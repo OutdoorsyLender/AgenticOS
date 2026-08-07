@@ -44,8 +44,8 @@ contains usernames, home paths, machine ids, or environment dumps.
 | `systemd_user_bus` | `/run/user/<uid>/bus` socket exists |
 | `systemd_scope_creation` | **always `UNVERIFIED` here** — see §3 |
 | `cgroup_version` / `cgroup_v2_mounted` | `cgroup.controllers` + `cgroup2` mount entry |
-| `cgroup_kill_available` | `cgroup.kill` exists (kernel ≥ 5.14) |
-| `cgroup_events_available` | `cgroup.events` exists |
+| `cgroup_kill_available` | `cgroup.kill` in a dynamically discovered non-root cgroup (kernel ≥ 5.14) |
+| `cgroup_events_available` | `cgroup.events` in a dynamically discovered non-root cgroup |
 | `user_namespaces_observed` | `/proc/sys/user/max_user_namespaces` > 0 |
 | `landlock_abi` | `landlock_create_ruleset` **version query only** via ctypes syscall — detection, never enforcement |
 | `repo_on_linux_filesystem` | repo path must not be under `/mnt/<drive>` (drvfs) |
@@ -69,14 +69,32 @@ tests skip with concrete reasons rather than faking success.
 
 ## 5. Supported / unsupported hosts
 
-- **Target**: Ubuntu on WSL2 (systemd enabled), repo on the Linux filesystem
-  (e.g. `~/src/AgenticOS`).
-- **Plain Linux with systemd**: expected to work identically.
+- **Verified target (Milestone 2B, observed)**: Ubuntu 26.04 LTS on WSL2,
+  kernel `6.6.87.2-microsoft-standard-WSL2`, systemd 259 as PID 1,
+  systemd user manager + bus operational, unified cgroup v2 at
+  `/sys/fs/cgroup` (`nsdelegate`), Landlock ABI v3 detected (not enforced),
+  pidfd available, repo on the Linux filesystem. All capability probes and
+  the real containment suite pass on this environment.
+- **Plain Linux with systemd**: expected to work identically (not observed).
 - **Windows (native)**: containment capabilities report
   `UNSUPPORTED`/`UNVERIFIED`; `CgroupProcessRunner.run()` raises
   `ContainmentUnavailableError` with reasons. Unit tests still prove the
   detection and cancellation logic via synthetic fixtures and fake backends.
 - **WSL1**: no real cgroup v2; reports `UNSUPPORTED`.
+
+### cgroup.events / cgroup.kill detection semantics (corrected in 2B)
+
+These files exist **only in non-root cgroups** — the hierarchy root never
+exposes them, so probing `/sys/fs/cgroup/cgroup.events` directly is a false
+negative (observed on the real host). The detector now discovers an existing
+non-root cgroup dynamically: first the current process's own cgroup from
+`/proc/self/cgroup`, then PID 1's, then (last resort) the first direct child
+of the cgroup root exposing `cgroup.events`. No path is hard-coded, nothing
+is created to answer detection, and the probe stays read-only. Presence of
+`cgroup.kill` means the kernel exposes the feature; whether AgenticOS may
+*use* it on a task scope (`cgroup_kill_usable`) is only proven at runtime by
+actually writing to a task cgroup — system capability and current-user
+permission remain separate facts.
 
 ## 6. Known WSL caveats
 

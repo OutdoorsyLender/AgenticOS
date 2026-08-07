@@ -154,12 +154,10 @@ class UnsafeLocalRunner(SandboxRunner):
             shell=False,  # hard requirement: argv array only, never a shell
             start_new_session=(os.name != "nt"),  # own process group on POSIX
         )
-        pgid: Optional[int] = None
-        if os.name != "nt":
-            try:
-                pgid = os.getpgid(proc.pid)
-            except OSError:
-                pgid = None
+        # Identity must be captured while the process is alive — after
+        # communicate()/reaping, /proc/<pid> is gone on Linux.
+        identity = ProcessIdentity.from_pid(proc.pid)
+        pgid = identity.process_group_id
         timed_out = False
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
@@ -182,7 +180,7 @@ class UnsafeLocalRunner(SandboxRunner):
             started_at=started_at,
             finished_at=finished_at,
             process_group_id=pgid,
-            identity=ProcessIdentity.from_pid(proc.pid),
+            identity=identity,
         )
 
     @staticmethod

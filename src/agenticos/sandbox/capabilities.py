@@ -111,6 +111,19 @@ def parse_cgroup_events(events_text: str) -> dict[str, int]:
     return out
 
 
+def parse_proc_cgroup(text: str) -> Optional[str]:
+    """Extract the cgroup v2 path from /proc/<pid>/cgroup content.
+
+    v2 content is a single '0::/path' line; the path is '/' when the process
+    sits in the hierarchy root. Returns None when no unified entry exists.
+    """
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+            return parts[2] or "/"
+    return None
+
+
 class HostCapabilityDetector:
     """Read-only host capability probes.
 
@@ -265,6 +278,32 @@ class HostCapabilityDetector:
             "read-only detection only; verified at runtime by CgroupProcessRunner.probe()",
         )
 
+    def _discover_nonroot_cgroup(self) -> tuple[Optional[Path], str]:
+        """Find an existing non-root cgroup directory, read-only.
+
+        Preference order: the current process's own cgroup (from
+        /proc/self/cgroup), then PID 1's cgroup, then — as a last resort —
+        the first direct child of the cgroup root exposing cgroup.events.
+        Never creates a cgroup; never assumes a distro-specific path.
+        Returns (path, source_description).
+        """
+        for proc_file, label in (
+            (self.proc_root / "self" / "cgroup", "/proc/self/cgroup"),
+            (self.proc_root / "1" / "cgroup", "/proc/1/cgroup"),
+        ):
+            rel = parse_proc_cgroup(self._read(proc_file) or "")
+            if rel and rel != "/":
+                candidate = self.cgroup_root / rel.lstrip("/")
+                if candidate.is_dir():
+                    return candidate, f"{label} entry {rel!r}"
+        try:
+            for child in sorted(self.cgroup_root.iterdir()):
+                if child.is_dir() and (child / "cgroup.events").exists():
+                    return child, "direct child of cgroup root"
+        except OSError:
+            pass
+        return None, "no non-root cgroup found"
+
     def _check_cgroups(self, report: HostCapabilityReport) -> None:
         controllers = self.cgroup_root / "cgroup.controllers"
         mounts_text = self._read(self.proc_root / "self" / "mounts") or ""
@@ -287,18 +326,42 @@ class HostCapabilityDetector:
             report.add("cgroup_v2_mounted", CapabilityStatus.UNVERIFIED,
                        "cgroup2 mount present but controllers file missing at detection root")
 
-        kill = self.cgroup_root / "cgroup.kill"
-        report.add(
-            "cgroup_kill_available",
-            CapabilityStatus.SUPPORTED if kill.exists() else CapabilityStatus.UNSUPPORTED,
-            f"{kill} exists" if kill.exists() else f"{kill} missing (kernel < 5.14 or non-v2)",
-        )
-        events = self.cgroup_root / "cgroup.events"
-        report.add(
-            "cgroup_events_available",
-            CapabilityStatus.SUPPORTED if events.exists() else CapabilityStatus.UNSUPPORTED,
-            f"{events} exists" if events.exists() else f"{events} missing",
-        )
+        v2 = controllers.exists()
+        if not v2:
+            if "cgroup" in fstypes:
+                note = "cgroup.kill/cgroup.events are cgroup v2 features; host is v1"
+                report.add("cgroup_kill_available", CapabilityStatus.UNSUPPORTED, note)
+                report.add("cgroup_events_available", CapabilityStatus.UNSUPPORTED, note)
+            else:
+                note = "cgroup v2 not detected; cannot assess"
+                report.add("cgroup_kill_available", CapabilityStatus.UNVERIFIED, note)
+                report.add("cgroup_events_available", CapabilityStatus.UNVERIFIED, note)
+            return
+
+        kill_probe, kill_source = self._discover_nonroot_cgroup()
+        if kill_probe is None:
+            report.add("cgroup_kill_available", CapabilityStatus.UNVERIFIED,
+                       f"no existing non-root cgroup discoverable ({kill_source})")
+            report.add("cgroup_events_available", CapabilityStatus.UNVERIFIED,
+                       f"no existing non-root cgroup discoverable ({kill_source})")
+        else:
+            # cgroup.events / cgroup.kill exist only in NON-ROOT cgroups
+            # (kernel design); probing the hierarchy root is a false negative.
+            kill = kill_probe / "cgroup.kill"
+            report.add(
+                "cgroup_kill_available",
+                CapabilityStatus.SUPPORTED if kill.exists() else CapabilityStatus.UNSUPPORTED,
+                f"cgroup.kill {'present' if kill.exists() else 'absent'} in non-root "
+                f"cgroup {kill_probe.name!r} (via {kill_source})"
+                + ("" if kill.exists() else " — kernel < 5.14 or not applicable"),
+            )
+            events = kill_probe / "cgroup.events"
+            report.add(
+                "cgroup_events_available",
+                CapabilityStatus.SUPPORTED if events.exists() else CapabilityStatus.UNSUPPORTED,
+                f"cgroup.events {'present' if events.exists() else 'absent'} in non-root "
+                f"cgroup {kill_probe.name!r} (via {kill_source})",
+            )
 
     def _check_user_namespaces(self, report: HostCapabilityReport) -> None:
         raw = self._read(self.proc_root / "sys" / "user" / "max_user_namespaces")

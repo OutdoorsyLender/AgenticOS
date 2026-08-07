@@ -17,6 +17,7 @@ from agenticos.sandbox.capabilities import (
     HostCapabilityDetector,
     parse_cgroup_events,
     parse_mounts,
+    parse_proc_cgroup,
     parse_wsl_version,
 )
 
@@ -31,7 +32,12 @@ PLAIN_LINUX_PROC_VERSION = (
 
 
 def make_linux_fixture_tree(tmp_path, *, wsl=True, cgroup_v2=True, cgroup_kill=True):
-    """A synthetic /proc + /sys/fs/cgroup tree for the detector."""
+    """A synthetic /proc + /sys/fs/cgroup tree for the detector.
+
+    Models the REAL cgroup v2 layout: cgroup.controllers exists at the
+    hierarchy root, but cgroup.events / cgroup.kill exist only in non-root
+    cgroups (e.g. init.scope), and /proc/self/cgroup points there.
+    """
     proc = tmp_path / "proc"
     cg = tmp_path / "sys" / "fs" / "cgroup"
     (proc / "1").mkdir(parents=True)
@@ -46,15 +52,20 @@ def make_linux_fixture_tree(tmp_path, *, wsl=True, cgroup_v2=True, cgroup_kill=T
     (proc / "self" / "stat").write_text("1 (init) S 0 1 1 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 42 1000 1\n")
     (proc / "sys" / "user" / "max_user_namespaces").write_text("15000\n")
     if cgroup_v2:
+        (proc / "self" / "cgroup").write_text("0::/init.scope\n")
+        (proc / "1" / "cgroup").write_text("0::/init.scope\n")
         (proc / "self" / "mounts").write_text(
             "tmpfs /run tmpfs rw 0 0\n"
             "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n"
         )
         (cg / "cgroup.controllers").write_text("cpuset cpu io memory pids\n")
-        (cg / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+        init_scope = cg / "init.scope"
+        init_scope.mkdir()
+        (init_scope / "cgroup.events").write_text("populated 1\nfrozen 0\n")
         if cgroup_kill:
-            (cg / "cgroup.kill").write_text("")
+            (init_scope / "cgroup.kill").write_text("")
     else:
+        (proc / "self" / "cgroup").write_text("2:cpu:/\n1:name=systemd:/\n")
         (proc / "self" / "mounts").write_text(
             "cgroup /sys/fs/cgroup/cpu cgroup rw,cpu 0 0\n"
         )
@@ -81,6 +92,16 @@ def test_parse_cgroup_events():
     assert parse_cgroup_events("populated 0\nfrozen 0\n") == {"populated": 0, "frozen": 0}
     assert parse_cgroup_events("populated 1\nfrozen 0\n")["populated"] == 1
     assert parse_cgroup_events("garbage line\n") == {}
+
+
+def test_parse_proc_cgroup():
+    assert parse_proc_cgroup("0::/init.scope\n") == "/init.scope"
+    assert parse_proc_cgroup(
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/aos-task-x.scope\n"
+    ) == "/user.slice/user-1000.slice/user@1000.service/app.slice/aos-task-x.scope"
+    assert parse_proc_cgroup("0::/\n") == "/"  # process in hierarchy root
+    assert parse_proc_cgroup("2:cpu:/\n1:name=systemd:/\n") is None  # v1-only
+    assert parse_proc_cgroup("") is None
 
 
 # --------------------------------------------------------------------------
@@ -115,7 +136,23 @@ def test_cgroup_kill_absent_reported(tmp_path):
     report = HostCapabilityDetector(proc_root=proc, cgroup_root=cg, environ={}).detect()
     assert report.status_of("cgroup_v2_mounted") is CapabilityStatus.SUPPORTED
     assert report.status_of("cgroup_kill_available") is CapabilityStatus.UNSUPPORTED
-    assert "missing" in report.capabilities["cgroup_kill_available"].evidence
+    assert "absent" in report.capabilities["cgroup_kill_available"].evidence
+    # events still detected from the same non-root cgroup
+    assert report.status_of("cgroup_events_available") is CapabilityStatus.SUPPORTED
+
+
+def test_cgroup_kill_unverifiable_without_nonroot_cgroup(tmp_path):
+    """v2 mounted but no discoverable non-root cgroup => UNVERIFIED, never
+    silently SUPPORTED or UNSUPPORTED."""
+    proc, cg = make_linux_fixture_tree(tmp_path, cgroup_v2=True)
+    (proc / "self" / "cgroup").write_text("0::/\n")  # process in hierarchy root
+    (proc / "1" / "cgroup").write_text("0::/\n")
+    import shutil as _shutil
+    _shutil.rmtree(cg / "init.scope")  # no fallback child either
+    report = HostCapabilityDetector(proc_root=proc, cgroup_root=cg, environ={}).detect()
+    assert report.status_of("cgroup_v2_mounted") is CapabilityStatus.SUPPORTED
+    assert report.status_of("cgroup_kill_available") is CapabilityStatus.UNVERIFIED
+    assert report.status_of("cgroup_events_available") is CapabilityStatus.UNVERIFIED
 
 
 def test_scope_creation_is_not_assumed_from_systemd(tmp_path):
