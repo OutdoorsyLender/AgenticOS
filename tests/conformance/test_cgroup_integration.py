@@ -151,6 +151,31 @@ def test_proc02_grandchild_contained(crunner, layout, fixture_env):
     assert result.process.containment_state == ContainmentState.TERMINATED.value
 
 
+def test_proc01_normal_child_contained(crunner, layout, fixture_env):
+    runner, _ = crunner
+    result = runner.run_scenario(
+        "PROC-01", cwd=layout.assigned_worktree, env=fixture_env,
+    )
+    assert result.succeeded is True
+    assert result.details["child_exit_code"] == 0
+    assert not pid_alive(result.details["child_pid"])
+    assert result.process.containment_state == ContainmentState.TERMINATED.value
+
+
+def test_proc04_setsid_child_contained(crunner, layout, fixture_env):
+    """A child that calls setsid() (new session) must NOT escape the task
+    cgroup: sessions are not the containment boundary, the cgroup is."""
+    runner, _ = crunner
+    result = runner.run_scenario(
+        "PROC-04", cwd=layout.assigned_worktree, env=fixture_env,
+    )
+    assert result.succeeded is True
+    assert result.details["setsid_supported"] is True
+    assert result.details["child_outcome"].startswith("setsid-ok")
+    assert not pid_alive(result.details["child_pid"])
+    assert result.process.containment_state == ContainmentState.TERMINATED.value
+
+
 def test_proc03_sigterm_child_contained(crunner, layout, fixture_env):
     runner, _ = crunner
     result = runner.run_scenario(
