@@ -12,14 +12,18 @@ import hashlib
 import json
 import os
 import platform
+import select
 import shutil
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Mapping, Optional
+
+from .capabilities import parse_proc_cgroup
 
 
 EXPECTED_BWRAP_PATH = Path("/usr/bin/bwrap")
@@ -149,6 +153,41 @@ EXPLICIT_NAMESPACE_FLAGS = (
     "--new-session",
     "--die-with-parent",
 )
+
+NAMESPACE_NAMES = ("user", "mnt", "net", "pid", "ipc", "uts")
+REPORTED_NAMESPACE_KEYS = {
+    "mnt": "mnt-namespace",
+    "net": "net-namespace",
+    "pid": "pid-namespace",
+    "ipc": "ipc-namespace",
+    "uts": "uts-namespace",
+}
+
+
+class NamespaceEvidenceError(RuntimeBoundaryUnavailable):
+    """Raised when Bubblewrap and independent `/proc` evidence disagree."""
+
+
+@dataclass(frozen=True)
+class BwrapSetupStatus:
+    child_pid: int
+    reported_namespaces: dict[str, int]
+
+
+@dataclass(frozen=True)
+class NamespaceSnapshot:
+    pid: int
+    identities: dict[str, int]
+    cgroup: str
+    uid_map: str
+
+
+@dataclass(frozen=True)
+class NamespaceEvidence:
+    verified: bool
+    controller: NamespaceSnapshot
+    child: NamespaceSnapshot
+    status: BwrapSetupStatus
 
 
 class _OpenHow(ctypes.Structure):
@@ -617,3 +656,182 @@ def build_bwrap_argv(
         )
     )
     return argv
+
+
+def _required_positive_int(payload: Mapping[str, object], key: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise NamespaceEvidenceError(
+            f"Bubblewrap setup field {key!r} must be a positive integer"
+        )
+    return value
+
+
+def parse_bwrap_documents(documents: list[object]) -> BwrapSetupStatus:
+    """Select one valid setup record while tolerating bounded future objects."""
+    setup: Optional[BwrapSetupStatus] = None
+    setup_keys = {"child-pid", *REPORTED_NAMESPACE_KEYS.values()}
+    for document in documents:
+        if not isinstance(document, dict):
+            raise NamespaceEvidenceError("Bubblewrap status object must be a mapping")
+        if not setup_keys.intersection(document):
+            continue
+        child_pid = _required_positive_int(document, "child-pid")
+        reported = {
+            name: _required_positive_int(document, key)
+            for name, key in REPORTED_NAMESPACE_KEYS.items()
+        }
+        candidate = BwrapSetupStatus(child_pid, reported)
+        if setup is not None:
+            raise NamespaceEvidenceError(
+                "contradictory or duplicate Bubblewrap setup records"
+            )
+        setup = candidate
+    if setup is None:
+        raise NamespaceEvidenceError("Bubblewrap setup object is missing")
+    return setup
+
+
+def _uid_map_includes_host_identity(uid_map: str, expected_host_uid: int) -> bool:
+    if expected_host_uid <= 0:
+        return False
+    for line in uid_map.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            _inside, outside, count = (int(field) for field in fields)
+        except ValueError:
+            continue
+        if outside <= expected_host_uid < outside + count:
+            return True
+    return False
+
+
+def verify_namespace_evidence(
+    status: BwrapSetupStatus,
+    *,
+    controller: NamespaceSnapshot,
+    child: NamespaceSnapshot,
+    expected_cgroup: str,
+    expected_host_uid: int,
+) -> NamespaceEvidence:
+    """Authenticate Bubblewrap status against independent host `/proc` state."""
+    if child.pid != status.child_pid:
+        raise NamespaceEvidenceError("Bubblewrap child PID does not match /proc")
+    if set(controller.identities) != set(NAMESPACE_NAMES):
+        raise NamespaceEvidenceError("controller namespace snapshot is incomplete")
+    if set(child.identities) != set(NAMESPACE_NAMES):
+        raise NamespaceEvidenceError("child namespace snapshot is incomplete")
+    for name in NAMESPACE_NAMES:
+        if child.identities[name] == controller.identities[name]:
+            raise NamespaceEvidenceError(f"required {name} namespace was not separated")
+    for name, reported in status.reported_namespaces.items():
+        if child.identities[name] != reported:
+            raise NamespaceEvidenceError(
+                f"Bubblewrap {name} namespace contradicts host /proc"
+            )
+    if child.cgroup != expected_cgroup:
+        raise NamespaceEvidenceError(
+            "Bubblewrap child is not in the exact verified task cgroup"
+        )
+    if not _uid_map_includes_host_identity(child.uid_map, expected_host_uid):
+        raise NamespaceEvidenceError(
+            "child uid_map does not prove the expected unprivileged mapping"
+        )
+    return NamespaceEvidence(True, controller, child, status)
+
+
+def read_bwrap_setup_status(
+    fd: int,
+    *,
+    timeout: float,
+    max_line_bytes: int = 4096,
+    max_total_bytes: int = 16384,
+    max_objects: int = 16,
+) -> BwrapSetupStatus:
+    """Read bounded newline-delimited JSON until the one setup object arrives."""
+    if timeout <= 0:
+        raise ValueError("status timeout must be positive")
+    deadline = time.monotonic() + timeout
+    line = bytearray()
+    total = 0
+    documents: list[object] = []
+    setup_keys = {"child-pid", *REPORTED_NAMESPACE_KEYS.values()}
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([fd], [], [], min(0.1, deadline - time.monotonic()))
+        if not ready:
+            continue
+        chunk = os.read(fd, 1)
+        if not chunk:
+            break
+        total += 1
+        if total > max_total_bytes:
+            raise NamespaceEvidenceError("Bubblewrap status exceeded bounded total")
+        if chunk != b"\n":
+            line.extend(chunk)
+            if len(line) > max_line_bytes:
+                raise NamespaceEvidenceError("Bubblewrap status exceeded bounded line")
+            continue
+        if not line:
+            raise NamespaceEvidenceError("Bubblewrap emitted an empty JSON record")
+        try:
+            document = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise NamespaceEvidenceError("Bubblewrap emitted malformed JSON") from exc
+        line.clear()
+        documents.append(document)
+        if len(documents) > max_objects:
+            raise NamespaceEvidenceError("Bubblewrap status exceeded bounded objects")
+        if isinstance(document, dict) and setup_keys.intersection(document):
+            return parse_bwrap_documents(documents)
+    if line:
+        raise NamespaceEvidenceError("Bubblewrap status ended with truncated JSON")
+    raise NamespaceEvidenceError("Bubblewrap setup status missing before deadline")
+
+
+def _parse_namespace_link(link: str, expected_name: str) -> int:
+    prefix = f"{expected_name}:["
+    if not link.startswith(prefix) or not link.endswith("]"):
+        raise NamespaceEvidenceError(
+            f"invalid {expected_name} namespace identity"
+        )
+    value = link[len(prefix):-1]
+    if not value.isdigit() or int(value) <= 0:
+        raise NamespaceEvidenceError(
+            f"invalid {expected_name} namespace inode"
+        )
+    return int(value)
+
+
+def read_namespace_snapshot(
+    pid: int,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> NamespaceSnapshot:
+    """Read one host-visible process namespace/cgroup identity atomically enough.
+
+    A vanished or recycled process is rejected by callers through the expected
+    PID, cgroup, and Bubblewrap-reported namespace comparisons.
+    """
+    if not sys.platform.startswith("linux") or pid <= 0:
+        raise NamespaceEvidenceError("host /proc namespace evidence requires Linux PID")
+    process_root = Path(proc_root) / str(pid)
+    try:
+        identities = {
+            name: _parse_namespace_link(
+                os.readlink(process_root / "ns" / name), name
+            )
+            for name in NAMESPACE_NAMES
+        }
+        cgroup = parse_proc_cgroup(
+            (process_root / "cgroup").read_text(errors="strict")
+        )
+        uid_map = (process_root / "uid_map").read_text(errors="strict")
+    except OSError as exc:
+        raise NamespaceEvidenceError(
+            f"host /proc namespace evidence unavailable: {type(exc).__name__}"
+        ) from exc
+    if cgroup is None:
+        raise NamespaceEvidenceError("host /proc has no cgroup-v2 identity")
+    return NamespaceSnapshot(pid, identities, cgroup, uid_map)
