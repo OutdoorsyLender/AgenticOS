@@ -201,3 +201,17 @@ the transient unit is inactive.
 This composition does not turn either component into a complete sandbox: the
 cgroup controls process-tree lifecycle, while Landlock ABI 3 mediates only
 its documented filesystem operations.
+
+## 11. Milestone 4A lifecycle composition
+
+Bubblewrap intentionally does not create a cgroup namespace. Its explicit PID,
+network, mount, user, IPC, and UTS namespaces are independently checked from
+host `/proc`, including exact task-cgroup membership, before the namespace gate
+releases. `--die-with-parent` is defense in depth only.
+
+The established transient scope, cancellation escalation, `cgroup.kill`, and
+recursive `populated 0` proof remain authoritative. M4A runs all existing
+descendant shapes plus namespace/Landlock/controller/timeout faults through
+that lifecycle and requires no active `aos-*` scope afterward. See
+[runtime-boundary.md](runtime-boundary.md) for the composed event order and
+the narrow earned claim.

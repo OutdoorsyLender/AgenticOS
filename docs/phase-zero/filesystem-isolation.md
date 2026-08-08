@@ -332,3 +332,17 @@ This was observed on Microsoft Windows NT `10.0.26200.0`, Python 3.13.9,
 pytest 8.3.5. The skips are Linux-only enforcement tests. This result proves
 cross-platform imports and non-Linux behavior only; it is not Windows
 filesystem isolation evidence.
+
+## 23. Milestone 4A composition
+
+M4A does not replace the M3B path/inode boundary. It maps securely opened host
+objects to fixed synthetic destinations with Bubblewrap FD binds, then protocol
+v2 makes the native launcher independently open and `fstat()` those
+sandbox-visible objects before Landlock. `/workspace` is the worker ABI; the
+host source locator is absent from worker argv, environment, and inner request.
+
+Real-host substitution, destination-change, wrong-type, and locator-replacement
+tests preserve the M3B identity/race invariant. The resulting mount,
+credential, IPC, and no-network evidence is in
+[runtime-boundary.md](runtime-boundary.md). The earlier standalone M3B claim
+and its ABI-v3 limitations remain valid rather than being rewritten.

@@ -164,6 +164,26 @@ def test_block_fd_ordering_and_normal_exit(m4a_runner, layout):
     assert evidence is not None and evidence.verified is True
     assert process.containment_cgroup is not None
     assert process.containment_cgroup.endswith(evidence.child.cgroup)
+    terminal = [
+        record
+        for record in m4a_runner.collector.records
+        if record.kind == "RUNTIME_BOUNDARY_VERIFIED"
+    ]
+    assert len(terminal) == 1
+    payload = terminal[0].payload
+    assert payload["workspace_destination"] == "/workspace"
+    assert payload["worker_cwd"] == "/workspace"
+    assert payload["network_policy"] == "DENY"
+    assert payload["containment_state"] == "TERMINATED"
+    assert payload["landlock_abi"] == 3
+    assert payload["namespace_identities"] == evidence.child.identities
+    assert len(payload["filesystem_view_digest"]) == 64
+    assert len(payload["environment_policy_digest"]) == 64
+    assert len(payload["combined_policy_digest"]) == 64
+    serialized = json.dumps(payload, sort_keys=True)
+    assert str(layout.root) not in serialized
+    assert str(layout.assigned_worktree) not in serialized
+    assert "OPENAI_API_KEY" not in serialized
 
 
 @pytest.mark.parametrize(

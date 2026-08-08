@@ -172,3 +172,17 @@ by re-running this corpus through a new `SandboxRunner` backend.
   (the canonical AgenticOS envelope). `EvidenceRecord` carries
   `schema_version` so these fields can evolve compatibly.
 - `.pre-commit-config.yaml`, `SECURITY.md`, `docs/security-boundary.md`.
+
+## Milestone 4A additions
+
+The corpus now includes fixed M4A runtime-view/security-state probes, UDP,
+abstract Unix sockets, a sandbox-private Unix-socket positive control, and a
+connected-FD sanitation attack. The production `NamespaceLandlockRunner` uses
+the same result/evidence model but operates only on stable sandbox paths.
+Synthetic host locators are supplied solely to the mapping test through a
+workspace-owned probe file, never through production argv, environment, or
+inner launch policy.
+
+The full M4A architecture, evidence fields, adversarial matrix, and limitations
+are recorded in [runtime-boundary.md](runtime-boundary.md). The durable next
+steps and authentication-ownership rules are in [../roadmap.md](../roadmap.md).

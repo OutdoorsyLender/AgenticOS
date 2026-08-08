@@ -131,3 +131,13 @@ from the later per-task `FILESYSTEM_POLICY_APPLIED` evidence. Unknown probe
 errors, ABI below 3, or a failed enforcement probe prevent scope creation and
 worker execution; there is no fallback to the experimental shim or to an
 unsafe runner.
+
+## 9. Milestone 4A runtime gate
+
+M4A additionally pins `/usr/bin/bwrap` by exact path, version, SHA-256,
+root ownership, mode 0755, absent setuid/setgid bits, and absent file
+capabilities. Its bounded behavior probe must demonstrate the explicit
+user/mount/PID/network/IPC/UTS namespace configuration, FD binds, JSON status,
+`--block-fd`, and nested-userns denial. The accepted recorded-host result is
+documented in [runtime-boundary.md](runtime-boundary.md). Capability discovery
+remains observation; every task re-gates before scope creation.
