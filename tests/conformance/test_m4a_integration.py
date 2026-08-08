@@ -16,6 +16,7 @@ import pytest
 from agenticos.sandbox.containment import (
     CancellationConfig,
     CgroupProcessRunner,
+    ContainmentState,
     ContainmentUnavailableError,
 )
 from agenticos.sandbox.evidence import EvidenceCollector
@@ -507,3 +508,162 @@ def test_connected_socket_negative_control_and_production_sanitation(
     finally:
         controller_peer.close()
         leaked_peer.close()
+
+
+def _assert_no_task_units(runner):
+    units = runner.backend._ctl(["list-units", "aos-*", "--all", "--no-legend"])
+    assert not units.stdout.strip()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "target"),
+    [
+        ("PROC-01", None),
+        ("PROC-02", None),
+        ("PROC-03", None),
+        ("PROC-04", None),
+        ("PROC-05", "/tmp/m4a-lingering-heartbeat"),
+        ("PROC-06", "/tmp/m4a-double-fork-heartbeat"),
+        ("PROC-07", None),
+        ("PROC-08", "/tmp/m4a-new-pgroup-heartbeat"),
+    ],
+)
+def test_descendant_shapes_inherit_boundary_and_finish_with_empty_cgroup(
+    m4a_runner, scenario, target
+):
+    args = ["--scenario", scenario]
+    if target is not None:
+        args += ["--target", target]
+    process, result = _run_worker(m4a_runner, *args)
+    assert result["succeeded"] is True, result
+    assert process.containment_state == ContainmentState.TERMINATED.value
+    _assert_no_task_units(m4a_runner)
+
+
+def test_timeout_cancels_signal_ignoring_worker_and_drains_scope(m4a_runner):
+    process = m4a_runner.run(
+        [
+            "/usr/bin/python3", "-c",
+            "import signal,time; "
+            "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+        ],
+        cwd="/workspace",
+        env={},
+        timeout=0.3,
+    )
+    assert process.timed_out is True
+    assert process.containment_state == ContainmentState.TERMINATED.value
+    _assert_no_task_units(m4a_runner)
+
+
+def test_namespace_evidence_failure_never_releases_hostile_exec_and_cleans_up(
+    m4a_runner, layout, monkeypatch
+):
+    import agenticos.sandbox.m4a_runner as runner_module
+
+    marker = layout.task_tmp / "namespace-fault-worker-ran"
+
+    def reject_namespace(*args, **kwargs):
+        raise runner_module.NamespaceEvidenceError("injected namespace mismatch")
+
+    monkeypatch.setattr(runner_module, "verify_namespace_evidence", reject_namespace)
+    with pytest.raises(ContainmentUnavailableError, match="namespace mismatch"):
+        m4a_runner.run(
+            [
+                "/usr/bin/python3", "-c",
+                "from pathlib import Path; Path('/tmp/namespace-fault-worker-ran').touch()",
+            ],
+            cwd="/workspace",
+            env={},
+            _marker_path=marker,
+        )
+    assert not marker.exists()
+    _assert_no_task_units(m4a_runner)
+
+
+def test_post_namespace_landlock_failure_never_executes_worker_and_cleans_up(
+    m4a_runner, layout, monkeypatch
+):
+    import agenticos.sandbox.m4a_runner as runner_module
+
+    original_build = runner_module.build_bwrap_argv
+    marker = layout.task_tmp / "landlock-fault-worker-ran"
+
+    def inject_fault(plan, **kwargs):
+        argv = original_build(plan, **kwargs)
+        command_index = argv.index("--")
+        argv[command_index:command_index] = [
+            "--setenv", "AOS_LAUNCHER_FAULT_INJECT", "fail_ruleset"
+        ]
+        return argv
+
+    monkeypatch.setattr(runner_module, "build_bwrap_argv", inject_fault)
+    with pytest.raises(ContainmentUnavailableError):
+        m4a_runner.run(
+            [
+                "/usr/bin/python3", "-c",
+                "from pathlib import Path; Path('/tmp/landlock-fault-worker-ran').touch()",
+            ],
+            cwd="/workspace",
+            env={},
+            _marker_path=marker,
+        )
+    assert not marker.exists()
+    assert m4a_runner.last_launch_outcome["failed_stage"] == "ruleset"
+    _assert_no_task_units(m4a_runner)
+
+
+def test_controller_exception_before_exec_release_cleans_up_without_worker(
+    m4a_runner, layout, monkeypatch
+):
+    import agenticos.sandbox.m4a_runner as runner_module
+
+    marker = layout.task_tmp / "controller-fault-worker-ran"
+
+    def fail_parse(*args, **kwargs):
+        raise RuntimeError("injected controller parse failure")
+
+    monkeypatch.setattr(runner_module, "parse_launcher_status", fail_parse)
+    with pytest.raises(RuntimeError, match="controller parse failure"):
+        m4a_runner.run(
+            [
+                "/usr/bin/python3", "-c",
+                "from pathlib import Path; Path('/tmp/controller-fault-worker-ran').touch()",
+            ],
+            cwd="/workspace",
+            env={},
+            _marker_path=marker,
+        )
+    assert not marker.exists()
+    _assert_no_task_units(m4a_runner)
+
+
+def test_missing_workspace_source_fails_before_process_creation(
+    m4a_runner, layout
+):
+    moved = layout.root / "workspace-temporarily-missing"
+    layout.assigned_worktree.rename(moved)
+    try:
+        with pytest.raises(Exception, match="source|No such file|resolve"):
+            m4a_runner.run(
+                ["/usr/bin/true"], cwd="/workspace", env={}
+            )
+        _assert_no_task_units(m4a_runner)
+    finally:
+        moved.rename(layout.assigned_worktree)
+
+
+def test_failed_worker_exec_after_authenticated_policy_is_fail_closed(
+    m4a_runner
+):
+    with pytest.raises(ContainmentUnavailableError, match="launcher failed at exec"):
+        m4a_runner.run(
+            ["/usr/bin/agenticos-definitely-missing"],
+            cwd="/workspace",
+            env={},
+        )
+    assert m4a_runner.last_launch_outcome["failed_stage"] == "exec"
+    assert m4a_runner.last_launch_outcome["policy_applied"] is True
+    assert m4a_runner.last_launch_outcome["exec_succeeded"] is False
+    _assert_no_task_units(m4a_runner)

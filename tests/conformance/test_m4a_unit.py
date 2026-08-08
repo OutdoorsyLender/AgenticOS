@@ -500,6 +500,24 @@ def test_v2_launch_request_uses_pre_authorized_synthetic_identities():
     assert prepared.policy_digest == "a" * 64
 
 
+def test_v2_allows_only_fixed_synthetic_null_identity_sentinel():
+    from agenticos.sandbox.launcher import prepare_launch_request
+
+    prepared = prepare_launch_request(
+        ["/usr/bin/true"], {}, "/workspace", [], protocol_version=2,
+        cwd_record=("/workspace", 11, 22),
+        root_records=[("/dev/null", 0, 0, "w")],
+    )
+    assert b"w 0 0 9 /dev/null\n" in prepared.wire
+
+    with pytest.raises(ValueError, match="identity"):
+        prepare_launch_request(
+            ["/usr/bin/true"], {}, "/workspace", [], protocol_version=2,
+            cwd_record=("/workspace", 11, 22),
+            root_records=[("/dev/zero", 0, 0, "w")],
+        )
+
+
 def test_v2_status_requires_identity_between_sanitize_and_policy():
     from agenticos.sandbox.launcher import parse_launcher_status
 

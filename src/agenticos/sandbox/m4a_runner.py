@@ -350,7 +350,10 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                     workspace_mount.source.identity.device,
                     workspace_mount.source.identity.inode,
                 ),
-                root_records=authorized_root_records,
+                root_records=[
+                    *authorized_root_records,
+                    ("/dev/null", 0, 0, "w"),
+                ],
                 policy_digest_override=plan.combined_policy_digest,
             )
             assert proc.stdin is not None

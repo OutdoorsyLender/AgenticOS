@@ -465,9 +465,13 @@ static int trusted_open(int base_fd, const char *path, int extra_oflags,
         if (fd >= 0) {
             if (fstat(fd, &st) != 0)
                 fail_closed("resolve", errno);
-            if ((uint64_t)st.st_dev != expected_dev ||
-                (uint64_t)st.st_ino != expected_ino)
+            if (expected_dev == 0 && expected_ino == 0) {
+                if (strcmp(path, "/dev/null") != 0 || !S_ISCHR(st.st_mode))
+                    fail_closed("resolve_identity", ESTALE);
+            } else if ((uint64_t)st.st_dev != expected_dev ||
+                       (uint64_t)st.st_ino != expected_ino) {
                 fail_closed("resolve_identity", ESTALE);
+            }
             return fd;
         }
         if (errno == EAGAIN)

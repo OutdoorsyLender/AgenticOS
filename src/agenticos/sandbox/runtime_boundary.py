@@ -619,7 +619,7 @@ def build_bwrap_argv(
         raise ValueError("setup descriptors must be unique and at least 5")
     argv = [str(executable), *plan.namespace_flags, "--clearenv", "--tmpfs", "/"]
     argv.extend(("--dir", "/opt", "--dir", "/opt/agenticos"))
-    argv.extend(("--dir", "/home", "--dir", "/run"))
+    argv.extend(("--dir", "/home", "--dir", "/run", "--dev", "/dev"))
     for mount in plan.mounts:
         _append_directory(argv, mount.destination)
         argv.extend(
@@ -640,8 +640,6 @@ def build_bwrap_argv(
         (
             "--proc",
             "/proc",
-            "--dev",
-            "/dev",
             "--chdir",
             plan.cwd,
             "--setenv",

@@ -175,7 +175,11 @@ def prepare_launch_request(
             raise ValueError("protocol v2 cwd record does not match cwd")
         resolved_root_records = list(root_records)
         for path, dev, ino, mode in resolved_root_records:
-            if not path.startswith("/") or dev < 0 or ino <= 0:
+            synthetic_null = path == "/dev/null" and dev == 0 and ino == 0
+            if (
+                not path.startswith("/")
+                or (not synthetic_null and (dev < 0 or ino <= 0))
+            ):
                 raise ValueError("invalid protocol v2 root identity record")
             if mode[0] not in "rxw" or any(f not in "fs" for f in mode[1:]):
                 raise ValueError(f"invalid root mode {mode!r}")
