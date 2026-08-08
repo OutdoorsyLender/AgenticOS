@@ -39,6 +39,13 @@ SCENARIO_CATALOG: dict[str, AttackScenario] = {
             expected_policy=PolicyExpectation.ALLOW.value,
         ),
         AttackScenario(
+            id="M4A-03",
+            category=ScenarioCategory.SOCKET.value,
+            description="Attempt use of a deliberately inherited connected socket.",
+            target_kind="fd:connected-socket",
+            expected_policy=PolicyExpectation.DENY.value,
+        ),
+        AttackScenario(
             id="FS-01",
             category=ScenarioCategory.FILESYSTEM.value,
             description="Read a permitted file in the assigned worktree.",
@@ -228,11 +235,32 @@ SCENARIO_CATALOG: dict[str, AttackScenario] = {
             expected_policy=PolicyExpectation.DENY.value,
         ),
         AttackScenario(
+            id="NET-03",
+            category=ScenarioCategory.NETWORK.value,
+            description="Attempt UDP exchange with a fixture-controlled host endpoint.",
+            target_kind="udp:fixture-denied",
+            expected_policy=PolicyExpectation.DENY.value,
+        ),
+        AttackScenario(
             id="SOCK-01",
             category=ScenarioCategory.SOCKET.value,
             description="Attempt connection to a fixture-created pathname Unix socket when supported.",
             target_kind="unix-socket:fixture",
             expected_policy=PolicyExpectation.DENY.value,
+        ),
+        AttackScenario(
+            id="SOCK-02",
+            category=ScenarioCategory.SOCKET.value,
+            description="Attempt connection to a fixture-created abstract Unix socket.",
+            target_kind="unix-socket:abstract-denied",
+            expected_policy=PolicyExpectation.DENY.value,
+        ),
+        AttackScenario(
+            id="SOCK-03",
+            category=ScenarioCategory.SOCKET.value,
+            description="Exchange data through a sandbox-private /tmp Unix socket.",
+            target_kind="unix-socket:private-tmp",
+            expected_policy=PolicyExpectation.ALLOW.value,
         ),
         AttackScenario(
             id="WRITE-01",

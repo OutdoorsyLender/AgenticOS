@@ -1080,6 +1080,34 @@ def scenario_tcp_connect(scenario_id: str, args: argparse.Namespace) -> dict[str
         )
 
 
+def scenario_udp_exchange(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """Send only to a fixture-controlled loopback endpoint and await a reply."""
+    started = utc_now_iso()
+    try:
+        host, _, port = args.target.rpartition(":")
+        if host != "127.0.0.1" or not port.isdigit():
+            raise ValueError("UDP fixture target must be 127.0.0.1:port")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(1.0)
+            sent = sock.sendto(b"AOS_CANARY_udp_probe", (host, int(port)))
+            try:
+                response, _ = sock.recvfrom(256)
+            except socket.timeout:
+                response = b""
+        return make_result(
+            scenario_id,
+            args.target,
+            started,
+            succeeded=bool(response),
+            error_type=None if response else "NoResponse",
+            details={"bytes_sent": sent, "response_received": bool(response)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id, args.target, started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+            details={"response_received": False},
+        )
 def scenario_unix_connect(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
     started = utc_now_iso()
     if not hasattr(socket, "AF_UNIX"):
@@ -1090,9 +1118,10 @@ def scenario_unix_connect(scenario_id: str, args: argparse.Namespace) -> dict[st
             details={"supported": False},
         )
     try:
+        endpoint = "\0" + args.target[1:] if args.target.startswith("@") else args.target
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(5.0)
-            sock.connect(args.target)
+            sock.connect(endpoint)
             try:
                 banner = sock.recv(256).decode("utf-8", errors="replace").strip()
             except socket.timeout:
@@ -1109,6 +1138,59 @@ def scenario_unix_connect(scenario_id: str, args: argparse.Namespace) -> dict[st
         )
 
 
+def scenario_private_unix_socket(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Prove socket-node creation remains available only in private /tmp."""
+    started = utc_now_iso()
+    endpoint = f"/tmp/aos-private-{os.getpid()}.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(endpoint)
+        server.listen(1)
+        client.settimeout(2.0)
+        client.connect(endpoint)
+        accepted, _ = server.accept()
+        with accepted:
+            client.sendall(b"private-socket-ok")
+            received = accepted.recv(64)
+        return make_result(
+            scenario_id, "/tmp", started,
+            succeeded=received == b"private-socket-ok",
+            details={"private_exchange": received == b"private-socket-ok"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id, "/tmp", started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+        )
+    finally:
+        client.close()
+        server.close()
+        try:
+            os.unlink(endpoint)
+        except FileNotFoundError:
+            pass
+
+
+def scenario_connected_fd_send(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Attempt a canary write through a deliberately supplied descriptor number."""
+    started = utc_now_iso()
+    try:
+        written = os.write(int(args.target), b"AOS_CANARY_connected_socket")
+        return make_result(
+            scenario_id, "inherited-fd", started, succeeded=True,
+            details={"bytes_written": written},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id, "inherited-fd", started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+            details={"errno": getattr(exc, "errno", None)},
+        )
 # --------------------------------------------------------------------------
 # Scenario registry — keep in sync with agenticos.sandbox.policy.SCENARIO_CATALOG
 # --------------------------------------------------------------------------
@@ -1120,6 +1202,8 @@ SCENARIOS: dict[str, dict[str, Any]] = {
                 "description": "Inspect the fixed M4A /workspace and runtime ABI."},
     "M4A-02": {"handler": scenario_m4a_security_state, "needs": (),
                 "description": "Inspect final M4A credentials, capabilities, userns, and FDs."},
+    "M4A-03": {"handler": scenario_connected_fd_send, "needs": ("target",),
+                "description": "Attempt use of a deliberately inherited connected socket."},
     "FS-01": {"handler": scenario_file_read, "needs": ("target",),
               "description": "Read a permitted file in the assigned worktree."},
     "FS-02": {"handler": scenario_file_read, "needs": ("target",),
@@ -1174,8 +1258,14 @@ SCENARIOS: dict[str, dict[str, Any]] = {
                "description": "Attempt a TCP connection to a fixture-controlled local test endpoint."},
     "NET-02": {"handler": scenario_tcp_connect, "needs": ("target",),
                "description": "Attempt a connection to a fixture-controlled denied local endpoint."},
+    "NET-03": {"handler": scenario_udp_exchange, "needs": ("target",),
+               "description": "Attempt UDP exchange with a fixture-controlled host endpoint."},
     "SOCK-01": {"handler": scenario_unix_connect, "needs": ("target",),
                 "description": "Attempt connection to a fixture-created pathname Unix socket when supported."},
+    "SOCK-02": {"handler": scenario_unix_connect, "needs": ("target",),
+                "description": "Attempt connection to a fixture-created abstract Unix socket."},
+    "SOCK-03": {"handler": scenario_private_unix_socket, "needs": (),
+                "description": "Exchange data through a sandbox-private /tmp Unix socket."},
     "WRITE-01": {"handler": scenario_file_write, "needs": ("target",),
                  "description": "Write within the assigned synthetic worktree."},
     "WRITE-02": {"handler": scenario_file_write, "needs": ("target",),

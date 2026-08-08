@@ -6,7 +6,9 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -391,3 +393,117 @@ def test_credentials_capabilities_nested_userns_and_fds_are_closed(
     assert details["nested_userns_exit_code"] != 0
     assert details["open_fds"] == [0, 1, 2], details["fd_targets"]
     assert details["fds_beyond_stdio"] == []
+
+
+def test_host_tcp_endpoint_is_unreachable_and_observes_no_connection(m4a_runner):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(0.2)
+        target = f"127.0.0.1:{server.getsockname()[1]}"
+        _, result = _run_worker(
+            m4a_runner, "--scenario", "NET-02", "--target", target
+        )
+        assert result["succeeded"] is False
+        with pytest.raises(TimeoutError):
+            server.accept()
+    finally:
+        server.close()
+
+
+def test_host_udp_endpoint_receives_no_datagram_or_response(m4a_runner):
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        server.bind(("127.0.0.1", 0))
+        server.settimeout(0.2)
+        target = f"127.0.0.1:{server.getsockname()[1]}"
+        _, result = _run_worker(
+            m4a_runner, "--scenario", "NET-03", "--target", target
+        )
+        assert result["succeeded"] is False
+        assert result["details"]["response_received"] is False
+        with pytest.raises(TimeoutError):
+            server.recvfrom(256)
+    finally:
+        server.close()
+
+
+def test_host_pathname_and_abstract_unix_sockets_are_unreachable(
+    m4a_runner, layout
+):
+    abstract_name = "aos-host-" + uuid.uuid4().hex
+    pathname = str(layout.sockets_dir / "host.sock")
+    endpoints = [(pathname, pathname), ("\0" + abstract_name, "@" + abstract_name)]
+    for bind_target, worker_target in endpoints:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(bind_target)
+            server.listen(1)
+            server.settimeout(0.2)
+            scenario = "SOCK-02" if worker_target.startswith("@") else "SOCK-01"
+            _, result = _run_worker(
+                m4a_runner, "--scenario", scenario, "--target", worker_target
+            )
+            assert result["succeeded"] is False
+            with pytest.raises(TimeoutError):
+                server.accept()
+        finally:
+            server.close()
+            if not bind_target.startswith("\0"):
+                Path(bind_target).unlink(missing_ok=True)
+
+
+def test_sandbox_private_tmp_unix_socket_works(m4a_runner):
+    _, result = _run_worker(m4a_runner, "--scenario", "SOCK-03")
+    assert result["succeeded"] is True, result
+    assert result["details"]["private_exchange"] is True
+
+
+def test_connected_socket_negative_control_and_production_sanitation(
+    m4a_runner
+):
+    control, inherited = socket.socketpair()
+    control.settimeout(2.0)
+    try:
+        canary = b"AOS_CANARY_namespace_only_connected_socket"
+        completed = subprocess.run(
+            [
+                "/usr/bin/unshare", "--user", "--map-root-user", "--net",
+                "--fork", sys.executable, "-c",
+                "import os,sys; os.write(int(sys.argv[1]), " + repr(canary) + ")",
+                str(inherited.fileno()),
+            ],
+            pass_fds=(inherited.fileno(),),
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert control.recv(256) == canary
+    finally:
+        control.close()
+        inherited.close()
+
+    controller_peer, leaked_peer = socket.socketpair()
+    controller_peer.settimeout(0.2)
+    try:
+        process = m4a_runner.run(
+            [
+                "/usr/bin/python3", "/opt/agenticos/worker.py",
+                "--scenario", "M4A-03", "--target", str(leaked_peer.fileno()),
+            ],
+            cwd="/workspace",
+            env={},
+            _leak_fds=(leaked_peer.fileno(),),
+        )
+        assert process.exit_code == 0, process.stderr
+        result = json.loads(process.stdout)
+        assert result["succeeded"] is False
+        assert result["details"]["errno"] == 9
+        with pytest.raises(TimeoutError):
+            controller_peer.recv(256)
+    finally:
+        controller_peer.close()
+        leaked_peer.close()
