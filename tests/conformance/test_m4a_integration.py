@@ -259,6 +259,33 @@ def test_unreadable_cgroup_evidence_is_not_treated_as_empty(
     _assert_no_task_units(m4a_runner)
 
 
+def test_failed_timeout_cancellation_never_uses_unbounded_reap_or_returns_failed(
+    m4a_runner, monkeypatch
+):
+    communicate_timeouts = []
+    original_communicate = m4a_runner._communicate_process
+
+    def record_communicate(proc, timeout):
+        communicate_timeouts.append(timeout)
+        return original_communicate(proc, timeout)
+
+    monkeypatch.setattr(m4a_runner, "_communicate_process", record_communicate)
+    monkeypatch.setattr(
+        m4a_runner,
+        "_cancel",
+        lambda _scope, _cgroup_path, _proc: ContainmentState.FAILED,
+    )
+    with pytest.raises(ContainmentUnavailableError, match="cleanup was not proven"):
+        m4a_runner.run(
+            ["/usr/bin/python3", "-c", "import time; time.sleep(60)"],
+            cwd="/workspace",
+            env={},
+            timeout=0.1,
+        )
+    assert None not in communicate_timeouts
+    _assert_no_task_units(m4a_runner)
+
+
 @pytest.mark.parametrize(
     ("profile", "write_allowed"),
     [(M4AProfile.INSPECT, False), (M4AProfile.BUILD, True)],

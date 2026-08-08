@@ -543,6 +543,22 @@ def open_verified_bwrap(capability: BubblewrapCapability) -> int:
             capability.inode,
         ):
             raise RuntimeBoundaryUnavailable("Bubblewrap object identity changed")
+        privilege_metadata = (
+            int(observed.st_uid),
+            int(observed.st_gid),
+            stat.S_IMODE(observed.st_mode),
+            bool(observed.st_mode & stat.S_ISUID),
+            bool(observed.st_mode & stat.S_ISGID),
+        )
+        accepted_metadata = (
+            capability.uid,
+            capability.gid,
+            capability.mode,
+            capability.setuid,
+            capability.setgid,
+        )
+        if privilege_metadata != accepted_metadata:
+            raise RuntimeBoundaryUnavailable("Bubblewrap privilege metadata changed")
         if _sha256_fd(fd) != capability.sha256:
             raise RuntimeBoundaryUnavailable("Bubblewrap object content changed")
         if _read_fd_capabilities(fd) != "":
@@ -835,7 +851,7 @@ def read_bwrap_setup_status(
     max_total_bytes: int = 16384,
     max_objects: int = 16,
 ) -> BwrapSetupStatus:
-    """Read bounded JSON through a quiet window after the one setup object."""
+    """Drain the immediately queued bounded JSON setup sequence."""
     if timeout <= 0:
         raise ValueError("status timeout must be positive")
     deadline = time.monotonic() + timeout

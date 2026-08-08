@@ -53,6 +53,13 @@ namespace set, FD binds, JSON status, `--block-fd`, `--disable-userns`,
 creation is denied. A path/version/hash/ownership/mode/capability or behavioral
 mismatch makes M4A unavailable; there is no weaker fallback.
 
+The pinned behavior probe emits one complete setup object before the block gate.
+The live reader drains the immediately queued bounded JSON sequence and rejects
+duplicates within it; Bubblewrap keeps the channel open while blocked, so this is
+not represented as an EOF-complete stream. Delayed setup records would be a
+backend behavior change requiring a new completion protocol and acceptance
+review. Independently authenticated host `/proc` identities remain authoritative.
+
 M4A uses `--unshare-user`, `--unshare-pid`, `--unshare-net`, `--unshare-ipc`,
 and `--unshare-uts`. It deliberately does not create a cgroup namespace. The
 host-visible systemd/cgroup-v2 scope remains lifecycle authority.

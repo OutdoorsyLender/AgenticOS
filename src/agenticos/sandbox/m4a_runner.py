@@ -626,8 +626,13 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 out_b, err_b = self._communicate_process(proc, timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                containment_state = self._cancel(scope, cgroup_path, proc).value
-                out_b, err_b = self._communicate_process(proc, None)
+                cancellation_state = self._cancel(scope, cgroup_path, proc)
+                if cancellation_state is not ContainmentState.TERMINATED:
+                    raise ContainmentUnavailableError(
+                        "timed-out M4A task cleanup was not proven"
+                    )
+                containment_state = cancellation_state.value
+                out_b, err_b = self._communicate_process(proc, self.setup_timeout)
 
             if cgroup_path is not None and not wait_cgroup_empty(
                 self.backend,
@@ -645,34 +650,37 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             self.backend.stop_unit(scope)
             if self.backend.unit_active(scope):
                 containment_state = ContainmentState.FAILED.value
-            if containment_state == ContainmentState.TERMINATED.value:
-                self._emit(
-                    EV_RUNTIME_VERIFIED,
-                    profile=plan.profile.value,
-                    workspace_destination="/workspace",
-                    workspace_identity={
-                        "device": workspace_mount.source.identity.device,
-                        "inode": workspace_mount.source.identity.inode,
-                        "file_type": workspace_mount.source.identity.file_type,
-                    },
-                    worker_cwd=plan.cwd,
-                    environment_names=[name for name, _ in plan.worker_environment],
-                    filesystem_view_digest=plan.filesystem_view_digest,
-                    environment_policy_digest=plan.environment_policy_digest,
-                    combined_policy_digest=plan.combined_policy_digest,
-                    network_policy=plan.network_policy,
-                    namespace_identities=dict(evidence.child.identities),
-                    child_cgroup=evidence.child.cgroup,
-                    gate_ordering=dict(self.last_ordering_observations),
-                    worker_marker_instrumented=_marker_path is not None,
-                    landlock_abi=outcome.get("abi"),
-                    handled_access_fs=outcome.get("handled_access_fs"),
-                    identity_verified=outcome.get("identity_verified"),
-                    policy_applied=outcome.get("policy_applied"),
-                    exec_succeeded=outcome.get("exec_succeeded"),
-                    containment_state=containment_state,
-                    cleanup="recursive_cgroup_empty",
+            if containment_state != ContainmentState.TERMINATED.value:
+                raise ContainmentUnavailableError(
+                    "M4A task cleanup did not reach proven TERMINATED state"
                 )
+            self._emit(
+                EV_RUNTIME_VERIFIED,
+                profile=plan.profile.value,
+                workspace_destination="/workspace",
+                workspace_identity={
+                    "device": workspace_mount.source.identity.device,
+                    "inode": workspace_mount.source.identity.inode,
+                    "file_type": workspace_mount.source.identity.file_type,
+                },
+                worker_cwd=plan.cwd,
+                environment_names=[name for name, _ in plan.worker_environment],
+                filesystem_view_digest=plan.filesystem_view_digest,
+                environment_policy_digest=plan.environment_policy_digest,
+                combined_policy_digest=plan.combined_policy_digest,
+                network_policy=plan.network_policy,
+                namespace_identities=dict(evidence.child.identities),
+                child_cgroup=evidence.child.cgroup,
+                gate_ordering=dict(self.last_ordering_observations),
+                worker_marker_instrumented=_marker_path is not None,
+                landlock_abi=outcome.get("abi"),
+                handled_access_fs=outcome.get("handled_access_fs"),
+                identity_verified=outcome.get("identity_verified"),
+                policy_applied=outcome.get("policy_applied"),
+                exec_succeeded=outcome.get("exec_succeeded"),
+                containment_state=containment_state,
+                cleanup="recursive_cgroup_empty",
+            )
             self._emit(EV_TASK_EXITED, unit=scope, containment_state=containment_state)
 
             finished_at = utc_now_iso()

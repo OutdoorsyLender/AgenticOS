@@ -343,6 +343,15 @@ fields, rejects malformed values, duplicate or contradictory setup records, and
 missing required evidence, while tolerating bounded unknown future fields and
 unrelated future object types.
 
+The parser guarantee applies to the bounded object sequence it receives. During
+the live gate, Bubblewrap necessarily keeps its status FD open while the child is
+blocked, so the controller drains all immediately queued objects through a short
+quiet window and then closes its read side; it does not claim an EOF-delimited
+stream. The exact pinned Bubblewrap behavior probe must produce one setup record
+before release. A future implementation that emits delayed setup records requires
+a new explicit completion protocol and acceptance review. Host `/proc` evidence,
+not JSON timing, remains namespace authority.
+
 The setup record supplies a host-visible child PID. While `--block-fd` still
 holds the namespace gate, the controller independently reads:
 

@@ -544,6 +544,13 @@ def test_verified_bubblewrap_reopen_rejects_identity_or_content_change(tmp_path)
     with pytest.raises(boundary.RuntimeBoundaryUnavailable, match="identity changed"):
         boundary.open_verified_bwrap(replace(capability, inode=observed.st_ino + 1))
 
+    executable.chmod(0o700)
+    with pytest.raises(
+        boundary.RuntimeBoundaryUnavailable, match="privilege metadata changed"
+    ):
+        boundary.open_verified_bwrap(capability)
+
+    executable.chmod(0o755)
     executable.write_bytes(b"other")
     with pytest.raises(boundary.RuntimeBoundaryUnavailable, match="content changed"):
         boundary.open_verified_bwrap(capability)
