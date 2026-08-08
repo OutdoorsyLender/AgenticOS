@@ -18,6 +18,7 @@ import pytest
 
 
 MODULE = "agenticos.sandbox.runtime_boundary"
+RUNNER_MODULE = "agenticos.sandbox.m4a_runner"
 
 
 def _runtime_boundary():
@@ -30,6 +31,19 @@ def test_runtime_boundary_module_exists():
 
 def test_runtime_boundary_module_imports_for_fail_closed_platform_checks():
     assert _runtime_boundary().__name__ == MODULE
+
+
+def test_m4a_runner_module_exists():
+    assert importlib.util.find_spec(RUNNER_MODULE) is not None
+
+
+def test_m4a_runner_uses_existing_cgroup_process_contract():
+    from agenticos.sandbox.containment import CgroupProcessRunner
+
+    module = importlib.import_module(RUNNER_MODULE)
+    runner_type = getattr(module, "NamespaceLandlockRunner", None)
+    assert isinstance(runner_type, type)
+    assert issubclass(runner_type, CgroupProcessRunner)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux openat2")

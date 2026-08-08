@@ -1,6 +1,10 @@
-"""Phase Zero sandbox conformance harness.
+"""AgenticOS sandbox conformance and Linux isolation backends.
 
-This package does NOT implement real OS security isolation. It provides a
-synthetic hostile-worker + conformance harness used to measure future real
-sandbox backends.
+The portable pieces provide a synthetic hostile-worker harness. Linux-only
+backends additionally compose measured cgroup, namespace, and Landlock
+boundaries and fail closed when their required host capabilities are absent.
 """
+
+from .m4a_runner import NamespaceLandlockRunner
+
+__all__ = ["NamespaceLandlockRunner"]
