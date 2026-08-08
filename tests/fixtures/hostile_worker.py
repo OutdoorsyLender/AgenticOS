@@ -191,6 +191,116 @@ def scenario_m4a_runtime_view(
             error_type=type(exc).__name__,
             error_message=str(exc),
         )
+
+
+def scenario_m4a_security_state(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Record final M4A env, capability, nested-userns, and FD state."""
+    started = utc_now_iso()
+    try:
+        # Census before importing ctypes: this Python build loads libffi from
+        # a private memfd, which is probe-created rather than inherited.
+        open_fds: list[int] = []
+        fd_types: dict[str, int] = {}
+        fd_targets: dict[str, str] = {}
+        for fd in range(256):
+            try:
+                observed_fd = os.fstat(fd)
+            except OSError:
+                continue
+            open_fds.append(fd)
+            fd_types[str(fd)] = observed_fd.st_mode & 0o170000
+            try:
+                fd_targets[str(fd)] = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError as exc:
+                fd_targets[str(fd)] = type(exc).__name__
+
+        import ctypes
+
+        class CapHeader(ctypes.Structure):
+            _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+        class CapData(ctypes.Structure):
+            _fields_ = [
+                ("effective", ctypes.c_uint32),
+                ("permitted", ctypes.c_uint32),
+                ("inheritable", ctypes.c_uint32),
+            ]
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        header = CapHeader(0x20080522, 0)
+        data = (CapData * 2)()
+        if libc.capget(ctypes.byref(header), ctypes.byref(data)) != 0:
+            raise OSError(ctypes.get_errno(), "capget failed")
+
+        def cap_value(field: str) -> int:
+            return int(getattr(data[0], field)) | (
+                int(getattr(data[1], field)) << 32
+            )
+
+        def prctl_set(operation: int, arg2: int = 0) -> int:
+            result = 0
+            for capability in range(64):
+                ctypes.set_errno(0)
+                value = libc.prctl(operation, arg2, capability, 0, 0)
+                if value == 1:
+                    result |= 1 << capability
+                elif value < 0 and ctypes.get_errno() == 22:
+                    break
+                elif value < 0:
+                    raise OSError(ctypes.get_errno(), "prctl capability query failed")
+            return result
+
+        capabilities = {
+            "CapInh": cap_value("inheritable"),
+            "CapPrm": cap_value("permitted"),
+            "CapEff": cap_value("effective"),
+            "CapBnd": prctl_set(23),  # PR_CAPBSET_READ
+            "CapAmb": prctl_set(47, 1),  # PR_CAP_AMBIENT / IS_SET
+        }
+        no_new_privs = libc.prctl(39, 0, 0, 0, 0)  # PR_GET_NO_NEW_PRIVS
+        if no_new_privs < 0:
+            raise OSError(ctypes.get_errno(), "PR_GET_NO_NEW_PRIVS failed")
+
+        nested = subprocess.run(
+            ["/usr/bin/unshare", "--user", "--map-root-user", "/usr/bin/true"],
+            input="",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        return make_result(
+            scenario_id,
+            "self",
+            started,
+            succeeded=True,
+            details={
+                "environment": dict(sorted(os.environ.items())),
+                "capabilities": {
+                    name: f"{value:016x}" for name, value in capabilities.items()
+                },
+                "capability_source": "capget+prctl",
+                "no_new_privs": str(no_new_privs),
+                "nested_userns_exit_code": nested.returncode,
+                "nested_userns_error_present": bool(nested.stderr.strip()),
+                "open_fds": open_fds,
+                "fd_types": fd_types,
+                "fd_targets": fd_targets,
+                "fds_beyond_stdio": [fd for fd in open_fds if fd > 2],
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id,
+            "self",
+            started,
+            succeeded=False,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
 def scenario_traversal_read(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
     """Attempt to reach the denied target from --base via a ../ relative path."""
     started = utc_now_iso()
@@ -1008,6 +1118,8 @@ Handler = Callable[[str, argparse.Namespace], dict[str, Any]]
 SCENARIOS: dict[str, dict[str, Any]] = {
     "M4A-01": {"handler": scenario_m4a_runtime_view, "needs": (),
                 "description": "Inspect the fixed M4A /workspace and runtime ABI."},
+    "M4A-02": {"handler": scenario_m4a_security_state, "needs": (),
+                "description": "Inspect final M4A credentials, capabilities, userns, and FDs."},
     "FS-01": {"handler": scenario_file_read, "needs": ("target",),
               "description": "Read a permitted file in the assigned worktree."},
     "FS-02": {"handler": scenario_file_read, "needs": ("target",),

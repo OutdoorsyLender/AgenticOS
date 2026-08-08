@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import stat
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ from agenticos.sandbox.runtime_boundary import (
     M4AProfile,
     probe_bubblewrap,
     secure_open_source,
+    build_worker_env,
 )
 from helpers import WORKER_PATH
 
@@ -341,3 +343,51 @@ def test_wrong_workspace_object_type_is_rejected_before_hostile_exec(
             _marker_path=marker,
         )
     assert not marker.exists()
+
+
+def test_credentials_capabilities_nested_userns_and_fds_are_closed(
+    m4a_runner, layout
+):
+    fake_credentials = {
+        "OPENAI_API_KEY": "AOS_CANARY_openai",
+        "ANTHROPIC_API_KEY": "AOS_CANARY_anthropic",
+        "AWS_ACCESS_KEY_ID": "AOS_CANARY_cloud",
+        "SSH_AUTH_SOCK": str(layout.sockets_dir / "host-agent.sock"),
+        "XDG_RUNTIME_DIR": str(layout.sockets_dir),
+        "AOS_PROVIDER_CONFIG": str(layout.fake_credentials_file),
+        "GIT_ASKPASS": str(layout.root / "host-askpass"),
+    }
+    outside_fd = os.open(layout.denied_sibling_file, os.O_RDONLY)
+    controller_socket, leaked_socket = socket.socketpair()
+    try:
+        process = m4a_runner.run(
+            [
+                "/usr/bin/python3", "/opt/agenticos/worker.py",
+                "--scenario", "M4A-02",
+            ],
+            cwd="/workspace",
+            env=fake_credentials,
+            _leak_fds=(outside_fd, leaked_socket.fileno()),
+        )
+    finally:
+        os.close(outside_fd)
+        controller_socket.close()
+        leaked_socket.close()
+
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["succeeded"] is True, result
+    details = result["details"]
+    assert details["environment"] == build_worker_env()
+    assert not set(fake_credentials).intersection(details["environment"])
+    assert details["capabilities"] == {
+        "CapInh": "0000000000000000",
+        "CapPrm": "0000000000000000",
+        "CapEff": "0000000000000000",
+        "CapBnd": "0000000000000000",
+        "CapAmb": "0000000000000000",
+    }
+    assert details["no_new_privs"] == "1"
+    assert details["nested_userns_exit_code"] != 0
+    assert details["open_fds"] == [0, 1, 2], details["fd_targets"]
+    assert details["fds_beyond_stdio"] == []

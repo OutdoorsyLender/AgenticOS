@@ -32,6 +32,13 @@ SCENARIO_CATALOG: dict[str, AttackScenario] = {
             expected_policy=PolicyExpectation.ALLOW.value,
         ),
         AttackScenario(
+            id="M4A-02",
+            category=ScenarioCategory.PROCESS.value,
+            description="Inspect final M4A credentials, capabilities, userns, and FDs.",
+            target_kind="self:m4a-security-state",
+            expected_policy=PolicyExpectation.ALLOW.value,
+        ),
+        AttackScenario(
             id="FS-01",
             category=ScenarioCategory.FILESYSTEM.value,
             description="Read a permitted file in the assigned worktree.",
