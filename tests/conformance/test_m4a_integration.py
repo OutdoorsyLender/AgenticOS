@@ -205,7 +205,7 @@ def test_workspace_identity_runtime_view_and_profiled_write(
         )
     )
     runner = _runtime_runner(layout, m4a_launcher, profile)
-    process, result = _run_worker(runner, "--scenario", "M4A-01")
+    process, result = _run_worker(runner, "--scenario", "FS-16")
 
     assert result["succeeded"] is True, result
     details = result["details"]
@@ -386,7 +386,7 @@ def test_credentials_capabilities_nested_userns_and_fds_are_closed(
         process = m4a_runner.run(
             [
                 "/usr/bin/python3", "/opt/agenticos/worker.py",
-                "--scenario", "M4A-02",
+                "--scenario", "PROC-09",
             ],
             cwd="/workspace",
             env=fake_credentials,
@@ -513,7 +513,7 @@ def test_connected_socket_negative_control_and_production_sanitation(
         process = m4a_runner.run(
             [
                 "/usr/bin/python3", "/opt/agenticos/worker.py",
-                "--scenario", "M4A-03", "--target", str(leaked_peer.fileno()),
+                "--scenario", "SOCK-04", "--target", str(leaked_peer.fileno()),
             ],
             cwd="/workspace",
             env={},

@@ -1198,11 +1198,11 @@ def scenario_connected_fd_send(
 Handler = Callable[[str, argparse.Namespace], dict[str, Any]]
 
 SCENARIOS: dict[str, dict[str, Any]] = {
-    "M4A-01": {"handler": scenario_m4a_runtime_view, "needs": (),
+    "FS-16": {"handler": scenario_m4a_runtime_view, "needs": (),
                 "description": "Inspect the fixed M4A /workspace and runtime ABI."},
-    "M4A-02": {"handler": scenario_m4a_security_state, "needs": (),
+    "PROC-09": {"handler": scenario_m4a_security_state, "needs": (),
                 "description": "Inspect final M4A credentials, capabilities, userns, and FDs."},
-    "M4A-03": {"handler": scenario_connected_fd_send, "needs": ("target",),
+    "SOCK-04": {"handler": scenario_connected_fd_send, "needs": ("target",),
                 "description": "Attempt use of a deliberately inherited connected socket."},
     "FS-01": {"handler": scenario_file_read, "needs": ("target",),
               "description": "Read a permitted file in the assigned worktree."},

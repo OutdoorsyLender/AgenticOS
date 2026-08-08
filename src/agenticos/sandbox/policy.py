@@ -25,21 +25,21 @@ SCENARIO_CATALOG: dict[str, AttackScenario] = {
     s.id: s
     for s in [
         AttackScenario(
-            id="M4A-01",
+            id="FS-16",
             category=ScenarioCategory.FILESYSTEM.value,
             description="Inspect the fixed M4A /workspace and runtime ABI.",
             target_kind="runtime:m4a-fixed-view",
             expected_policy=PolicyExpectation.ALLOW.value,
         ),
         AttackScenario(
-            id="M4A-02",
+            id="PROC-09",
             category=ScenarioCategory.PROCESS.value,
             description="Inspect final M4A credentials, capabilities, userns, and FDs.",
             target_kind="self:m4a-security-state",
             expected_policy=PolicyExpectation.ALLOW.value,
         ),
         AttackScenario(
-            id="M4A-03",
+            id="SOCK-04",
             category=ScenarioCategory.SOCKET.value,
             description="Attempt use of a deliberately inherited connected socket.",
             target_kind="fd:connected-socket",
