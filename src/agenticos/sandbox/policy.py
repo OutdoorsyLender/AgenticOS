@@ -25,6 +25,13 @@ SCENARIO_CATALOG: dict[str, AttackScenario] = {
     s.id: s
     for s in [
         AttackScenario(
+            id="M4A-01",
+            category=ScenarioCategory.FILESYSTEM.value,
+            description="Inspect the fixed M4A /workspace and runtime ABI.",
+            target_kind="runtime:m4a-fixed-view",
+            expected_policy=PolicyExpectation.ALLOW.value,
+        ),
+        AttackScenario(
             id="FS-01",
             category=ScenarioCategory.FILESYSTEM.value,
             description="Read a permitted file in the assigned worktree.",

@@ -157,7 +157,11 @@ class FilesystemPolicy:
             if p.exists():
                 runtime.append(p)
         # venv (if the interpreter lives in one)
-        for parent in Path(sys.executable).resolve().parents:
+        # Inspect lexical parents of the invoked interpreter as well as the
+        # resolved binary.  A conventional venv ``python`` is a symlink into
+        # /usr, but CPython still reads pyvenv.cfg beside that symlink before
+        # importing site.
+        for parent in Path(sys.executable).absolute().parents:
             if (parent / "pyvenv.cfg").exists():
                 runtime.append(parent)
                 break

@@ -40,6 +40,7 @@ from .runtime_boundary import (
     AuthorizedSource,
     M4AProfile,
     NamespaceEvidence,
+    NamespaceEvidenceError,
     RuntimeBoundaryUnavailable,
     build_bwrap_argv,
     build_runtime_plan,
@@ -242,7 +243,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             synthetic_home=synthetic_home,
         )
         workspace_mount = plan.mount_for("/workspace")
-        root_records = [
+        authorized_root_records = [
             (
                 mount.destination,
                 mount.source.identity.device,
@@ -251,22 +252,6 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             )
             for mount in plan.mounts
         ]
-        prepared = prepare_launch_request(
-            worker_argv,
-            dict(plan.worker_environment),
-            "/workspace",
-            [],
-            min_abi=3,
-            protocol_version=2,
-            cwd_record=(
-                "/workspace",
-                workspace_mount.source.identity.device,
-                workspace_mount.source.identity.inode,
-            ),
-            root_records=root_records,
-            policy_digest_override=plan.combined_policy_digest,
-        )
-
         namespace_gate_r0, namespace_gate_w = os.pipe()
         json_status_r, json_status_w0 = os.pipe()
         native_status_r, native_status_w0 = os.pipe()
@@ -329,9 +314,6 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             for source in sources:
                 os.close(source.fd)
             sources = ()
-            assert proc.stdin is not None
-            proc.stdin.write(prepared.wire)
-            proc.stdin.flush()
 
             setup_status = read_bwrap_setup_status(
                 json_status_r,
@@ -355,6 +337,25 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             )
             self.last_namespace_evidence = evidence
             self.last_ordering_observations["namespace_verified_before_release"] = True
+
+            prepared = prepare_launch_request(
+                worker_argv,
+                dict(plan.worker_environment),
+                "/workspace",
+                [],
+                min_abi=3,
+                protocol_version=2,
+                cwd_record=(
+                    "/workspace",
+                    workspace_mount.source.identity.device,
+                    workspace_mount.source.identity.inode,
+                ),
+                root_records=authorized_root_records,
+                policy_digest_override=plan.combined_policy_digest,
+            )
+            assert proc.stdin is not None
+            proc.stdin.write(prepared.wire)
+            proc.stdin.flush()
             self._emit(EV_CONTAINMENT_VERIFIED, unit=scope, cgroup_path=str(cgroup_path))
             self._emit(
                 EV_NAMESPACE_VERIFIED,
@@ -410,7 +411,9 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             self.last_launch_outcome = outcome
             if not outcome.get("policy_applied") or not outcome.get("identity_verified"):
                 raise ContainmentUnavailableError(
-                    "invalid M4A filesystem policy acknowledgement"
+                    "invalid M4A filesystem policy acknowledgement: "
+                    f"stage={outcome.get('failed_stage')} "
+                    f"error={outcome.get('failure')}"
                 )
             self._emit_v2_progress(scope, outcome)
             worker_absent = self._marker_absent(_marker_path)
@@ -467,6 +470,12 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                     raise ContainmentUnavailableError(
                         "M4A launch failed and cgroup cleanup was not proven"
                     ) from launch_error
+            if isinstance(
+                launch_error, (NamespaceEvidenceError, RuntimeBoundaryUnavailable)
+            ):
+                raise ContainmentUnavailableError(
+                    f"M4A launch evidence failed: {launch_error}"
+                ) from launch_error
             raise
         finally:
             for fd in child_ends:

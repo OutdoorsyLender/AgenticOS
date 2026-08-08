@@ -113,6 +113,84 @@ def scenario_file_write(scenario_id: str, args: argparse.Namespace) -> dict[str,
         )
 
 
+def scenario_m4a_runtime_view(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Inspect only the fixed synthetic M4A ABI and exercise its write tiers."""
+    started = utc_now_iso()
+    workspace = os.stat("/workspace", follow_symlinks=False)
+
+    def attempt_write(path: str) -> bool:
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("m4a synthetic write probe\n")
+            return True
+        except OSError:
+            return False
+
+    try:
+        with open("/workspace/allowed.txt", encoding="utf-8") as handle:
+            workspace_canary_readable = "AOS_CANARY_permitted_" in handle.read()
+        locator_visibility: list[bool] = []
+        try:
+            with open(
+                "/workspace/host-locator-probe.txt", encoding="utf-8"
+            ) as handle:
+                locator_visibility = [
+                    os.path.exists(locator.strip())
+                    for locator in handle
+                    if locator.strip()
+                ]
+        except FileNotFoundError:
+            pass
+        return make_result(
+            scenario_id,
+            "/workspace",
+            started,
+            succeeded=True,
+            details={
+                "cwd": os.getcwd(),
+                "pwd": os.environ.get("PWD"),
+                "workspace_identity": {
+                    "device": workspace.st_dev,
+                    "inode": workspace.st_ino,
+                    "type": workspace.st_mode & 0o170000,
+                },
+                "fixed_paths": {
+                    path: os.path.exists(path)
+                    for path in (
+                        "/bin", "/dev", "/home", "/lib", "/lib64", "/opt",
+                        "/proc", "/run", "/sbin", "/tmp", "/usr", "/workspace",
+                    )
+                },
+                "runtime_python": os.path.realpath(sys.executable),
+                "workspace_canary_readable": workspace_canary_readable,
+                "workspace_write_succeeded": attempt_write(
+                    "/workspace/m4a-write-probe.txt"
+                ),
+                "private_tmp_write_succeeded": attempt_write(
+                    "/tmp/m4a-tmp-probe.txt"
+                ),
+                "synthetic_home_write_succeeded": attempt_write(
+                    "/home/tool/m4a-home-probe.txt"
+                ),
+                "sibling_visible": os.path.exists("/sibling-worktree"),
+                "agenticos_private_visible": os.path.exists("/agenticos-private"),
+                "host_fake_home_visible": os.path.exists("/home/tool/.ssh/id_fake"),
+                "windows_mount_visible": os.path.exists("/mnt/c"),
+                "host_locator_visibility": locator_visibility,
+                "environment_names": sorted(os.environ),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id,
+            "/workspace",
+            started,
+            succeeded=False,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
 def scenario_traversal_read(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
     """Attempt to reach the denied target from --base via a ../ relative path."""
     started = utc_now_iso()
@@ -928,6 +1006,8 @@ def scenario_unix_connect(scenario_id: str, args: argparse.Namespace) -> dict[st
 Handler = Callable[[str, argparse.Namespace], dict[str, Any]]
 
 SCENARIOS: dict[str, dict[str, Any]] = {
+    "M4A-01": {"handler": scenario_m4a_runtime_view, "needs": (),
+                "description": "Inspect the fixed M4A /workspace and runtime ABI."},
     "FS-01": {"handler": scenario_file_read, "needs": ("target",),
               "description": "Read a permitted file in the assigned worktree."},
     "FS-02": {"handler": scenario_file_read, "needs": ("target",),

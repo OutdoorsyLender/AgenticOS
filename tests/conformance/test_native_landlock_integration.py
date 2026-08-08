@@ -425,7 +425,7 @@ def test_native_landlock_denies_symlink_read_and_write_escape(
             target=link,
         )
         assert result.succeeded is False
-        assert result.error_type == "PermissionError"
+        assert result.error_type == "PermissionError", result.process.stderr
         assert result.details["errno"] == 13
 
 
