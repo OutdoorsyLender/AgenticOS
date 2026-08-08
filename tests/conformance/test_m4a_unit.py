@@ -6,8 +6,11 @@ import importlib
 import importlib.util
 import json
 import os
+import select
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -457,3 +460,144 @@ def test_namespace_snapshot_reads_all_required_host_proc_fields():
     assert all(identity > 0 for identity in snapshot.identities.values())
     assert snapshot.cgroup.startswith("/")
     assert snapshot.uid_map.strip()
+
+
+def test_v2_launch_request_uses_pre_authorized_synthetic_identities():
+    from agenticos.sandbox.launcher import prepare_launch_request
+
+    prepared = prepare_launch_request(
+        ["/usr/bin/python3", "/opt/agenticos/worker.py"],
+        {"PWD": "/workspace"},
+        "/workspace",
+        [],
+        protocol_version=2,
+        cwd_record=("/workspace", 11, 22),
+        root_records=[
+            ("/workspace", 11, 22, "w"),
+            ("/usr", 33, 44, "x"),
+        ],
+        policy_digest_override="a" * 64,
+        nonce="m4a-nonce",
+    )
+
+    assert prepared.wire.startswith(b"AOSLAUNCH/2\n")
+    assert b"cwd 11 22 10 /workspace\n" in prepared.wire
+    assert b"w 11 22 10 /workspace\n" in prepared.wire
+    assert prepared.policy_digest == "a" * 64
+
+
+def test_v2_status_requires_identity_between_sanitize_and_policy():
+    from agenticos.sandbox.launcher import parse_launcher_status
+
+    parsed = parse_launcher_status(
+        b"R:nonce\nS\nI\nP\nN\nA:3:7fff:digest\n",
+        expected_nonce="nonce",
+        expected_policy_digest="digest",
+        protocol_version=2,
+    )
+
+    assert parsed["identity_verified"] is True
+    assert parsed["policy_applied"] is True
+    assert parsed["failed_stage"] is None
+
+
+def test_v2_status_rejects_missing_or_misordered_identity():
+    from agenticos.sandbox.launcher import parse_launcher_status
+
+    for transcript in (
+        b"R:nonce\nS\nP\nN\nA:3:7fff:digest\n",
+        b"R:nonce\nI\nS\nP\nN\nA:3:7fff:digest\n",
+    ):
+        parsed = parse_launcher_status(
+            transcript,
+            expected_nonce="nonce",
+            expected_policy_digest="digest",
+            protocol_version=2,
+        )
+        assert parsed["failed_stage"] == "protocol"
+        assert parsed["policy_applied"] is False
+
+
+def test_v1_status_transcript_remains_accepted():
+    from agenticos.sandbox.launcher import parse_launcher_status
+
+    parsed = parse_launcher_status(
+        b"R:nonce\nS\nP\nN\nA:3:7fff:digest\n",
+        expected_nonce="nonce",
+        expected_policy_digest="digest",
+        protocol_version=1,
+    )
+
+    assert parsed["policy_applied"] is True
+    assert parsed["identity_verified"] is False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="native Linux launcher")
+def test_native_launcher_v2_emits_identity_after_fd_sanitation(tmp_path):
+    from agenticos.sandbox.launcher import prepare_launch_request
+
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher = tmp_path / "fs_launcher"
+    subprocess.run(
+        [
+            "cc", "-std=c11", "-D_GNU_SOURCE", "-Wall", "-Wextra",
+            "-Werror", "-O2",
+            str(repo_root / "native" / "fs_launcher" / "fs_launcher.c"),
+            "-o", str(launcher),
+        ],
+        check=True,
+    )
+    cwd_stat = os.stat("/tmp")
+    usr_stat = os.stat("/usr")
+    prepared = prepare_launch_request(
+        ["/usr/bin/true"],
+        {},
+        "/tmp",
+        [],
+        protocol_version=2,
+        cwd_record=("/tmp", cwd_stat.st_dev, cwd_stat.st_ino),
+        root_records=[
+            ("/usr", usr_stat.st_dev, usr_stat.st_ino, "x"),
+            ("/tmp", cwd_stat.st_dev, cwd_stat.st_ino, "w"),
+        ],
+        policy_digest_override="a" * 64,
+        nonce="m4a-native",
+    )
+    status_r, status_w = os.pipe()
+    proc = subprocess.Popen(
+        [str(launcher)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"AOS_STATUS_FD": str(status_w)},
+        pass_fds=(status_w,),
+    )
+    os.close(status_w)
+    transcript = b""
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(prepared.wire)
+        proc.stdin.flush()
+        deadline = time.monotonic() + 2.0
+        while b"R:m4a-native\n" not in transcript and time.monotonic() < deadline:
+            ready, _, _ = select.select([status_r], [], [], 0.2)
+            if ready:
+                transcript += os.read(status_r, 256)
+        assert transcript == b"R:m4a-native\n"
+        proc.stdin.write(b"G")
+        proc.stdin.flush()
+        deadline = time.monotonic() + 2.0
+        while b"\nA:" not in transcript and time.monotonic() < deadline:
+            ready, _, _ = select.select([status_r], [], [], 0.2)
+            if ready:
+                transcript += os.read(status_r, 256)
+        assert transcript.splitlines()[:5] == [b"R:m4a-native", b"S", b"I", b"P", b"N"]
+        assert transcript.splitlines()[5] == b"A:3:7fff:" + b"a" * 64
+        proc.stdin.write(b"X")
+        proc.stdin.close()
+        assert proc.wait(timeout=5.0) == 0
+    finally:
+        os.close(status_r)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)

@@ -117,6 +117,7 @@ static char g_policy_digest[65];
 static long g_min_abi = 3;
 
 static int g_status_fd = -1;
+static int g_protocol_version = 1;
 
 static void fail_closed(const char *stage, int err);
 
@@ -318,7 +319,11 @@ static void parse_request(void)
     int seen_roots = 0;
 
     n = read_line(0, line, sizeof(line));
-    if (n != 11 || memcmp(line, "AOSLAUNCH/1", 11) != 0)
+    if (n == 11 && memcmp(line, "AOSLAUNCH/1", 11) == 0)
+        g_protocol_version = 1;
+    else if (n == 11 && memcmp(line, "AOSLAUNCH/2", 11) == 0)
+        g_protocol_version = 2;
+    else
         fail_closed("parse", EPROTO);
 
     for (;;) {
@@ -543,6 +548,12 @@ int main(void)
         root_fds[i] = trusted_open(base_fd, g_root_path[i], 0,
                                    g_root_dev[i], g_root_ino[i]);
 
+    if (g_protocol_version == 2) {
+        if (fchdir(cwd_fd) != 0)
+            fail_closed("cwd", errno);
+        status_letter('I');
+    }
+
     struct landlock_ruleset_attr rattr;
     rattr.handled_access_fs = LL_ALL_V3;
     if (fault && strcmp(fault, "fail_ruleset") == 0)
@@ -580,7 +591,7 @@ int main(void)
     }
     status_letter('P');
 
-    if (fchdir(cwd_fd) != 0)
+    if (g_protocol_version == 1 && fchdir(cwd_fd) != 0)
         fail_closed("cwd", errno);
 
     if (fault && strcmp(fault, "fail_nnp") == 0)

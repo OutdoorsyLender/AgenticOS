@@ -68,6 +68,7 @@ EV_POLICY_FAILED = "FILESYSTEM_POLICY_FAILED"
 EV_TASK_EXITED = "FILESYSTEM_TASK_EXITED"
 
 PROTOCOL_VERSION = "AOSLAUNCH/1"
+PROTOCOL_VERSION_M4A = "AOSLAUNCH/2"
 MAX_ITEMS = 64
 MAX_ITEM_LEN = 4096
 ABI_V3_HANDLED_ACCESS_FS = 0x7FFF
@@ -132,6 +133,10 @@ def prepare_launch_request(
     *,
     min_abi: int = 3,
     nonce: Optional[str] = None,
+    protocol_version: int = 1,
+    cwd_record: Optional[tuple[str, int, int]] = None,
+    root_records: Optional[Sequence[tuple[str, int, int, str]]] = None,
+    policy_digest_override: Optional[str] = None,
 ) -> PreparedLaunchRequest:
     """Serialize a launch request for the native fs_launcher protocol.
 
@@ -144,6 +149,8 @@ def prepare_launch_request(
         raise ValueError("argv count out of bounds")
     if len(env) > MAX_ITEMS or len(roots) > MAX_ITEMS:
         raise ValueError("env/roots count out of bounds")
+    if protocol_version not in (1, 2):
+        raise ValueError(f"unsupported launch protocol version {protocol_version}")
     for mode in (m for _, m in roots):
         if mode[0] not in "rxw" or any(f not in "fs" for f in mode[1:]):
             raise ValueError(f"invalid root mode {mode!r}")
@@ -153,22 +160,47 @@ def prepare_launch_request(
         return canonical, int(stat_result.st_dev), int(stat_result.st_ino)
 
     nonce_value = nonce or secrets.token_hex(16)
-    cwd_path, cwd_dev, cwd_ino = identity(str(cwd))
-    root_records = [(*identity(str(path)), mode) for path, mode in roots]
+    if protocol_version == 1:
+        if cwd_record is not None or root_records is not None:
+            raise ValueError("pre-authorized identity records require protocol v2")
+        cwd_path, cwd_dev, cwd_ino = identity(str(cwd))
+        resolved_root_records = [
+            (*identity(str(path)), mode) for path, mode in roots
+        ]
+    else:
+        if cwd_record is None or root_records is None:
+            raise ValueError("protocol v2 requires pre-authorized identity records")
+        cwd_path, cwd_dev, cwd_ino = cwd_record
+        if cwd_path != str(cwd):
+            raise ValueError("protocol v2 cwd record does not match cwd")
+        resolved_root_records = list(root_records)
+        for path, dev, ino, mode in resolved_root_records:
+            if not path.startswith("/") or dev < 0 or ino <= 0:
+                raise ValueError("invalid protocol v2 root identity record")
+            if mode[0] not in "rxw" or any(f not in "fs" for f in mode[1:]):
+                raise ValueError(f"invalid root mode {mode!r}")
     digest_payload = {
         "cwd": {"path": cwd_path, "dev": cwd_dev, "ino": cwd_ino},
         "roots": [
             {"path": path, "dev": dev, "ino": ino, "mode": mode}
-            for path, dev, ino, mode in root_records
+            for path, dev, ino, mode in resolved_root_records
         ],
     }
-    digest = hashlib.sha256(
-        json.dumps(
-            digest_payload, sort_keys=True, separators=(",", ":")
-        ).encode()
+    computed_digest = hashlib.sha256(
+        json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    if policy_digest_override is not None:
+        if (
+            len(policy_digest_override) != 64
+            or any(c not in "0123456789abcdef" for c in policy_digest_override)
+        ):
+            raise ValueError("policy digest override must be lowercase SHA-256 hex")
+        digest = policy_digest_override
+    else:
+        digest = computed_digest
 
-    out = [PROTOCOL_VERSION.encode() + b"\n"]
+    version_tag = PROTOCOL_VERSION if protocol_version == 1 else PROTOCOL_VERSION_M4A
+    out = [version_tag.encode() + b"\n"]
     out.append(b"nonce " + _lv(nonce_value))
     out.append(b"policy_digest " + _lv(digest))
     out.append(f"min_abi {int(min_abi)}\n".encode())
@@ -177,10 +209,10 @@ def prepare_launch_request(
     out.append(f"env {len(env)}\n".encode())
     out += [_lv(f"{k}={v}") for k, v in env.items()]
     out.append(f"cwd {cwd_dev} {cwd_ino} ".encode() + _lv(cwd_path))
-    out.append(f"roots {len(root_records)}\n".encode())
+    out.append(f"roots {len(resolved_root_records)}\n".encode())
     out += [
         f"{mode} {dev} {ino} ".encode() + _lv(path)
-        for path, dev, ino, mode in root_records
+        for path, dev, ino, mode in resolved_root_records
     ]
     out.append(b"END\n")
     return PreparedLaunchRequest(
@@ -210,6 +242,7 @@ def parse_launcher_status(
     expected_policy_digest: Optional[str] = None,
     expected_min_abi: int = 3,
     expected_handled_access_fs: int = ABI_V3_HANDLED_ACCESS_FS,
+    protocol_version: int = 1,
 ) -> dict:
     """Parse and authenticate the line-oriented launcher status stream."""
     outcome: dict = {
@@ -222,6 +255,7 @@ def parse_launcher_status(
         "abi": None,
         "handled_access_fs": None,
         "policy_digest": None,
+        "identity_verified": False,
     }
     for raw_line in data.splitlines():
         line = raw_line.decode(errors="replace")
@@ -229,7 +263,7 @@ def parse_launcher_status(
             if line.startswith("R:"):
                 outcome["progress"].append("R")
                 outcome["nonce"] = line[2:]
-            elif line in ("S", "P", "N"):
+            elif line in ("S", "I", "P", "N"):
                 outcome["progress"].append(line)
             elif line.startswith("A:"):
                 _tag, abi, mask, digest = line.split(":", 3)
@@ -259,8 +293,15 @@ def parse_launcher_status(
         and outcome["policy_digest"] != expected_policy_digest
     ):
         outcome["failed_stage"] = "protocol"
+    expected_progress = (
+        ["R", "S", "P", "N", "A"]
+        if protocol_version == 1
+        else ["R", "S", "I", "P", "N", "A"]
+    )
+    if protocol_version not in (1, 2):
+        outcome["failed_stage"] = "protocol"
     if "A" in outcome["progress"] and (
-        outcome["progress"] != ["R", "S", "P", "N", "A"]
+        outcome["progress"] != expected_progress
         or outcome["abi"] is None
         or outcome["abi"] < expected_min_abi
         or outcome["handled_access_fs"] != expected_handled_access_fs
@@ -271,6 +312,11 @@ def parse_launcher_status(
         and outcome["failed_stage"] in (None, "exec")
         and outcome["abi"] is not None
         and outcome["handled_access_fs"] is not None
+    )
+    outcome["identity_verified"] = (
+        protocol_version == 2
+        and "I" in outcome["progress"]
+        and outcome["failed_stage"] in (None, "exec")
     )
     # Parsing A proves the restriction, not exec: the native launcher still
     # waits for the controller's second gate.  The runner sets this only
