@@ -433,6 +433,12 @@ class HostCapabilityDetector:
                            "(detection only, not enforced)")
             elif probe.status == "ERROR":
                 report.add("landlock_abi", CapabilityStatus.ERROR, probe.reason)
+            elif probe.errno is None:
+                # On a non-Linux/unknown-syscall platform no version query
+                # ran. Preserve the detector's observation contract:
+                # UNVERIFIED, not a fabricated kernel capability result.
+                report.add("landlock_abi", CapabilityStatus.UNVERIFIED,
+                           probe.reason)
             else:
                 report.add("landlock_abi", CapabilityStatus.UNSUPPORTED,
                            f"landlock_create_ruleset {probe.status.lower()}: "

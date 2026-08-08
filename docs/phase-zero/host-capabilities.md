@@ -47,7 +47,7 @@ contains usernames, home paths, machine ids, or environment dumps.
 | `cgroup_kill_available` | `cgroup.kill` in a dynamically discovered non-root cgroup (kernel ≥ 5.14) |
 | `cgroup_events_available` | `cgroup.events` in a dynamically discovered non-root cgroup |
 | `user_namespaces_observed` | `/proc/sys/user/max_user_namespaces` > 0 |
-| `landlock_abi` | `landlock_create_ruleset` **version query only** via ctypes syscall; any positive ABI is detected as `SUPPORTED`, `ENOSYS` is unsupported, `EOPNOTSUPP` disabled, other errno `ERROR`; the M3B runtime gate separately rejects ABI <3 |
+| `landlock_abi` | `landlock_create_ruleset` **version query only** via ctypes syscall; any positive ABI is detected as `SUPPORTED`, `ENOSYS` is unsupported, `EOPNOTSUPP` disabled, other errno `ERROR`; platforms where no query can run remain `UNVERIFIED`; the M3B runtime gate separately rejects ABI <3 |
 | `repo_on_linux_filesystem` | repo path must not be under `/mnt/<drive>` (drvfs) |
 
 ## 3. System capability vs current-user permission
