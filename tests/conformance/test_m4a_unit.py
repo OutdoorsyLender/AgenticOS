@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import importlib
 import importlib.util
 import json
@@ -511,6 +512,35 @@ def test_cgroup_populated_distinguishes_gone_from_unreadable_and_malformed(
 
     monkeypatch.setattr(Path, "read_text", deny_read)
     with pytest.raises(PermissionError, match="unreadable"):
+        backend.cgroup_populated(cgroup)
+
+
+def test_cgroup_populated_accepts_enodev_only_after_evidence_object_is_gone(
+    tmp_path, monkeypatch
+):
+    from agenticos.sandbox.containment import SystemdScopeBackend
+
+    backend = object.__new__(SystemdScopeBackend)
+    cgroup = tmp_path / "collected.scope"
+    events = cgroup / "cgroup.events"
+
+    def no_device(_path, *args, **kwargs):
+        raise OSError(errno.ENODEV, "injected collected cgroup")
+
+    monkeypatch.setattr(Path, "read_text", no_device)
+    assert backend.cgroup_populated(cgroup) is None
+
+    cgroup.mkdir()
+    events.touch()
+    with pytest.raises(OSError) as observed:
+        backend.cgroup_populated(cgroup)
+    assert observed.value.errno == errno.ENODEV
+
+    def unreadable_stat(_path, *args, **kwargs):
+        raise PermissionError("injected unreadable collection confirmation")
+
+    monkeypatch.setattr(Path, "stat", unreadable_stat)
+    with pytest.raises(PermissionError, match="collection confirmation"):
         backend.cgroup_populated(cgroup)
 
 

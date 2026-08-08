@@ -25,6 +25,7 @@ confirms the hierarchy is empty. Root-process exit alone is NEVER enough.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import signal
@@ -242,10 +243,23 @@ class SystemdScopeBackend:
             return False
 
     def cgroup_populated(self, cgroup_path: Path) -> Optional[bool]:
+        events_path = cgroup_path / "cgroup.events"
         try:
-            events = parse_cgroup_events((cgroup_path / "cgroup.events").read_text())
+            events = parse_cgroup_events(events_path.read_text())
         except FileNotFoundError:
             return None  # cgroup gone == nothing inside
+        except OSError as exc:
+            # cgroupfs can report ENODEV when systemd removes the hierarchy
+            # during an in-progress read. Accept it only after independently
+            # observing that the evidence object is now gone.
+            if exc.errno == errno.ENODEV:
+                try:
+                    events_path.stat()
+                except FileNotFoundError:
+                    return None
+                except OSError:
+                    raise
+            raise
         if "populated" not in events:
             raise ContainmentUnavailableError(
                 f"cgroup.events lacks populated evidence: {cgroup_path}"
