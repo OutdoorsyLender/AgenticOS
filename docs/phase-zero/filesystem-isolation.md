@@ -320,3 +320,15 @@ The sole skip is the intentional non-Linux gating assertion. After each full
 run, `systemctl --user list-units --all 'aos-*'` returned no units and no
 `aos-*` cgroup reported `populated 1`. Native-Windows pytest is a portability
 regression only and is reported separately from Linux enforcement evidence.
+
+Windows portability regression after fast-forwarding the same Git commit:
+
+```powershell
+python -m pytest -o addopts= -q
+# 87 passed, 94 skipped in 21.13s
+```
+
+This was observed on Microsoft Windows NT `10.0.26200.0`, Python 3.13.9,
+pytest 8.3.5. The skips are Linux-only enforcement tests. This result proves
+cross-platform imports and non-Linux behavior only; it is not Windows
+filesystem isolation evidence.
