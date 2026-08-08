@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import select
 import subprocess
@@ -69,9 +70,17 @@ EV_TASK_EXITED = "FILESYSTEM_TASK_EXITED"
 
 PROTOCOL_VERSION = "AOSLAUNCH/1"
 PROTOCOL_VERSION_M4A = "AOSLAUNCH/2"
+PROTOCOL_VERSION_M4B = "AOSLAUNCH/3"
 MAX_ITEMS = 64
 MAX_ITEM_LEN = 4096
 ABI_V3_HANDLED_ACCESS_FS = 0x7FFF
+_MAX_UNSIGNED_64 = (1 << 64) - 1
+_MAX_FD_NUMBER = (1 << 31) - 1
+_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_LOWER_HEX_32_RE = re.compile(r"[0-9a-f]{32}\Z")
+_LOWER_HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
+_M4B_PROXY_HOST = "127.0.0.1"
+_M4B_PROXY_PORT = 18080
 
 # Ambient-credential accident prevention — NOT credential isolation.
 _ENV_DENY_SUBSTRINGS = (
@@ -91,6 +100,56 @@ class PreparedLaunchRequest:
     wire: bytes
     nonce: str
     policy_digest: str
+
+
+@dataclass(frozen=True)
+class NetworkLaunchRecord:
+    """Exact controller-authorized listener handoff context for protocol v3."""
+
+    task_id: str
+    task_generation: int
+    launch_nonce: str
+    network_policy_digest: str
+    handoff_fd: int
+    proxy_host: str
+    proxy_port: int
+
+    def __post_init__(self) -> None:
+        if type(self.task_id) is not str or not _TASK_ID_RE.fullmatch(self.task_id):
+            raise ValueError("task_id must be a bounded ASCII identifier")
+        if (
+            type(self.task_generation) is not int
+            or not 0 < self.task_generation <= _MAX_UNSIGNED_64
+        ):
+            raise ValueError(
+                "task_generation must be a positive unsigned 64-bit integer"
+            )
+        if (
+            type(self.launch_nonce) is not str
+            or not _LOWER_HEX_32_RE.fullmatch(self.launch_nonce)
+        ):
+            raise ValueError(
+                "launch_nonce must be exactly 32 lowercase hexadecimal characters"
+            )
+        if (
+            type(self.network_policy_digest) is not str
+            or not _LOWER_HEX_64_RE.fullmatch(self.network_policy_digest)
+        ):
+            raise ValueError(
+                "network_policy_digest must be lowercase SHA-256 hexadecimal"
+            )
+        if (
+            type(self.handoff_fd) is not int
+            or not 5 <= self.handoff_fd <= _MAX_FD_NUMBER
+        ):
+            raise ValueError("handoff_fd must be an exact descriptor at least 5")
+        if (
+            type(self.proxy_host) is not str
+            or self.proxy_host != _M4B_PROXY_HOST
+            or type(self.proxy_port) is not int
+            or self.proxy_port != _M4B_PROXY_PORT
+        ):
+            raise ValueError("proxy listener must be exactly 127.0.0.1:18080")
 
 
 def sanitize_env(env: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
@@ -115,11 +174,13 @@ def sanitize_env(env: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
     return kept, sorted(dropped)
 
 
-def _lv(value: str) -> bytes:
+def _lv(value: str, *, reject_nul: bool = False) -> bytes:
     """Length-prefixed protocol value; bounded; rejects newlines."""
     raw = value.encode()
     if b"\n" in raw:
         raise ValueError("protocol value must not contain a newline")
+    if reject_nul and b"\0" in raw:
+        raise ValueError("protocol v3 value must not contain NUL")
     if len(raw) > MAX_ITEM_LEN:
         raise ValueError(f"protocol value exceeds {MAX_ITEM_LEN} bytes")
     return str(len(raw)).encode() + b" " + raw + b"\n"
@@ -137,6 +198,8 @@ def prepare_launch_request(
     cwd_record: Optional[tuple[str, int, int]] = None,
     root_records: Optional[Sequence[tuple[str, int, int, str]]] = None,
     policy_digest_override: Optional[str] = None,
+    status_fd: Optional[int] = None,
+    network_record: Optional[NetworkLaunchRecord] = None,
 ) -> PreparedLaunchRequest:
     """Serialize a launch request for the native fs_launcher protocol.
 
@@ -149,8 +212,21 @@ def prepare_launch_request(
         raise ValueError("argv count out of bounds")
     if len(env) > MAX_ITEMS or len(roots) > MAX_ITEMS:
         raise ValueError("env/roots count out of bounds")
-    if protocol_version not in (1, 2):
+    if type(protocol_version) is not int or protocol_version not in (1, 2, 3):
         raise ValueError(f"unsupported launch protocol version {protocol_version}")
+    if protocol_version in (1, 2):
+        if status_fd is not None or network_record is not None:
+            raise ValueError("status fd and network record require protocol v3")
+    else:
+        if type(network_record) is not NetworkLaunchRecord:
+            raise ValueError("protocol v3 requires exactly one network record")
+        if (
+            type(status_fd) is not int
+            or not 3 <= status_fd <= _MAX_FD_NUMBER
+        ):
+            raise ValueError("protocol v3 status fd must be an exact descriptor at least 3")
+        if status_fd == network_record.handoff_fd:
+            raise ValueError("protocol v3 status and handoff descriptors must be distinct")
     for mode in (m for _, m in roots):
         if mode[0] not in "rxw" or any(f not in "fs" for f in mode[1:]):
             raise ValueError(f"invalid root mode {mode!r}")
@@ -159,7 +235,13 @@ def prepare_launch_request(
         stat_result = os.stat(canonical)
         return canonical, int(stat_result.st_dev), int(stat_result.st_ino)
 
-    nonce_value = nonce or secrets.token_hex(16)
+    if protocol_version == 3:
+        assert network_record is not None
+        nonce_value = network_record.launch_nonce if nonce is None else nonce
+        if type(nonce_value) is not str or nonce_value != network_record.launch_nonce:
+            raise ValueError("protocol v3 launch nonce does not match network record")
+    else:
+        nonce_value = nonce or secrets.token_hex(16)
     if protocol_version == 1:
         if cwd_record is not None or root_records is not None:
             raise ValueError("pre-authorized identity records require protocol v2")
@@ -169,10 +251,14 @@ def prepare_launch_request(
         ]
     else:
         if cwd_record is None or root_records is None:
-            raise ValueError("protocol v2 requires pre-authorized identity records")
+            raise ValueError(
+                f"protocol v{protocol_version} requires pre-authorized identity records"
+            )
         cwd_path, cwd_dev, cwd_ino = cwd_record
         if cwd_path != str(cwd):
-            raise ValueError("protocol v2 cwd record does not match cwd")
+            raise ValueError(
+                f"protocol v{protocol_version} cwd record does not match cwd"
+            )
         resolved_root_records = list(root_records)
         for path, dev, ino, mode in resolved_root_records:
             synthetic_null = path == "/dev/null" and dev == 0 and ino == 0
@@ -180,7 +266,9 @@ def prepare_launch_request(
                 not path.startswith("/")
                 or (not synthetic_null and (dev < 0 or ino <= 0))
             ):
-                raise ValueError("invalid protocol v2 root identity record")
+                raise ValueError(
+                    f"invalid protocol v{protocol_version} root identity record"
+                )
             if mode[0] not in "rxw" or any(f not in "fs" for f in mode[1:]):
                 raise ValueError(f"invalid root mode {mode!r}")
     digest_payload = {
@@ -203,19 +291,44 @@ def prepare_launch_request(
     else:
         digest = computed_digest
 
-    version_tag = PROTOCOL_VERSION if protocol_version == 1 else PROTOCOL_VERSION_M4A
+    version_tag = {
+        1: PROTOCOL_VERSION,
+        2: PROTOCOL_VERSION_M4A,
+        3: PROTOCOL_VERSION_M4B,
+    }[protocol_version]
     out = [version_tag.encode() + b"\n"]
-    out.append(b"nonce " + _lv(nonce_value))
-    out.append(b"policy_digest " + _lv(digest))
+    if protocol_version == 3:
+        assert status_fd is not None
+        assert network_record is not None
+        out.append(f"status_fd {status_fd}\n".encode("ascii"))
+        out.append(
+            (
+                "network "
+                f"{network_record.task_id} "
+                f"{network_record.task_generation} "
+                f"{network_record.launch_nonce} "
+                f"{network_record.network_policy_digest} "
+                f"{network_record.handoff_fd} "
+                f"{network_record.proxy_host} "
+                f"{network_record.proxy_port}\n"
+            ).encode("ascii")
+        )
+    reject_nul = protocol_version == 3
+    out.append(b"nonce " + _lv(nonce_value, reject_nul=reject_nul))
+    out.append(b"policy_digest " + _lv(digest, reject_nul=reject_nul))
     out.append(f"min_abi {int(min_abi)}\n".encode())
     out.append(f"argv {len(argv)}\n".encode())
-    out += [_lv(a) for a in argv]
+    out += [_lv(a, reject_nul=reject_nul) for a in argv]
     out.append(f"env {len(env)}\n".encode())
-    out += [_lv(f"{k}={v}") for k, v in env.items()]
-    out.append(f"cwd {cwd_dev} {cwd_ino} ".encode() + _lv(cwd_path))
+    out += [_lv(f"{k}={v}", reject_nul=reject_nul) for k, v in env.items()]
+    out.append(
+        f"cwd {cwd_dev} {cwd_ino} ".encode()
+        + _lv(cwd_path, reject_nul=reject_nul)
+    )
     out.append(f"roots {len(resolved_root_records)}\n".encode())
     out += [
-        f"{mode} {dev} {ino} ".encode() + _lv(path)
+        f"{mode} {dev} {ino} ".encode()
+        + _lv(path, reject_nul=reject_nul)
         for path, dev, ino, mode in resolved_root_records
     ]
     out.append(b"END\n")
@@ -244,11 +357,14 @@ def parse_launcher_status(
     *,
     expected_nonce: Optional[str] = None,
     expected_policy_digest: Optional[str] = None,
+    expected_network_record: Optional[NetworkLaunchRecord] = None,
     expected_min_abi: int = 3,
     expected_handled_access_fs: int = ABI_V3_HANDLED_ACCESS_FS,
     protocol_version: int = 1,
 ) -> dict:
     """Parse and authenticate the line-oriented launcher status stream."""
+    v3_expected_progress = ["R", "L", "S", "I", "P", "N", "A"]
+    v3_terminal_seen = False
     outcome: dict = {
         "progress": [],
         "failed_stage": None,
@@ -260,13 +376,52 @@ def parse_launcher_status(
         "handled_access_fs": None,
         "policy_digest": None,
         "identity_verified": False,
+        "listener_exported": False,
+        "network_policy_digest": None,
+        "listener_frame": None,
+        "listener_evidence": None,
     }
     for raw_line in data.splitlines():
         line = raw_line.decode(errors="replace")
         try:
+            if protocol_version == 3 and v3_terminal_seen:
+                raise ValueError("record followed a terminal launcher status")
             if line.startswith("R:"):
                 outcome["progress"].append("R")
                 outcome["nonce"] = line[2:]
+            elif raw_line.startswith(b"L:"):
+                if protocol_version != 3 or "L" in outcome["progress"]:
+                    raise ValueError("listener status is not valid for this protocol")
+                pieces = raw_line.split(b":", 2)
+                if len(pieces) != 3:
+                    raise ValueError("malformed listener status")
+                network_digest = pieces[1].decode("ascii")
+                if not _LOWER_HEX_64_RE.fullmatch(network_digest):
+                    raise ValueError("malformed listener status digest")
+                from .network_identity import (  # Linux-only protocol-v3 path
+                    ListenerAdoptionFrame,
+                    NetworkIdentityError,
+                )
+
+                try:
+                    frame = ListenerAdoptionFrame.from_bytes(pieces[2])
+                except NetworkIdentityError as exc:
+                    raise ValueError("malformed listener adoption frame") from exc
+                if (
+                    type(expected_network_record) is not NetworkLaunchRecord
+                    or network_digest != frame.policy_digest
+                    or frame.task_id != expected_network_record.task_id
+                    or frame.task_generation
+                    != expected_network_record.task_generation
+                    or frame.launch_nonce != expected_network_record.launch_nonce
+                    or frame.policy_digest
+                    != expected_network_record.network_policy_digest
+                ):
+                    raise ValueError("listener status context did not authenticate")
+                outcome["progress"].append("L")
+                outcome["network_policy_digest"] = network_digest
+                outcome["listener_frame"] = frame
+                outcome["listener_evidence"] = frame.evidence
             elif line in ("S", "I", "P", "N"):
                 outcome["progress"].append(line)
             elif line.startswith("A:"):
@@ -279,10 +434,19 @@ def parse_launcher_status(
                 _tag, stage, error_number = line.split(":", 2)
                 outcome["failed_stage"] = stage
                 outcome["errno"] = int(error_number)
+                if protocol_version == 3:
+                    v3_terminal_seen = True
             elif line.startswith("E:"):
+                if (
+                    protocol_version == 3
+                    and outcome["progress"] != v3_expected_progress
+                ):
+                    raise ValueError("exec status preceded launcher completion")
                 _tag, error_number = line.split(":", 1)
                 outcome["failed_stage"] = "exec"
                 outcome["exec_errno"] = int(error_number)
+                if protocol_version == 3:
+                    v3_terminal_seen = True
             else:
                 raise ValueError("unknown status record")
         except (TypeError, ValueError):
@@ -297,12 +461,26 @@ def parse_launcher_status(
         and outcome["policy_digest"] != expected_policy_digest
     ):
         outcome["failed_stage"] = "protocol"
-    expected_progress = (
-        ["R", "S", "P", "N", "A"]
-        if protocol_version == 1
-        else ["R", "S", "I", "P", "N", "A"]
-    )
-    if protocol_version not in (1, 2):
+    if protocol_version == 1:
+        expected_progress = ["R", "S", "P", "N", "A"]
+    elif protocol_version == 2:
+        expected_progress = ["R", "S", "I", "P", "N", "A"]
+    else:
+        expected_progress = v3_expected_progress
+    if (
+        type(protocol_version) is not int
+        or protocol_version not in (1, 2, 3)
+        or (
+            protocol_version == 3
+            and (
+                type(expected_network_record) is not NetworkLaunchRecord
+                or outcome["nonce"] != expected_network_record.launch_nonce
+                or outcome["progress"]
+                != expected_progress[: len(outcome["progress"])]
+            )
+        )
+        or (protocol_version in (1, 2) and expected_network_record is not None)
+    ):
         outcome["failed_stage"] = "protocol"
     if "A" in outcome["progress"] and (
         outcome["progress"] != expected_progress
@@ -318,8 +496,13 @@ def parse_launcher_status(
         and outcome["handled_access_fs"] is not None
     )
     outcome["identity_verified"] = (
-        protocol_version == 2
+        protocol_version in (2, 3)
         and "I" in outcome["progress"]
+        and outcome["failed_stage"] in (None, "exec")
+    )
+    outcome["listener_exported"] = (
+        protocol_version == 3
+        and "L" in outcome["progress"]
         and outcome["failed_stage"] in (None, "exec")
     )
     # Parsing A proves the restriction, not exec: the native launcher still

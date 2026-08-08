@@ -13,7 +13,10 @@
  * path policy only, under the separately-proven cgroup containment layer.
  *
  * Protocol (fd 0, text, length-prefixed values, all counts/sizes bounded):
- *   AOSLAUNCH/1\n
+ *   AOSLAUNCH/<1|2|3>\n
+ *   v3 only: status_fd <n>\n
+ *   v3 only: network <task> <generation> <nonce> <network-digest>
+ *                    <handoff-fd> 127.0.0.1 18080\n
  *   nonce <len> <bytes>\n
  *   policy_digest <len> <hex bytes>\n
  *   min_abi <n>\n
@@ -23,12 +26,13 @@
  *   roots <count>\n + <count> lines
  *         "<mode>[flags] <dev> <ino> <len> <path bytes>\n"
  *   END\n
- *   (controller then writes a single gate byte 'G')
+ *   (controller writes 'G'; v3 also requires 'C' after listener export)
  *
  * mode: r=ro x=rx w=rw ; flags: f=allow MAKE_FIFO s=allow MAKE_SOCK
  *
- * Status channel (fd from AOS_STATUS_FD, moved to fd 3, CLOEXEC):
+ * Status channel (legacy env FD; v3 request FD; moved to fd 3, CLOEXEC):
  *   R:<nonce>\n ready/at gate   S\n fds sanitized
+ *   v3: L:<network-digest>:<canonical AOSLISTENER/1 frame>\n
  *   P\n policy prepared   N\n no_new_privs
  *   A:<abi>:<handled-mask-hex>:<policy-digest>\n restrict_self applied;
  *                                               launcher waits for 'X'
@@ -43,14 +47,18 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <linux/close_range.h>
 #include <linux/landlock.h>
 #include <linux/openat2.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -94,6 +102,23 @@
 #define MAX_ITEMS 64
 #define MAX_ITEM_LEN 4096
 #define LINE_CAP (MAX_ITEM_LEN + 160)
+#define MAX_TASK_ID_LEN 128
+#define NONCE_HEX_LEN 32
+#define DIGEST_HEX_LEN 64
+#define MAX_ADOPTION_FRAME 2048
+#define LISTENER_BACKLOG 4
+#define M4B_PROXY_HOST "127.0.0.1"
+#define M4B_PROXY_PORT 18080
+
+#ifndef SO_DOMAIN
+#define SO_DOMAIN 39
+#endif
+#ifndef SO_REUSEPORT
+#define SO_REUSEPORT 15
+#endif
+#ifndef SO_NETNS_COOKIE
+#define SO_NETNS_COOKIE 71
+#endif
 
 /* ---- static request storage (no malloc) ---- */
 static char g_argv_data[MAX_ITEMS][MAX_ITEM_LEN + 1];
@@ -115,8 +140,16 @@ static uint64_t g_cwd_ino;
 static char g_nonce[MAX_ITEM_LEN + 1];
 static char g_policy_digest[65];
 static long g_min_abi = 3;
+static char g_task_id[MAX_TASK_ID_LEN + 1];
+static uint64_t g_task_generation;
+static char g_network_nonce[NONCE_HEX_LEN + 1];
+static char g_network_policy_digest[DIGEST_HEX_LEN + 1];
+static int g_handoff_fd = -1;
+static char g_proxy_host[sizeof(M4B_PROXY_HOST)];
+static int g_proxy_port;
 
 static int g_status_fd = -1;
+static int g_legacy_status_fd = -1;
 static int g_protocol_version = 1;
 
 static void fail_closed(const char *stage, int err);
@@ -220,6 +253,16 @@ static int read_line(int fd, char *buf, size_t cap)
     }
 }
 
+static int read_protocol_line(int fd, char *buf, size_t cap)
+{
+    int n = read_line(fd, buf, cap);
+
+    if (g_protocol_version == 3 && n >= 0 &&
+        memchr(buf, '\0', (size_t)n) != NULL)
+        fail_closed("parse", EPROTO);
+    return n;
+}
+
 static long parse_long(const char *s, int *ok)
 {
     long v = 0;
@@ -257,6 +300,118 @@ static uint64_t parse_u64_token(const char *s, size_t len, int *ok)
     }
     *ok = 1;
     return value;
+}
+
+static uint64_t parse_canonical_u64_token(const char *s, size_t len, int *ok)
+{
+    if (len > 1 && s[0] == '0') {
+        *ok = 0;
+        return 0;
+    }
+    return parse_u64_token(s, len, ok);
+}
+
+static int parse_fd_token(const char *s, int minimum, int *out)
+{
+    int ok;
+    uint64_t value = parse_canonical_u64_token(s, strlen(s), &ok);
+    if (!ok || value < (uint64_t)minimum || value > (uint64_t)INT_MAX)
+        return -1;
+    *out = (int)value;
+    return 0;
+}
+
+static int exact_lower_hex(const char *value, size_t required)
+{
+    if (strlen(value) != required)
+        return 0;
+    for (size_t i = 0; i < required; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') ||
+              (value[i] >= 'a' && value[i] <= 'f')))
+            return 0;
+    }
+    return 1;
+}
+
+static int valid_task_id(const char *value)
+{
+    size_t len = strlen(value);
+    if (len == 0 || len > MAX_TASK_ID_LEN)
+        return 0;
+    if (!((value[0] >= 'A' && value[0] <= 'Z') ||
+          (value[0] >= 'a' && value[0] <= 'z') ||
+          (value[0] >= '0' && value[0] <= '9')))
+        return 0;
+    for (size_t i = 1; i < len; i++) {
+        char c = value[i];
+        if (!((c >= 'A' && c <= 'Z') ||
+              (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') ||
+              c == '.' || c == '_' || c == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+static int split_exact_tokens(char *value, char **tokens, size_t count)
+{
+    char *cursor = value;
+    for (size_t i = 0; i < count; i++) {
+        if (*cursor == '\0' || *cursor == ' ')
+            return -1;
+        tokens[i] = cursor;
+        while (*cursor != '\0' && *cursor != ' ')
+            cursor++;
+        if (i + 1 == count)
+            return *cursor == '\0' ? 0 : -1;
+        if (*cursor != ' ')
+            return -1;
+        *cursor++ = '\0';
+    }
+    return -1;
+}
+
+static int parse_network_record(char *value)
+{
+    char *tokens[7];
+    int ok;
+    uint64_t generation;
+    uint64_t port;
+    int handoff_fd;
+
+    if (split_exact_tokens(value, tokens, 7) != 0 ||
+        !valid_task_id(tokens[0]))
+        return -1;
+    generation = parse_canonical_u64_token(
+        tokens[1], strlen(tokens[1]), &ok);
+    if (!ok || generation == 0)
+        return -1;
+    if (!exact_lower_hex(tokens[2], NONCE_HEX_LEN) ||
+        !exact_lower_hex(tokens[3], DIGEST_HEX_LEN) ||
+        parse_fd_token(tokens[4], 5, &handoff_fd) != 0 ||
+        strcmp(tokens[5], M4B_PROXY_HOST) != 0)
+        return -1;
+    port = parse_canonical_u64_token(tokens[6], strlen(tokens[6]), &ok);
+    if (!ok || port != M4B_PROXY_PORT)
+        return -1;
+
+    memcpy(g_task_id, tokens[0], strlen(tokens[0]) + 1);
+    g_task_generation = generation;
+    memcpy(g_network_nonce, tokens[2], NONCE_HEX_LEN + 1);
+    memcpy(g_network_policy_digest, tokens[3], DIGEST_HEX_LEN + 1);
+    g_handoff_fd = handoff_fd;
+    memcpy(g_proxy_host, tokens[5], sizeof(g_proxy_host));
+    g_proxy_port = (int)port;
+    return 0;
+}
+
+static void reject_descriptor_collision(void)
+{
+    if (g_status_fd >= 0 && g_handoff_fd >= 0 &&
+        g_status_fd == g_handoff_fd) {
+        g_status_fd = -1;
+        fail_closed("parse", EPROTO);
+    }
 }
 
 /* "<len> <value>" inline in one line; value may contain spaces but never
@@ -317,23 +472,45 @@ static void parse_request(void)
     int seen_env = 0;
     int seen_cwd = 0;
     int seen_roots = 0;
+    int seen_status_fd = 0;
+    int seen_network = 0;
 
     n = read_line(0, line, sizeof(line));
-    if (n == 11 && memcmp(line, "AOSLAUNCH/1", 11) == 0)
+    if (n == 11 && memcmp(line, "AOSLAUNCH/1", 11) == 0) {
         g_protocol_version = 1;
-    else if (n == 11 && memcmp(line, "AOSLAUNCH/2", 11) == 0)
+        g_status_fd = g_legacy_status_fd;
+    } else if (n == 11 && memcmp(line, "AOSLAUNCH/2", 11) == 0) {
         g_protocol_version = 2;
-    else
+        g_status_fd = g_legacy_status_fd;
+    } else if (n == 11 && memcmp(line, "AOSLAUNCH/3", 11) == 0) {
+        g_protocol_version = 3;
+        g_status_fd = -1;
+    } else {
         fail_closed("parse", EPROTO);
+    }
 
     for (;;) {
-        n = read_line(0, line, sizeof(line));
+        n = read_protocol_line(0, line, sizeof(line));
         if (n == -2)
             fail_closed("parse", E2BIG);
         if (n < 0)
             fail_closed("parse", EPROTO);
 
-        if (memcmp(line, "nonce ", 6) == 0) {
+        if (memcmp(line, "status_fd ", 10) == 0) {
+            int parsed_fd;
+            if (g_protocol_version != 3 || seen_status_fd++)
+                fail_closed("parse", EPROTO);
+            if (parse_fd_token(line + 10, 3, &parsed_fd) != 0)
+                fail_closed("parse", EPROTO);
+            g_status_fd = parsed_fd;
+            reject_descriptor_collision();
+        } else if (memcmp(line, "network ", 8) == 0) {
+            if (g_protocol_version != 3 || seen_network++)
+                fail_closed("parse", EPROTO);
+            if (parse_network_record(line + 8) != 0)
+                fail_closed("parse", EPROTO);
+            reject_descriptor_collision();
+        } else if (memcmp(line, "nonce ", 6) == 0) {
             if (seen_nonce++)
                 fail_closed("parse", EPROTO);
             if (parse_len_value(line + 6, g_nonce, sizeof(g_nonce)) != 0)
@@ -360,7 +537,7 @@ static void parse_request(void)
                 fail_closed("parse", EPROTO);
             g_argc = (int)count;
             for (int i = 0; i < g_argc; i++) {
-                n = read_line(0, line, sizeof(line));
+                n = read_protocol_line(0, line, sizeof(line));
                 if (n < 0)
                     fail_closed("parse", EPROTO);
                 if (parse_len_value(line, g_argv_data[i], MAX_ITEM_LEN + 1) != 0)
@@ -377,7 +554,7 @@ static void parse_request(void)
                 fail_closed("parse", EPROTO);
             g_envc = (int)count;
             for (int i = 0; i < g_envc; i++) {
-                n = read_line(0, line, sizeof(line));
+                n = read_protocol_line(0, line, sizeof(line));
                 if (n < 0)
                     fail_closed("parse", EPROTO);
                 if (parse_len_value(line, g_env_data[i], MAX_ITEM_LEN + 1) != 0)
@@ -400,7 +577,7 @@ static void parse_request(void)
                 fail_closed("parse", EPROTO);
             g_rootc = (int)count;
             for (int i = 0; i < g_rootc; i++) {
-                n = read_line(0, line, sizeof(line));
+                n = read_protocol_line(0, line, sizeof(line));
                 if (n < 2)
                     fail_closed("parse", EPROTO);
                 /* "<mode>[flags] <len> <path>" — split at last space that
@@ -437,6 +614,265 @@ static void parse_request(void)
         g_cwd[0] == '\0' || g_nonce[0] == '\0' ||
         strlen(g_policy_digest) != 64)
         fail_closed("parse", EPROTO);
+    if (g_protocol_version == 3) {
+        if (!seen_status_fd || !seen_network)
+            fail_closed("parse", EPROTO);
+        reject_descriptor_collision();
+        if (!exact_lower_hex(g_nonce, NONCE_HEX_LEN) ||
+            strcmp(g_nonce, g_network_nonce) != 0 ||
+            !exact_lower_hex(g_policy_digest, DIGEST_HEX_LEN) ||
+            strcmp(g_proxy_host, M4B_PROXY_HOST) != 0 ||
+            g_proxy_port != M4B_PROXY_PORT)
+            fail_closed("parse", EPROTO);
+    }
+}
+
+struct listener_evidence {
+    uint64_t device;
+    uint64_t inode;
+    uint64_t file_type;
+    uint64_t netns_cookie;
+    int family;
+    int socket_type;
+    int accepting;
+    int reuse_address;
+    int reuse_port;
+    int port;
+};
+
+static void require_handoff_channel(void)
+{
+    int flags;
+    struct stat st;
+    int domain;
+    int socket_type;
+    socklen_t option_len;
+    struct sockaddr_storage peer;
+    socklen_t peer_len = sizeof(peer);
+
+    flags = fcntl(g_handoff_fd, F_GETFD);
+    if (flags < 0)
+        fail_closed("handoff_fd", errno);
+    if (fcntl(g_handoff_fd, F_SETFD, flags | FD_CLOEXEC) != 0)
+        fail_closed("handoff_cloexec", errno);
+    flags = fcntl(g_handoff_fd, F_GETFD);
+    if (flags < 0 || !(flags & FD_CLOEXEC))
+        fail_closed("handoff_cloexec", flags < 0 ? errno : EPROTO);
+
+    if (fstat(g_handoff_fd, &st) != 0)
+        fail_closed("handoff_stat", errno);
+    if (!S_ISSOCK(st.st_mode))
+        fail_closed("handoff_stat", ENOTSOCK);
+
+    option_len = sizeof(domain);
+    if (getsockopt(g_handoff_fd, SOL_SOCKET, SO_DOMAIN,
+                   &domain, &option_len) != 0)
+        fail_closed("handoff_domain", errno);
+    if (option_len != sizeof(domain) || domain != AF_UNIX)
+        fail_closed("handoff_domain", EPROTOTYPE);
+
+    option_len = sizeof(socket_type);
+    if (getsockopt(g_handoff_fd, SOL_SOCKET, SO_TYPE,
+                   &socket_type, &option_len) != 0)
+        fail_closed("handoff_type", errno);
+    if (option_len != sizeof(socket_type) || socket_type != SOCK_SEQPACKET)
+        fail_closed("handoff_type", EPROTOTYPE);
+
+    memset(&peer, 0, sizeof(peer));
+    if (getpeername(g_handoff_fd, (struct sockaddr *)&peer, &peer_len) != 0)
+        fail_closed("handoff_peer", errno);
+    if (peer_len < sizeof(sa_family_t) || peer.ss_family != AF_UNIX)
+        fail_closed("handoff_peer", ENOTCONN);
+}
+
+static int get_int_socket_option(int fd, int option, const char *stage)
+{
+    int value;
+    socklen_t value_len = sizeof(value);
+    if (getsockopt(fd, SOL_SOCKET, option, &value, &value_len) != 0)
+        fail_closed(stage, errno);
+    if (value_len != sizeof(value))
+        fail_closed(stage, EPROTO);
+    return value;
+}
+
+static void require_reuse_disabled(int listener_fd)
+{
+    if (get_int_socket_option(listener_fd, SO_REUSEADDR,
+                              "listener_reuseaddr") != 0)
+        fail_closed("listener_reuseaddr", EPROTO);
+    if (get_int_socket_option(listener_fd, SO_REUSEPORT,
+                              "listener_reuseport") != 0)
+        fail_closed("listener_reuseport", EPROTO);
+}
+
+static struct listener_evidence collect_listener_evidence(int listener_fd)
+{
+    struct listener_evidence evidence;
+    struct stat st;
+    struct sockaddr_in address;
+    socklen_t address_len = sizeof(address);
+    socklen_t cookie_len;
+
+    memset(&evidence, 0, sizeof(evidence));
+    if (fstat(listener_fd, &st) != 0)
+        fail_closed("listener_fstat", errno);
+    evidence.file_type = (uint64_t)(st.st_mode & S_IFMT);
+    evidence.device = (uint64_t)st.st_dev;
+    evidence.inode = (uint64_t)st.st_ino;
+    if (evidence.file_type != S_IFSOCK ||
+        evidence.device == 0 || evidence.inode == 0)
+        fail_closed("listener_fstat", EPROTO);
+
+    evidence.family = get_int_socket_option(
+        listener_fd, SO_DOMAIN, "listener_domain");
+    evidence.socket_type = get_int_socket_option(
+        listener_fd, SO_TYPE, "listener_type");
+    evidence.accepting = get_int_socket_option(
+        listener_fd, SO_ACCEPTCONN, "listener_acceptconn");
+    evidence.reuse_address = get_int_socket_option(
+        listener_fd, SO_REUSEADDR, "listener_reuseaddr_evidence");
+    evidence.reuse_port = get_int_socket_option(
+        listener_fd, SO_REUSEPORT, "listener_reuseport_evidence");
+    if (evidence.family != AF_INET ||
+        evidence.socket_type != SOCK_STREAM ||
+        evidence.accepting != 1 ||
+        evidence.reuse_address != 0 ||
+        evidence.reuse_port != 0)
+        fail_closed("listener_evidence", EPROTO);
+
+    memset(&address, 0, sizeof(address));
+    if (getsockname(listener_fd, (struct sockaddr *)&address,
+                    &address_len) != 0)
+        fail_closed("listener_getsockname", errno);
+    if (address_len != sizeof(address) ||
+        address.sin_family != AF_INET ||
+        address.sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
+        ntohs(address.sin_port) != M4B_PROXY_PORT)
+        fail_closed("listener_getsockname", EPROTO);
+    evidence.port = ntohs(address.sin_port);
+
+    cookie_len = sizeof(evidence.netns_cookie);
+    if (getsockopt(listener_fd, SOL_SOCKET, SO_NETNS_COOKIE,
+                   &evidence.netns_cookie, &cookie_len) != 0)
+        fail_closed("listener_netns_cookie", errno);
+    if (cookie_len != sizeof(evidence.netns_cookie) ||
+        evidence.netns_cookie == 0)
+        fail_closed("listener_netns_cookie", EPROTO);
+    return evidence;
+}
+
+static size_t build_listener_frame(char *frame, size_t capacity,
+                                   const struct listener_evidence *evidence)
+{
+    int length = snprintf(
+        frame,
+        capacity,
+        "{\"evidence\":{\"accepting\":true,\"address\":\"127.0.0.1\","
+        "\"device\":%" PRIu64 ",\"family\":%d,\"file_type\":%" PRIu64 ","
+        "\"inode\":%" PRIu64 ",\"netns_cookie\":%" PRIu64 ","
+        "\"port\":%d,\"socket_type\":%d},"
+        "\"launch_nonce\":\"%s\",\"policy_digest\":\"%s\","
+        "\"task_generation\":%" PRIu64 ",\"task_id\":\"%s\","
+        "\"version\":\"AOSLISTENER/1\"}",
+        evidence->device,
+        evidence->family,
+        evidence->file_type,
+        evidence->inode,
+        evidence->netns_cookie,
+        evidence->port,
+        evidence->socket_type,
+        g_network_nonce,
+        g_network_policy_digest,
+        g_task_generation,
+        g_task_id);
+    if (length <= 0 || (size_t)length >= capacity ||
+        length > MAX_ADOPTION_FRAME)
+        fail_closed("listener_frame", EOVERFLOW);
+    return (size_t)length;
+}
+
+static void send_listener_frame(int listener_fd,
+                                const char *frame, size_t frame_len)
+{
+    struct iovec iov;
+    struct msghdr message;
+    union {
+        struct cmsghdr alignment;
+        unsigned char bytes[CMSG_SPACE(sizeof(int))];
+    } control;
+    struct cmsghdr *header;
+    ssize_t sent;
+
+    memset(&message, 0, sizeof(message));
+    memset(&control, 0, sizeof(control));
+    iov.iov_base = (void *)frame;
+    iov.iov_len = frame_len;
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.bytes;
+    message.msg_controllen = sizeof(control.bytes);
+    header = CMSG_FIRSTHDR(&message);
+    if (header == NULL)
+        fail_closed("handoff_frame", EPROTO);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(header), &listener_fd, sizeof(listener_fd));
+
+    do {
+        sent = sendmsg(g_handoff_fd, &message, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    if (sent < 0)
+        fail_closed("handoff_sendmsg", errno);
+    if ((size_t)sent != frame_len)
+        fail_closed("handoff_sendmsg", EIO);
+    if (shutdown(g_handoff_fd, SHUT_WR) != 0)
+        fail_closed("handoff_shutdown", errno);
+}
+
+static void status_listener(const char *frame, size_t frame_len)
+{
+    status_raw("L:", 2);
+    status_raw(g_network_policy_digest, DIGEST_HEX_LEN);
+    status_raw(":", 1);
+    status_raw(frame, frame_len);
+    status_raw("\n", 1);
+}
+
+static void export_listener(void)
+{
+    int listener_fd;
+    int descriptor_flags;
+    struct sockaddr_in address;
+    struct listener_evidence evidence;
+    char frame[MAX_ADOPTION_FRAME + 1];
+    size_t frame_len;
+
+    listener_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener_fd < 0)
+        fail_closed("listener_socket", errno);
+    descriptor_flags = fcntl(listener_fd, F_GETFD);
+    if (descriptor_flags < 0 || !(descriptor_flags & FD_CLOEXEC))
+        fail_closed("listener_cloexec",
+                    descriptor_flags < 0 ? errno : EPROTO);
+    require_reuse_disabled(listener_fd);
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(M4B_PROXY_PORT);
+    if (bind(listener_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+        fail_closed("listener_bind", errno);
+    if (listen(listener_fd, LISTENER_BACKLOG) != 0)
+        fail_closed("listener_listen", errno);
+
+    evidence = collect_listener_evidence(listener_fd);
+    frame_len = build_listener_frame(frame, sizeof(frame), &evidence);
+    send_listener_frame(listener_fd, frame, frame_len);
+    status_listener(frame, frame_len);
+    if (close(listener_fd) != 0)
+        fail_closed("listener_close", errno);
 }
 
 /* Trusted open: openat2 with no symlink/magiclink resolution, O_PATH.
@@ -489,13 +925,16 @@ int main(void)
         int ok0;
         long fdnum = parse_long(sfd, &ok0);
         if (ok0 && fdnum >= 0 && fdnum <= 1024)
-            g_status_fd = (int)fdnum;
+            g_legacy_status_fd = (int)fdnum;
     }
 
+    g_status_fd = g_legacy_status_fd;
     parse_request();
 
     if (g_status_fd < 3 || fcntl(g_status_fd, F_GETFD) < 0)
         fail_closed("statusfd", EBADF);
+    if (g_protocol_version == 3)
+        require_handoff_channel();
 
     /* Landlock ABI probe: runtime truth, not kernel-version inference. */
     long abi = syscall(SYS_landlock_create_ruleset, NULL, 0,
@@ -517,6 +956,15 @@ int main(void)
         long secs = parse_long(fault + 17, &okf);
         if (okf && secs > 0 && secs < 3600)
             sleep((unsigned int)secs);
+    }
+
+    if (g_protocol_version == 3) {
+        export_listener();
+        if (read_byte(0, &gate) != 0 || gate != 'C')
+            fail_closed("listener_gate", EACCES);
+        if (close(g_handoff_fd) != 0)
+            fail_closed("handoff_close", errno);
+        g_handoff_fd = -1;
     }
 
     /* Phase 1 FD hygiene: keep 0,1,2 + status at fd 3 + a CLOEXEC copy
@@ -552,13 +1000,14 @@ int main(void)
         root_fds[i] = trusted_open(base_fd, g_root_path[i], 0,
                                    g_root_dev[i], g_root_ino[i]);
 
-    if (g_protocol_version == 2) {
+    if (g_protocol_version == 2 || g_protocol_version == 3) {
         if (fchdir(cwd_fd) != 0)
             fail_closed("cwd", errno);
         status_letter('I');
     }
 
     struct landlock_ruleset_attr rattr;
+    memset(&rattr, 0, sizeof(rattr));
     rattr.handled_access_fs = LL_ALL_V3;
     if (fault && strcmp(fault, "fail_ruleset") == 0)
         fail_closed("ruleset", EIO);

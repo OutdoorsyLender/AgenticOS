@@ -142,6 +142,479 @@ def _open_fd_numbers() -> set[int]:
     return {int(name) for name in os.listdir("/proc/self/fd")}
 
 
+def _valid_network_launch_record(launcher):
+    return launcher.NetworkLaunchRecord(
+        task_id="task-7",
+        task_generation=3,
+        launch_nonce="ab" * 16,
+        network_policy_digest="c" * 64,
+        handoff_fd=35,
+        proxy_host="127.0.0.1",
+        proxy_port=18080,
+    )
+
+
+def test_protocol_v3_launch_request_has_exact_bounded_wire_and_frozen_record():
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    record = _valid_network_launch_record(launcher)
+
+    prepared = launcher.prepare_launch_request(
+        ["/usr/bin/true"],
+        {"PWD": "/workspace"},
+        "/workspace",
+        [],
+        protocol_version=3,
+        cwd_record=("/workspace", 11, 22),
+        root_records=[
+            ("/workspace", 11, 22, "w"),
+            ("/usr", 33, 44, "x"),
+        ],
+        policy_digest_override="d" * 64,
+        status_fd=34,
+        network_record=record,
+    )
+
+    expected = (
+        b"AOSLAUNCH/3\n"
+        b"status_fd 34\n"
+        b"network task-7 3 abababababababababababababababab "
+        + b"c" * 64
+        + b" 35 127.0.0.1 18080\n"
+        b"nonce 32 abababababababababababababababab\n"
+        b"policy_digest 64 "
+        + b"d" * 64
+        + b"\n"
+        b"min_abi 3\n"
+        b"argv 1\n"
+        b"13 /usr/bin/true\n"
+        b"env 1\n"
+        b"14 PWD=/workspace\n"
+        b"cwd 11 22 10 /workspace\n"
+        b"roots 2\n"
+        b"w 11 22 10 /workspace\n"
+        b"x 33 44 4 /usr\n"
+        b"END\n"
+    )
+    assert prepared.wire == expected
+    assert prepared.nonce == "ab" * 16
+    assert prepared.policy_digest == "d" * 64
+    assert [field.name for field in dataclasses.fields(record)] == [
+        "task_id",
+        "task_generation",
+        "launch_nonce",
+        "network_policy_digest",
+        "handoff_fd",
+        "proxy_host",
+        "proxy_port",
+    ]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        record.handoff_fd = 36
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_id", "-task"),
+        ("task_id", "task\n8"),
+        ("task_id", "task\r8"),
+        ("task_id", "task\x008"),
+        ("task_id", "t\u00e9st"),
+        ("task_id", "t" * 129),
+        ("task_generation", 0),
+        ("task_generation", True),
+        ("task_generation", 3.0),
+        ("task_generation", 1 << 64),
+        ("launch_nonce", "AB" * 16),
+        ("launch_nonce", "a" * 31),
+        ("launch_nonce", "a" * 31 + "\n"),
+        ("network_policy_digest", "C" * 64),
+        ("network_policy_digest", "c" * 63),
+        ("network_policy_digest", "c" * 63 + "\x00"),
+        ("handoff_fd", 4),
+        ("handoff_fd", True),
+        ("handoff_fd", 35.0),
+        ("handoff_fd", 1 << 31),
+        ("proxy_host", "0.0.0.0"),
+        ("proxy_host", "127.0.0.1\n"),
+        ("proxy_host", "127.0.0.1\x00"),
+        ("proxy_port", 18081),
+        ("proxy_port", True),
+        ("proxy_port", 18080.0),
+    ],
+)
+def test_protocol_v3_network_launch_record_rejects_malformed_fields(field, value):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    record = _valid_network_launch_record(launcher)
+
+    with pytest.raises((TypeError, ValueError)):
+        dataclasses.replace(record, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"network_record": None}, "network record"),
+        ({"status_fd": None}, "status fd"),
+        ({"status_fd": 2}, "status fd"),
+        ({"status_fd": True}, "status fd"),
+        ({"status_fd": 34.0}, "status fd"),
+        ({"status_fd": 1 << 31}, "status fd"),
+        ({"status_fd": 35}, "distinct"),
+        ({"nonce": "cd" * 16}, "nonce"),
+    ],
+)
+def test_protocol_v3_launch_request_rejects_missing_or_inconsistent_fields(
+    updates, message
+):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    arguments = {
+        "protocol_version": 3,
+        "cwd_record": ("/workspace", 11, 22),
+        "root_records": [],
+        "policy_digest_override": "d" * 64,
+        "status_fd": 34,
+        "network_record": _valid_network_launch_record(launcher),
+    }
+    arguments.update(updates)
+
+    with pytest.raises(ValueError, match=message):
+        launcher.prepare_launch_request(
+            ["/usr/bin/true"], {}, "/workspace", [], **arguments
+        )
+
+
+@pytest.mark.parametrize(
+    "nul_location", ["argv", "env-key", "env-value", "cwd", "root"]
+)
+def test_protocol_v3_launch_request_rejects_nul_in_nested_values(nul_location):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    argv = ["/usr/bin/true"]
+    env = {"PWD": "/workspace"}
+    cwd = "/workspace"
+    roots = []
+    cwd_record = (cwd, 11, 22)
+    root_records = []
+    if nul_location == "argv":
+        argv = ["/usr/bin/tr\x00ue"]
+    elif nul_location == "env-key":
+        env = {"P\x00WD": "/workspace"}
+    elif nul_location == "env-value":
+        env = {"PWD": "/work\x00space"}
+    elif nul_location == "cwd":
+        cwd = "/work\x00space"
+        cwd_record = (cwd, 11, 22)
+    else:
+        roots = [("/work\x00space", "w")]
+        root_records = [("/work\x00space", 11, 22, "w")]
+
+    with pytest.raises(ValueError, match="NUL"):
+        launcher.prepare_launch_request(
+            argv,
+            env,
+            cwd,
+            roots,
+            protocol_version=3,
+            cwd_record=cwd_record,
+            root_records=root_records,
+            policy_digest_override="d" * 64,
+            status_fd=34,
+            network_record=_valid_network_launch_record(launcher),
+        )
+
+
+@pytest.mark.parametrize("protocol_version", [1, 2])
+@pytest.mark.parametrize("field", ["network_record", "status_fd"])
+def test_protocol_v1_v2_reject_v3_network_launch_fields(protocol_version, field):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    kwargs = {"protocol_version": protocol_version}
+    if protocol_version == 2:
+        kwargs.update(
+            cwd_record=("/workspace", 11, 22),
+            root_records=[],
+        )
+    kwargs[field] = (
+        _valid_network_launch_record(launcher) if field == "network_record" else 34
+    )
+
+    with pytest.raises(ValueError, match="protocol v3"):
+        launcher.prepare_launch_request(
+            ["/usr/bin/true"], {}, "/workspace", [], **kwargs
+        )
+
+
+@pytest.mark.parametrize("protocol_version", [True, 1.0, 0, 4])
+def test_protocol_launch_request_rejects_wrong_version_type_or_value(protocol_version):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    with pytest.raises(ValueError, match="protocol version"):
+        launcher.prepare_launch_request(
+            ["/usr/bin/true"],
+            {},
+            "/workspace",
+            [],
+            protocol_version=protocol_version,
+        )
+
+
+def test_protocol_v3_status_authenticates_canonical_listener_frame_and_order():
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    identity = _network_identity()
+    record = _valid_network_launch_record(launcher)
+    with _fixed_listener() as listener:
+        frame = identity.ListenerAdoptionFrame(
+            version="AOSLISTENER/1",
+            task_id=record.task_id,
+            task_generation=record.task_generation,
+            launch_nonce=record.launch_nonce,
+            policy_digest=record.network_policy_digest,
+            evidence=identity.listener_evidence(listener.fileno()),
+        )
+        transcript = (
+            b"R:" + record.launch_nonce.encode("ascii") + b"\n"
+            b"L:" + record.network_policy_digest.encode("ascii") + b":"
+            + frame.to_bytes()
+            + b"\nS\nI\nP\nN\nA:3:7fff:"
+            + b"d" * 64
+            + b"\n"
+        )
+
+        parsed = launcher.parse_launcher_status(
+            transcript,
+            expected_nonce=record.launch_nonce,
+            expected_policy_digest="d" * 64,
+            expected_network_record=record,
+            protocol_version=3,
+        )
+
+    assert parsed["failed_stage"] is None
+    assert parsed["progress"] == ["R", "L", "S", "I", "P", "N", "A"]
+    assert parsed["listener_exported"] is True
+    assert parsed["network_policy_digest"] == "c" * 64
+    assert parsed["listener_frame"] == frame
+    assert parsed["listener_evidence"] == frame.evidence
+    assert parsed["identity_verified"] is True
+    assert parsed["policy_applied"] is True
+
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong-prefix", "wrong-frame"])
+def test_protocol_v3_status_rejects_missing_or_unauthenticated_listener(mutation):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    identity = _network_identity()
+    record = _valid_network_launch_record(launcher)
+    with _fixed_listener() as listener:
+        frame = identity.ListenerAdoptionFrame(
+            version="AOSLISTENER/1",
+            task_id=record.task_id,
+            task_generation=record.task_generation,
+            launch_nonce=record.launch_nonce,
+            policy_digest=record.network_policy_digest,
+            evidence=identity.listener_evidence(listener.fileno()),
+        )
+        if mutation == "missing":
+            listener_line = b""
+        elif mutation == "wrong-prefix":
+            listener_line = b"L:" + b"e" * 64 + b":" + frame.to_bytes() + b"\n"
+        else:
+            malformed = frame.to_bytes().replace(
+                b'"task_id":"task-7"', b'"task_id":"task-8"'
+            )
+            listener_line = b"L:" + b"c" * 64 + b":" + malformed + b"\n"
+        transcript = (
+            b"R:" + b"ab" * 16 + b"\n" + listener_line
+            + b"S\nI\nP\nN\nA:3:7fff:" + b"d" * 64 + b"\n"
+        )
+
+        parsed = launcher.parse_launcher_status(
+            transcript,
+            expected_nonce=record.launch_nonce,
+            expected_policy_digest="d" * 64,
+            expected_network_record=record,
+            protocol_version=3,
+        )
+
+    assert parsed["failed_stage"] == "protocol"
+    assert parsed["policy_applied"] is False
+
+
+@pytest.mark.parametrize("expected_nonce", [None, "cd" * 16])
+def test_protocol_v3_status_binds_ready_nonce_to_network_record(expected_nonce):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    identity = _network_identity()
+    record = _valid_network_launch_record(launcher)
+    with _fixed_listener() as listener:
+        frame = identity.ListenerAdoptionFrame(
+            version="AOSLISTENER/1",
+            task_id=record.task_id,
+            task_generation=record.task_generation,
+            launch_nonce=record.launch_nonce,
+            policy_digest=record.network_policy_digest,
+            evidence=identity.listener_evidence(listener.fileno()),
+        )
+        parsed = launcher.parse_launcher_status(
+            b"R:" + b"cd" * 16 + b"\nL:" + b"c" * 64 + b":"
+            + frame.to_bytes() + b"\n",
+            expected_nonce=expected_nonce,
+            expected_network_record=record,
+            protocol_version=3,
+        )
+
+    assert parsed["failed_stage"] == "protocol"
+    assert parsed["listener_exported"] is False
+
+
+@pytest.mark.parametrize(
+    "progress_tags",
+    [
+        ("L", "R"),
+        ("R", "S", "L"),
+        ("R", "R"),
+        ("R", "L", "S", "S"),
+        ("R", "L", "S", "I", "I"),
+        ("R", "L", "S", "I", "P", "P"),
+        ("R", "L", "S", "I", "P", "N", "N"),
+        ("R", "L", "S", "I", "P", "N", "A", "A"),
+    ],
+)
+def test_protocol_v3_status_rejects_nonprefix_partial_progress(progress_tags):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    identity = _network_identity()
+    record = _valid_network_launch_record(launcher)
+    with _fixed_listener() as listener:
+        frame = identity.ListenerAdoptionFrame(
+            version="AOSLISTENER/1",
+            task_id=record.task_id,
+            task_generation=record.task_generation,
+            launch_nonce=record.launch_nonce,
+            policy_digest=record.network_policy_digest,
+            evidence=identity.listener_evidence(listener.fileno()),
+        )
+        records = {
+            "R": b"R:" + record.launch_nonce.encode("ascii") + b"\n",
+            "L": b"L:" + record.network_policy_digest.encode("ascii")
+            + b":" + frame.to_bytes() + b"\n",
+            "S": b"S\n",
+            "I": b"I\n",
+            "P": b"P\n",
+            "N": b"N\n",
+            "A": b"A:3:7fff:" + b"d" * 64 + b"\n",
+        }
+        parsed = launcher.parse_launcher_status(
+            b"".join(records[tag] for tag in progress_tags),
+            expected_network_record=record,
+            expected_policy_digest="d" * 64,
+            protocol_version=3,
+        )
+
+    assert parsed["failed_stage"] == "protocol"
+    assert parsed["listener_exported"] is False
+    assert parsed["policy_applied"] is False
+
+
+@pytest.mark.parametrize(
+    "status_tags",
+    [
+        ("E", "R", "L", "S", "I", "P", "N", "A"),
+        ("R", "L", "E", "S", "I", "P", "N", "A"),
+        ("R", "L", "S", "I", "P", "N", "A", "E", "E"),
+        ("R", "L", "S", "I", "P", "N", "A", "E", "F"),
+        ("R", "L", "F", "F"),
+        ("R", "L", "F", "E"),
+    ],
+)
+def test_protocol_v3_status_rejects_impossible_terminal_records(status_tags):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    identity = _network_identity()
+    record = _valid_network_launch_record(launcher)
+    with _fixed_listener() as listener:
+        frame = identity.ListenerAdoptionFrame(
+            version="AOSLISTENER/1",
+            task_id=record.task_id,
+            task_generation=record.task_generation,
+            launch_nonce=record.launch_nonce,
+            policy_digest=record.network_policy_digest,
+            evidence=identity.listener_evidence(listener.fileno()),
+        )
+        records = {
+            "R": b"R:" + record.launch_nonce.encode("ascii") + b"\n",
+            "L": b"L:" + record.network_policy_digest.encode("ascii")
+            + b":" + frame.to_bytes() + b"\n",
+            "S": b"S\n",
+            "I": b"I\n",
+            "P": b"P\n",
+            "N": b"N\n",
+            "A": b"A:3:7fff:" + b"d" * 64 + b"\n",
+            "E": b"E:5\n",
+            "F": b"F:gate:13\n",
+        }
+        parsed = launcher.parse_launcher_status(
+            b"".join(records[tag] for tag in status_tags),
+            expected_network_record=record,
+            expected_policy_digest="d" * 64,
+            protocol_version=3,
+        )
+
+    assert parsed["failed_stage"] == "protocol"
+    assert parsed["listener_exported"] is False
+    assert parsed["policy_applied"] is False
+
+
+def test_protocol_v1_v2_status_bytes_and_progress_remain_exact(tmp_path):
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    observed = os.stat(tmp_path)
+    v1 = launcher.prepare_launch_request(
+        ["/usr/bin/true"], {}, str(tmp_path), [], nonce="legacy-nonce"
+    )
+    expected_v1_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "cwd": {
+                    "path": str(tmp_path),
+                    "dev": observed.st_dev,
+                    "ino": observed.st_ino,
+                },
+                "roots": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert v1.policy_digest == expected_v1_digest
+    expected_v1 = (
+        b"AOSLAUNCH/1\nnonce 12 legacy-nonce\npolicy_digest 64 "
+        + expected_v1_digest.encode("ascii")
+        + b"\nmin_abi 3\nargv 1\n13 /usr/bin/true\nenv 0\n"
+        + f"cwd {observed.st_dev} {observed.st_ino} ".encode("ascii")
+        + f"{len(str(tmp_path).encode())} {tmp_path}\n".encode()
+        + b"roots 0\nEND\n"
+    )
+    assert v1.wire == expected_v1
+
+    v2 = launcher.prepare_launch_request(
+        ["/usr/bin/true"],
+        {},
+        "/workspace",
+        [],
+        nonce="legacy-nonce",
+        protocol_version=2,
+        cwd_record=("/workspace", 11, 22),
+        root_records=[],
+        policy_digest_override="d" * 64,
+    )
+    assert v2.wire == (
+        b"AOSLAUNCH/2\nnonce 12 legacy-nonce\npolicy_digest 64 "
+        + b"d" * 64
+        + b"\nmin_abi 3\nargv 1\n13 /usr/bin/true\nenv 0\n"
+        b"cwd 11 22 10 /workspace\nroots 0\nEND\n"
+    )
+    parsed = launcher.parse_launcher_status(
+        b"R:legacy-nonce\nS\nI\nP\nN\nA:3:7fff:" + b"d" * 64 + b"\n",
+        expected_nonce="legacy-nonce",
+        expected_policy_digest="d" * 64,
+        protocol_version=2,
+    )
+    assert parsed["failed_stage"] is None
+    assert parsed["progress"] == ["R", "S", "I", "P", "N", "A"]
+
+
 def test_network_models_module_exists():
     assert importlib.util.find_spec(MODULE) is not None
 
