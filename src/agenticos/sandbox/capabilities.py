@@ -17,6 +17,8 @@ UNVERIFIED until something actually tries to create a transient scope
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import platform
 import shutil
@@ -39,6 +41,44 @@ class CapabilityStatus(str, Enum):
     UNVERIFIED = "UNVERIFIED"
     PERMISSION_DENIED = "PERMISSION_DENIED"
     ERROR = "ERROR"
+
+
+@dataclass(frozen=True)
+class LandlockAbiProbe:
+    status: str
+    abi: Optional[int]
+    errno: Optional[int]
+    reason: str
+
+
+def probe_landlock_abi() -> LandlockAbiProbe:
+    """Query Landlock's ABI without creating a ruleset or enforcing it."""
+    system = platform.system()
+    machine = platform.machine()
+    syscall_number = LANDLOCK_SYSCALL_NR.get(machine)
+    if system != "Linux" or syscall_number is None:
+        return LandlockAbiProbe(
+            "UNSUPPORTED", None, None, f"unsupported platform {system}/{machine}"
+        )
+    libc = ctypes.CDLL(None, use_errno=True)
+    abi = libc.syscall(
+        syscall_number, None, 0, LANDLOCK_CREATE_RULESET_VERSION
+    )
+    if abi > 0:
+        return LandlockAbiProbe("SUPPORTED", int(abi), None, f"ABI v{abi}")
+    error_number = ctypes.get_errno()
+    if error_number == errno.ENOSYS:
+        status = "UNSUPPORTED"
+    elif error_number == errno.EOPNOTSUPP:
+        status = "DISABLED"
+    else:
+        status = "ERROR"
+    return LandlockAbiProbe(
+        status,
+        None,
+        error_number,
+        f"version query failed with errno={error_number}",
+    )
 
 
 @dataclass
@@ -385,24 +425,18 @@ class HostCapabilityDetector:
     def _check_landlock(self, report: HostCapabilityReport) -> None:
         """Detection only. Queries the Landlock ABI version via a version
         syscall that creates nothing and enforces nothing."""
-        machine = platform.machine()
-        nr = LANDLOCK_SYSCALL_NR.get(machine)
-        if report.platform_system != "Linux" or nr is None:
-            report.add("landlock_abi", CapabilityStatus.UNVERIFIED,
-                       f"no Landlock syscall number for {report.platform_system}/{machine}")
-            return
         try:
-            import ctypes
-
-            libc = ctypes.CDLL(None, use_errno=True)
-            abi = libc.syscall(nr, None, 0, LANDLOCK_CREATE_RULESET_VERSION)
-            if abi > 0:
+            probe = probe_landlock_abi()
+            if probe.status == "SUPPORTED":
                 report.add("landlock_abi", CapabilityStatus.SUPPORTED,
-                           f"landlock_create_ruleset ABI v{abi} (detection only, not enforced)")
+                           f"landlock_create_ruleset ABI v{probe.abi} "
+                           "(detection only, not enforced)")
+            elif probe.status == "ERROR":
+                report.add("landlock_abi", CapabilityStatus.ERROR, probe.reason)
             else:
-                err = ctypes.get_errno()
                 report.add("landlock_abi", CapabilityStatus.UNSUPPORTED,
-                           f"landlock_create_ruleset version query failed, errno={err}")
+                           f"landlock_create_ruleset {probe.status.lower()}: "
+                           f"{probe.reason}")
         except Exception as exc:  # noqa: BLE001 - detection must never crash
             report.add("landlock_abi", CapabilityStatus.UNVERIFIED,
                        f"ABI probe raised {type(exc).__name__}: {exc}")

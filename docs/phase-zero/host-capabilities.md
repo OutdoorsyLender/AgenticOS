@@ -47,7 +47,7 @@ contains usernames, home paths, machine ids, or environment dumps.
 | `cgroup_kill_available` | `cgroup.kill` in a dynamically discovered non-root cgroup (kernel ≥ 5.14) |
 | `cgroup_events_available` | `cgroup.events` in a dynamically discovered non-root cgroup |
 | `user_namespaces_observed` | `/proc/sys/user/max_user_namespaces` > 0 |
-| `landlock_abi` | `landlock_create_ruleset` **version query only** via ctypes syscall — detection, never enforcement |
+| `landlock_abi` | `landlock_create_ruleset` **version query only** via ctypes syscall; any positive ABI is detected as `SUPPORTED`, `ENOSYS` is unsupported, `EOPNOTSUPP` disabled, other errno `ERROR`; the M3B runtime gate separately rejects ABI <3 |
 | `repo_on_linux_filesystem` | repo path must not be under `/mnt/<drive>` (drvfs) |
 
 ## 3. System capability vs current-user permission
@@ -72,7 +72,8 @@ tests skip with concrete reasons rather than faking success.
 - **Verified target (Milestone 2B, observed)**: Ubuntu 26.04 LTS on WSL2,
   kernel `6.6.87.2-microsoft-standard-WSL2`, systemd 259 as PID 1,
   systemd user manager + bus operational, unified cgroup v2 at
-  `/sys/fs/cgroup` (`nsdelegate`), Landlock ABI v3 detected (not enforced),
+  `/sys/fs/cgroup` (`nsdelegate`), Landlock ABI v3 detected and separately
+  enforced by the Milestone 3B runtime probe,
   pidfd available, repo on the Linux filesystem. All capability probes and
   the real containment suite pass on this environment.
 - **Plain Linux with systemd**: expected to work identically (not observed).
@@ -120,3 +121,13 @@ python -m pytest tests/conformance/test_cgroup_integration.py -v
 
 Integration tests are marked `cgroup_linux` and skip with the exact missing
 capability when the host cannot run them.
+
+## 8. Milestone 3B runtime gate
+
+`HostCapabilityDetector` remains observation-only. Before starting a native
+filesystem task, `NativeLandlockRunner` performs both the ABI query and the
+separate real enforcement probe. Capability evidence is recorded separately
+from the later per-task `FILESYSTEM_POLICY_APPLIED` evidence. Unknown probe
+errors, ABI below 3, or a failed enforcement probe prevent scope creation and
+worker execution; there is no fallback to the experimental shim or to an
+unsafe runner.

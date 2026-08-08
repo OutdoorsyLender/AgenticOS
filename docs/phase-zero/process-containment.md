@@ -1,7 +1,8 @@
 # Phase Zero — Process Containment (EXPERIMENTAL)
 
-> **THIS MILESTONE PROVES PROCESS CONTAINMENT ONLY.** It does NOT prove
-> filesystem isolation, network isolation, Windows-host isolation, credential
+> **MILESTONE 2B PROVES PROCESS CONTAINMENT ONLY.** Milestone 3B composes a
+> separately evidenced Landlock boundary with it. Neither proves network
+> isolation, Windows-host isolation, credential
 > isolation, Unix-socket isolation, provider safety, or complete AgenticOS
 > sandbox security.
 
@@ -153,15 +154,50 @@ about arbitrary Linux hosts.
 
 ## 8. What remains unproven
 
-- Any filesystem, network, socket, or credential isolation.
-- Whether `cgroup.kill` is permitted for the current user on the target host
-  (capability-detected; fallback is explicitly reported).
+- Process containment by itself proves no filesystem, network, socket, or
+  credential isolation. The separately tested Milestone 3B Landlock claim is
+  documented in `filesystem-isolation.md`.
+- Whether `cgroup.kill` is permitted on any host other than the recorded
+  target (capability-detected; fallback is explicitly reported).
 - Behavior under WSL kernel updates / distro variations.
 - Provider safety of any kind.
 
-## 9. Next milestone
+## 9. Historical next step
 
-Filesystem isolation experiments (read-only bind of the assigned worktree,
-denied sibling/private paths) behind a third `SandboxRunner` backend —
-evaluating mount namespaces vs. Landlock (already capability-detected) —
-measured by re-running the FS/WRITE attack corpus through the new backend.
+Milestone 3A evaluated mount namespaces and Landlock by re-running the
+FS/WRITE corpus. Milestone 3B then implemented the selected Landlock-first
+boundary described below.
+
+## 10. Milestone 3B composition record
+
+`NativeLandlockRunner` reuses the same transient-scope discovery,
+membership verification, cancellation escalation, recursive `populated 0`
+check, and scope cleanup. Only the trusted native launcher exists before the
+cgroup gate. Event-order tests prove:
+
+```
+CONTAINMENT_VERIFIED
+  -> FD_SET_SANITIZED
+  -> FILESYSTEM_POLICY_PREPARED
+  -> NO_NEW_PRIVS_SET
+  -> FILESYSTEM_POLICY_APPLIED
+  -> controller validates acknowledgement and releases exec
+  -> worker exec
+```
+
+The filesystem suite exercises children, grandchildren, new sessions, new
+process groups, parent-exit descendants, and double-forked descendants. Each
+records its own `/proc/self/cgroup` membership, retains Landlock denial, and
+remains attributable to the exact task scope until the existing lifecycle
+observes recursive `populated 0`. Cancellation of a task
+that ignores SIGINT and SIGTERM still reaches forced cgroup kill and empty
+verification. Filesystem setup failures and post-restriction exec failures
+use the same drain-and-cleanup path.
+An injected controller exception after exec release also spawns a
+signal-ignoring child; the exception path runs the same bounded escalation,
+records `CGROUP_EMPTY_VERIFIED`, confirms the child PID is gone, and verifies
+the transient unit is inactive.
+
+This composition does not turn either component into a complete sandbox: the
+cgroup controls process-tree lifecycle, while Landlock ABI 3 mediates only
+its documented filesystem operations.

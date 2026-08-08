@@ -1,4 +1,4 @@
-# Phase Zero — Filesystem Isolation Architecture (Milestone 3A)
+# Phase Zero — Filesystem Isolation Architecture (Milestones 3A and 3B)
 
 > **EXPERIMENTAL. This milestone does NOT make AgenticOS secure.** It answers
 > one question with real-host evidence: which filesystem-isolation mechanism
@@ -156,3 +156,167 @@ credential brokering, seccomp, anything on Windows hosts, malicious-kernel
 resistance, and any complete-sandbox claim. The pre-opened-FD hole is
 documented, not closed (it is a construction rule for the runtime).
 Single-host evidence only.
+
+## 17. Milestone 3B production boundary
+
+Milestone 3B promotes the Landlock-first result into a fail-closed native
+launch boundary. The controller starts only a small, single-threaded C
+launcher in the existing transient systemd scope. The launcher blocks at a
+nonce-bearing gate. The controller positively identifies the launcher's
+cgroup, records `CONTAINMENT_VERIFIED`, and only then releases setup. The
+launcher closes ambient descriptors, resolves policy roots, creates the
+ruleset, calls `PR_SET_NO_NEW_PRIVS`, calls `landlock_restrict_self()`, and
+acknowledges the authenticated policy digest. It then blocks a second time;
+only after the controller validates the complete transcript and sends the
+exec-release byte may it call `execve()` on the worker.
+
+There is no shell, fork, thread, subprocess, Python `preexec_fn`, or degraded
+fallback in the trusted pre-exec path. A missing launcher, unsupported or
+disabled Landlock, ABI below 3, unsafe root, protocol error, setup failure,
+or failed containment proof prevents hostile exec.
+
+The native binary is intentionally not tracked. From the repository root on
+the target Linux host, reproduce the warning-clean build with installed GCC
+and Linux UAPI headers:
+
+```sh
+gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 \
+  native/fs_launcher/fs_launcher.c -o native/fs_launcher/fs_launcher
+```
+
+`NativeLandlockRunner` fails closed when this binary is absent. The tested
+Ubuntu host required the `gcc`, `libc6-dev`, and `linux-libc-dev` packages.
+
+## 18. Capability and ruleset contract
+
+Support is determined by the documented version query
+`landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`, not by
+kernel or distribution version. ABI 3 is the minimum. On the tested host the
+query returned 3, and a separate deny-all enforcement probe confirmed that
+an unprivileged domain produces `EACCES`.
+
+The native launcher uses the installed Linux UAPI headers. Its handled mask
+is every ABI-v3 filesystem right (numeric mask `0x7fff`): execute, read and
+write file, read directory, remove directory/file, make char/directory/
+regular/socket/FIFO/block/symlink, refer, and truncate. Grants are narrower:
+
+- read-only: read file and read directory;
+- read-execute: read file, read directory, and execute;
+- read-write: read/write file, read directory, truncate, remove file/
+  directory, make regular/directory/symlink, and refer;
+- make FIFO/socket: opt-in policy flags only;
+- make character/block device: never granted.
+
+The fixture policy grants the assigned worktree and task temporary directory
+read-write; the interpreter/repository/runtime hierarchy read-execute; the
+fixture read-only directory read-only; and only `/dev/null` (write),
+`/dev/zero` (write), `/dev/random` (read), and `/dev/urandom` (read). It does
+not grant the whole `/dev` hierarchy.
+
+Because Landlock rules in one layer union their rights, policy construction
+rejects a same-object mode conflict and any ancestor/descendant overlap where
+the ancestor grants a right omitted by the descendant. A read-only ancestor
+with an explicit writable descendant remains valid; a writable workspace
+containing a nominally read-only child does not.
+
+## 19. Descriptor and path authority
+
+The Python parent uses `close_fds=True` and passes only explicit protocol
+descriptors. The launcher independently sanitizes with `close_range()` and
+closes its setup descriptors before exec. The observed persistent worker FD
+set is exactly `0, 1, 2`, even when the test deliberately passes an outside
+file FD into the launcher process.
+
+The existing-FD negative control remains important: a file opened before
+Landlock can still be read through that descriptor after restriction while a
+new pathname open is denied. This is a documented Landlock property and the
+reason descriptor sanitation is part of the security boundary.
+
+Controller strings are locators, never authority. It canonicalizes and binds
+each configured root to `(st_dev, st_ino)` in the authenticated request. The
+launcher opens `/` as a trusted directory FD and resolves the locator with
+`openat2(O_PATH|O_CLOEXEC, RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS|
+RESOLVE_NO_SYMLINKS)`, then verifies the opened object's identity with
+`fstat()`. Documented `EAGAIN` races receive at most three retries; every
+other failure, identity change, or exhausted retry fails closed. There is no
+`realpath()` or string-prefix authorization fallback. `fchdir()` uses the
+already opened workspace FD.
+
+## 20. Adversarial evidence on the tested host
+
+The real native-launcher suite observed:
+
+| Operation | Observation |
+|---|---|
+| workspace/read-only reads; workspace write/rename | allowed |
+| outside read/write and parent traversal | denied, `EACCES` |
+| symlink escape read/write | denied, `EACCES` |
+| read-only write | denied, `EACCES` |
+| `truncate()` and `open(O_TRUNC)` outside | denied, `EACCES`; content intact |
+| outside hardlink into workspace | denied, `EXDEV` |
+| read-only-to-workspace rename | denied, `EACCES` |
+| child, grandchild, setsid, new process group, parent-exit, double fork | pathname access denied, `EACCES`; cgroup drained |
+| concurrent policy-root replacement | intended inode opened or safe failure; never replacement |
+| injected setup failures | no hostile marker; scope drained |
+| exec failure after restriction | policy-applied evidence retained; separate exec-failed evidence |
+
+The policy acknowledgement contains the request nonce, ABI, handled mask,
+and SHA-256 policy digest. The controller authenticates those fields before
+emitting `FILESYSTEM_POLICY_APPLIED`. A forged digest produces
+`FILESYSTEM_POLICY_FAILED`, never policy-applied evidence, never an exec
+release, and therefore no hostile worker execution.
+
+## 21. Boundary characterization and claim
+
+Observed ABI-v3 gaps are deliberately tests, not promises: metadata calls
+such as `stat`, `chmod`, and `setxattr` can succeed outside the granted roots;
+connecting to an already-created pathname Unix socket can succeed; and an
+already-open descriptor remains usable. Landlock does not virtualize `/proc`,
+hide the filesystem, broker credentials, mediate network access at ABI 3, or
+provide mount/device isolation. Readable runtime roots (including `/proc`)
+are compatibility grants, not proof that their contents are harmless.
+
+The earned claim is narrow: on the recorded Ubuntu/WSL2 host, AgenticOS
+demonstrated a fail-closed ABI-v3 Landlock content/hierarchy boundary for new
+mediated operations, inherited by the tested descendant shapes and composed
+with deterministic cgroup-v2 termination. This is not a complete sandbox or
+a claim about native Windows execution, credentials, networks, sockets,
+mounts, devices, arbitrary Linux hosts, or a malicious kernel.
+
+## 22. Milestone 3B verification record (2026-08-07)
+
+Observed host: Ubuntu 26.04 LTS (Resolute) on WSL2, kernel
+`6.6.87.2-microsoft-standard-WSL2` x86_64, systemd 259
+(`259.5-0ubuntu3`), Python 3.14.4, pytest 8.4.2, unified cgroup v2, and
+Landlock ABI 3.
+
+Commands and final counts after code review fixes:
+
+```sh
+gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 \
+  native/fs_launcher/fs_launcher.c -o native/fs_launcher/fs_launcher
+# exit 0, no diagnostics
+
+.venv/bin/pytest -o addopts= -q \
+  tests/conformance/test_native_landlock_unit.py \
+  tests/conformance/test_native_landlock_integration.py
+# 62 passed
+
+.venv/bin/pytest -o addopts= -q \
+  tests/conformance/test_filesystem_isolation.py
+# 16 passed
+
+.venv/bin/pytest -o addopts= -q \
+  tests/conformance/test_cgroup_integration.py
+# 13 passed
+
+.venv/bin/pytest -o addopts= -q
+# repetition 1: 180 passed, 1 skipped
+# repetition 2: 180 passed, 1 skipped
+# repetition 3: 180 passed, 1 skipped
+```
+
+The sole skip is the intentional non-Linux gating assertion. After each full
+run, `systemctl --user list-units --all 'aos-*'` returned no units and no
+`aos-*` cgroup reported `populated 1`. Native-Windows pytest is a portability
+regression only and is reported separately from Linux enforcement evidence.

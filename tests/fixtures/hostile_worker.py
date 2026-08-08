@@ -91,6 +91,7 @@ def scenario_file_read(scenario_id: str, args: argparse.Namespace) -> dict[str, 
         return make_result(
             scenario_id, args.target, started, succeeded=False,
             error_type=type(exc).__name__, error_message=str(exc),
+            details={"errno": getattr(exc, "errno", None)},
         )
 
 
@@ -108,6 +109,7 @@ def scenario_file_write(scenario_id: str, args: argparse.Namespace) -> dict[str,
         return make_result(
             scenario_id, args.target, started, succeeded=False,
             error_type=type(exc).__name__, error_message=str(exc),
+            details={"errno": getattr(exc, "errno", None)},
         )
 
 
@@ -136,7 +138,12 @@ def scenario_traversal_read(scenario_id: str, args: argparse.Namespace) -> dict[
         return make_result(
             scenario_id, args.target, started, succeeded=False,
             error_type=type(exc).__name__, error_message=str(exc),
-            details={"base": base, "relative_path": rel, "traversal_path": traversal_path},
+            details={
+                "base": base,
+                "relative_path": rel,
+                "traversal_path": traversal_path,
+                "errno": getattr(exc, "errno", None),
+            },
         )
 
 
@@ -641,7 +648,7 @@ def scenario_preopened_fd(scenario_id: str, args: argparse.Namespace) -> dict[st
 def scenario_descendant_denied_read(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
     """FS-09: a DESCENDANT attempts to read the denied file (--target).
     --base selects the descendant shape: child | grandchild | setsid |
-    doublefork. The descendant records its observation to a result file in
+    newpgroup | parentexit | doublefork. The descendant records its observation to a result file in
     the cwd; ``succeeded`` means the descendant actually read the denied
     content (i.e. the restriction was NOT inherited)."""
     started = utc_now_iso()
@@ -649,12 +656,16 @@ def scenario_descendant_denied_read(scenario_id: str, args: argparse.Namespace) 
     target = args.target
     result_file = os.path.join(os.getcwd(), f"fs09-{mode}-result.json")
     attempt = (
-        "import json\n"
+        "import json, os\n"
+        "try:\n"
+        "    cgroup = open('/proc/self/cgroup').read().strip()\n"
+        "except Exception:\n"
+        "    cgroup = None\n"
         f"try:\n"
         f"    d = open({target!r}, 'rb').read()\n"
-        f"    r = {{'opened': True, 'canary_found': 'AOS_CANARY_' in d.decode('utf-8','replace')}}\n"
+        f"    r = {{'opened': True, 'canary_found': 'AOS_CANARY_' in d.decode('utf-8','replace'), 'pid': os.getpid(), 'cgroup': cgroup}}\n"
         f"except Exception as e:\n"
-        f"    r = {{'opened': False, 'error': type(e).__name__, 'errno': getattr(e, 'errno', None)}}\n"
+        f"    r = {{'opened': False, 'error': type(e).__name__, 'errno': getattr(e, 'errno', None), 'pid': os.getpid(), 'cgroup': cgroup}}\n"
         f"open({result_file!r}, 'w').write(json.dumps(r))\n"
     )
     runners = {
@@ -667,6 +678,18 @@ def scenario_descendant_denied_read(scenario_id: str, args: argparse.Namespace) 
             "import os, subprocess, sys\n"
             "os.setsid()\n"
             f"subprocess.run([sys.executable, '-c', {attempt!r}])\n"
+        ),
+        "newpgroup": (
+            "import os, subprocess, sys\n"
+            "os.setpgrp()\n"
+            f"subprocess.run([sys.executable, '-c', {attempt!r}])\n"
+        ),
+        "parentexit": (
+            "import os, time\n"
+            "if os.fork() > 0:\n"
+            "    os._exit(0)\n"
+            "time.sleep(0.1)\n"
+            f"exec({attempt!r})\n"
         ),
         "doublefork": (
             "import os, subprocess, sys\n"
@@ -682,7 +705,7 @@ def scenario_descendant_denied_read(scenario_id: str, args: argparse.Namespace) 
         return make_result(scenario_id, target, started, attempted=False,
                            succeeded=False, error_type="ValueError",
                            error_message=f"unknown mode {mode!r}")
-    if mode == "doublefork" and not hasattr(os, "fork"):
+    if mode in ("parentexit", "doublefork") and not hasattr(os, "fork"):
         return make_result(scenario_id, target, started, succeeded=False,
                            error_type="Unsupported",
                            error_message="os.fork not available on this platform")
@@ -705,6 +728,8 @@ def scenario_descendant_denied_read(scenario_id: str, args: argparse.Namespace) 
             details={"mode": mode, "descendant_opened": bool(observation.get("opened")),
                      "descendant_error": observation.get("error"),
                      "descendant_errno": observation.get("errno"),
+                     "descendant_pid": observation.get("pid"),
+                     "descendant_cgroup": observation.get("cgroup"),
                      "descendant_canary_found": observation.get("canary_found", False)},
         )
     except Exception as exc:  # noqa: BLE001
@@ -713,6 +738,133 @@ def scenario_descendant_denied_read(scenario_id: str, args: argparse.Namespace) 
                            details={"mode": mode})
 
 
+def scenario_enumerate_fds(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """FS-12: enumerate inherited file descriptors via /proc/self/fd.
+
+    Self-inspection probe: reports which FDs beyond 0/1/2 survived the
+    launch boundary. succeeded = enumeration worked; the security signal is
+    in details['open_fds']."""
+    started = utc_now_iso()
+    try:
+        entries = os.listdir("/proc/self/fd")
+        candidates = sorted(int(e) for e in entries if e.isdigit())
+        fds = []
+        for fd in candidates:
+            try:
+                os.fstat(fd)
+            except OSError:
+                continue
+            fds.append(fd)
+        return make_result(
+            scenario_id, "", started, succeeded=True,
+            details={"open_fds": fds, "fds_beyond_stdio": [f for f in fds if f > 2]},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(scenario_id, "", started, succeeded=False,
+                           error_type=type(exc).__name__, error_message=str(exc))
+
+
+def scenario_boundary_probe(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """FS-13: characterize what the filesystem boundary does NOT mediate.
+    --base selects the probe: stat | chmod | setxattr | socket_connect.
+    These document the guarantee edge; they are NOT conformance failures."""
+    started = utc_now_iso()
+    mode = (args.base or "stat").strip()
+    target = args.target
+    try:
+        if mode == "stat":
+            st = os.stat(target)
+            detail = {"mode": mode, "size": st.st_size}
+        elif mode == "chmod":
+            os.chmod(target, 0o600)
+            detail = {"mode": mode, "chmod": "0600"}
+        elif mode == "setxattr":
+            os.setxattr(target, b"user.aos_probe", b"1")
+            detail = {"mode": mode, "xattr": "user.aos_probe"}
+        elif mode == "socket_connect":
+            if not hasattr(socket, "AF_UNIX"):
+                return make_result(scenario_id, target, started, succeeded=False,
+                                   error_type="Unsupported",
+                                   error_message="AF_UNIX unavailable",
+                                   details={"mode": mode})
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(5.0)
+                s.connect(target)
+            detail = {"mode": mode}
+        else:
+            return make_result(scenario_id, target, started, attempted=False,
+                               succeeded=False, error_type="ValueError",
+                               error_message=f"unknown probe mode {mode!r}")
+        return make_result(scenario_id, target, started, succeeded=True,
+                           details=detail)
+    except Exception as exc:  # noqa: BLE001
+        return make_result(scenario_id, target, started, succeeded=False,
+                           error_type=type(exc).__name__, error_message=str(exc),
+                           details={"mode": mode, "errno": getattr(exc, "errno", None)})
+
+
+def scenario_file_truncate(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """FS-14: exercise both ABI-v3 truncation paths independently."""
+    started = utc_now_iso()
+    method = (args.base or "truncate").strip()
+    try:
+        if method == "truncate":
+            os.truncate(args.target, 0)
+        elif method == "open_trunc":
+            fd = os.open(args.target, os.O_RDONLY | os.O_TRUNC)
+            os.close(fd)
+        else:
+            raise ValueError(f"unknown truncation method {method!r}")
+        return make_result(
+            scenario_id,
+            args.target,
+            started,
+            succeeded=True,
+            details={"method": method},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id,
+            args.target,
+            started,
+            succeeded=False,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            details={"method": method, "errno": getattr(exc, "errno", None)},
+        )
+
+
+def scenario_link_or_rename(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """FS-15: hardlink or rename source target to the destination in --base."""
+    started = utc_now_iso()
+    try:
+        operation, destination = (args.base or "").split(":", 1)
+        if operation == "hardlink":
+            os.link(args.target, destination)
+        elif operation == "rename":
+            os.rename(args.target, destination)
+        else:
+            raise ValueError(f"unknown link/reparent operation {operation!r}")
+        return make_result(
+            scenario_id,
+            args.target,
+            started,
+            succeeded=True,
+            details={"operation": operation, "destination": destination},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id,
+            args.target,
+            started,
+            succeeded=False,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            details={
+                "operation": (args.base or "").split(":", 1)[0],
+                "errno": getattr(exc, "errno", None),
+            },
+        )
 # --------------------------------------------------------------------------
 # Network / socket scenarios (fixture-controlled local endpoints only)
 # --------------------------------------------------------------------------
@@ -798,6 +950,14 @@ SCENARIOS: dict[str, dict[str, Any]] = {
               "description": "Read an explicitly allowed read-only file."},
     "FS-11": {"handler": scenario_file_write, "needs": ("target",),
               "description": "Attempt to write an explicitly read-only file."},
+    "FS-12": {"handler": scenario_enumerate_fds, "needs": (),
+              "description": "Enumerate inherited file descriptors (self-inspection)."},
+    "FS-13": {"handler": scenario_boundary_probe, "needs": ("target",),
+              "description": "Boundary characterization probe (stat|chmod|setxattr|socket_connect via --base)."},
+    "FS-14": {"handler": scenario_file_truncate, "needs": ("target",),
+              "description": "Attempt truncate() or open(O_TRUNC) selected by --base."},
+    "FS-15": {"handler": scenario_link_or_rename, "needs": ("target", "base"),
+              "description": "Attempt hardlink or rename to the --base destination."},
     "ENV-01": {"handler": scenario_env_read, "needs": ("env_name",),
                "description": "Read an explicitly provided harmless environment value."},
     "ENV-02": {"handler": scenario_env_secret_probe, "needs": ("env_name",),

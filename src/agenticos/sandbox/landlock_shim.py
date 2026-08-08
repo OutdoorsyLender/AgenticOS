@@ -54,7 +54,7 @@ ACCESS_BY_NAME = {"ro": ACCESS_RO, "rw": ACCESS_RW}
 
 # Rights meaningful on non-directory paths; granting directory-only rights
 # (READ_DIR, MAKE_*, REMOVE_DIR) on a regular file makes add_rule fail EINVAL.
-_FILE_RIGHTS = _EXECUTE | _READ_FILE | _WRITE_FILE | _REMOVE_FILE | _REFER | _TRUNCATE
+_FILE_RIGHTS = _EXECUTE | _READ_FILE | _WRITE_FILE | _TRUNCATE
 
 
 class _RulesetAttr(ctypes.Structure):

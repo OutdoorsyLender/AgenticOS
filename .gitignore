@@ -5,6 +5,7 @@ __pycache__/
 .eggs/
 build/
 dist/
+/native/fs_launcher/fs_launcher
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

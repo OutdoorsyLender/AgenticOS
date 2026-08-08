@@ -11,6 +11,11 @@ UNDER the proven cgroup process-containment lifecycle:
 Process containment is NOT filesystem isolation; this module adds the
 second layer as an experiment. Nothing here restricts network, sockets,
 environment secrets, or pre-opened file descriptors.
+
+NOTE (Milestone 3B): the production launch boundary lives in
+agenticos.sandbox.launcher (NativeLandlockRunner + native fs_launcher).
+The runners in this module remain as the EXPERIMENTAL 3A reference/test
+oracle and are never selected as a production fallback.
 =====================================================================
 
 Policy model (deliberately minimal):
@@ -56,6 +61,10 @@ class FilesystemPolicy:
     writable_paths: list[Path] = field(default_factory=list)
     readonly_paths: list[Path] = field(default_factory=list)
     runtime_paths: list[Path] = field(default_factory=list)
+    # MAKE_FIFO / MAKE_SOCK are only granted to writable roots when the
+    # policy explicitly requires them. MAKE_CHAR / MAKE_BLOCK: never.
+    allow_fifo_nodes: bool = False
+    allow_socket_nodes: bool = False
 
     def rules(self) -> list[dict[str, str]]:
         rules = [{"path": str(self.workspace), "access": "rw"}]
@@ -63,6 +72,69 @@ class FilesystemPolicy:
         rules += [{"path": str(p), "access": "ro"} for p in self.readonly_paths]
         rules += [{"path": str(p), "access": "ro"} for p in self.runtime_paths]
         return rules
+
+    def to_launcher_roots(self) -> list[tuple[str, str]]:
+        """Canonicalized (path, mode) records for the native launcher.
+
+        Modes: r=ro, x=rx, w=rw (+f/s flags). Paths are realpath-resolved by
+        the controller; the launcher independently requires symlink-free
+        resolution (RESOLVE_NO_SYMLINKS) and fails closed on mismatch.
+        """
+        flags = ("f" if self.allow_fifo_nodes else "") + (
+            "s" if self.allow_socket_nodes else "")
+        roots: list[tuple[str, str]] = []
+
+        def add(path: Path, mode: str) -> None:
+            canon = os.path.realpath(path)
+            for existing_path, existing_mode in roots:
+                if existing_path == canon and existing_mode != mode:
+                    raise ValueError(
+                        "conflicting modes for canonical policy root "
+                        f"{canon!r}: {existing_mode!r} and {mode!r}"
+                    )
+            record = (canon, mode)
+            if record not in roots:
+                roots.append(record)
+
+        def granted_rights(mode: str) -> set[str]:
+            rights = {"read_file", "read_dir"}
+            if mode[0] == "x":
+                rights.add("execute")
+            elif mode[0] == "w":
+                rights.update({
+                    "write_file", "truncate", "remove_file", "remove_dir",
+                    "make_reg", "make_dir", "make_sym", "refer",
+                })
+            if "f" in mode:
+                rights.add("make_fifo")
+            if "s" in mode:
+                rights.add("make_sock")
+            return rights
+
+        add(self.workspace, "w" + flags)
+        for p in self.writable_paths:
+            add(p, "w" + flags)
+        for p in self.readonly_paths:
+            add(p, "r")
+        for p in self.runtime_paths:
+            add(p, "x")
+
+        # Landlock path-beneath rules in one layer union their grants.  An
+        # ancestor may therefore be narrower than a descendant exception,
+        # but it must never grant a right that the descendant mode omits.
+        for ancestor_path, ancestor_mode in roots:
+            ancestor = Path(ancestor_path)
+            for descendant_path, descendant_mode in roots:
+                descendant = Path(descendant_path)
+                if ancestor == descendant or not descendant.is_relative_to(ancestor):
+                    continue
+                if not granted_rights(ancestor_mode) <= granted_rights(descendant_mode):
+                    raise ValueError(
+                        "overlapping policy roots would widen descendant "
+                        f"rights: {ancestor_path!r} ({ancestor_mode}) contains "
+                        f"{descendant_path!r} ({descendant_mode})"
+                    )
+        return roots
 
     def to_env_value(self) -> str:
         return base64.b64encode(json.dumps({"rules": self.rules()}).encode()).decode()
@@ -89,15 +161,21 @@ class FilesystemPolicy:
             if (parent / "pyvenv.cfg").exists():
                 runtime.append(parent)
                 break
-        # /dev needs WRITE (e.g. /dev/null redirections); Landlock cannot
-        # scope device types — documented limitation of the experiment.
-        # Mount-namespace backends give a fresh minimal /dev instead and
-        # skip this path entirely.
-        writable = [layout.task_tmp, Path("/dev")]
+        # Keep the device grant intentionally narrow. ABI v3 cannot mediate
+        # device ioctls, so ordinary workers get only the standard nodes they
+        # commonly need rather than authority over the full /dev hierarchy.
+        writable = [layout.task_tmp]
+        readonly = [layout.readonly_dir]
+        for device in (Path("/dev/null"), Path("/dev/zero")):
+            if device.exists():
+                writable.append(device)
+        for device in (Path("/dev/random"), Path("/dev/urandom")):
+            if device.exists():
+                readonly.append(device)
         return cls(
             workspace=layout.assigned_worktree,
             writable_paths=writable,
-            readonly_paths=[layout.readonly_dir],
+            readonly_paths=readonly,
             runtime_paths=runtime,
         )
 
@@ -170,6 +248,9 @@ class LandlockIsolatedRunner(CgroupProcessRunner):
     inherited by every descendant across fork/exec/setsid/double-fork.
     Pre-opened file descriptors are NOT revoked by Landlock (documented
     limitation: never hand sensitive FDs to a worker).
+
+    Milestone 3B: retained as the experimental reference / test oracle.
+    The production boundary is agenticos.sandbox.launcher.NativeLandlockRunner.
     """
 
     name = "landlock-experimental"
@@ -254,7 +335,14 @@ class BwrapIsolatedRunner(CgroupProcessRunner):
         def add(flag: str, path: Path) -> None:
             # /dev and /proc are handled by bwrap itself (--dev /dev);
             # binding host device nodes would WIDEN access, not narrow it.
-            if str(path) in ("/dev", "/proc"):
+            if path in {
+                Path("/dev"),
+                Path("/dev/null"),
+                Path("/dev/zero"),
+                Path("/dev/random"),
+                Path("/dev/urandom"),
+                Path("/proc"),
+            }:
                 return
             key = f"{flag}:{path}"
             if key in emitted:
