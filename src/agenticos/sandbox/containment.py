@@ -244,9 +244,13 @@ class SystemdScopeBackend:
     def cgroup_populated(self, cgroup_path: Path) -> Optional[bool]:
         try:
             events = parse_cgroup_events((cgroup_path / "cgroup.events").read_text())
-        except OSError:
+        except FileNotFoundError:
             return None  # cgroup gone == nothing inside
-        return bool(events.get("populated", 0))
+        if "populated" not in events:
+            raise ContainmentUnavailableError(
+                f"cgroup.events lacks populated evidence: {cgroup_path}"
+            )
+        return bool(events["populated"])
 
     def unit_active(self, unit: str) -> bool:
         proc = self._ctl(["show", unit, "-p", "ActiveState,LoadState", "--value"])

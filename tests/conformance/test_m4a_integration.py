@@ -8,6 +8,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -184,6 +185,78 @@ def test_block_fd_ordering_and_normal_exit(m4a_runner, layout):
     assert str(layout.root) not in serialized
     assert str(layout.assigned_worktree) not in serialized
     assert "OPENAI_API_KEY" not in serialized
+
+
+def test_large_authenticated_request_is_streamed_after_namespace_release(
+    m4a_runner,
+):
+    large_arguments = ["x" * 4000 for _ in range(60)]
+    process = m4a_runner.run(
+        ["/usr/bin/python3", "-c", "print('large-request-ok')", *large_arguments],
+        cwd="/workspace",
+        env={},
+    )
+
+    assert process.exit_code == 0, process.stderr
+    assert process.stdout.strip() == "large-request-ok"
+    _assert_no_task_units(m4a_runner)
+
+
+def test_controller_exception_after_hostile_exec_recursively_cleans_scope(
+    m4a_runner, layout, monkeypatch
+):
+    marker = layout.task_tmp / "post-exec-controller-fault"
+    original_communicate = m4a_runner._communicate_process
+    calls = 0
+
+    def fail_once(proc, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            deadline = time.monotonic() + 3.0
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert marker.exists(), "worker did not enter before injected controller fault"
+            raise RuntimeError("injected post-exec controller failure")
+        return original_communicate(proc, timeout)
+
+    monkeypatch.setattr(m4a_runner, "_communicate_process", fail_once)
+    with pytest.raises(RuntimeError, match="post-exec controller failure"):
+        m4a_runner.run(
+            [
+                "/usr/bin/python3",
+                "-c",
+                "from pathlib import Path; import time; "
+                "Path('/tmp/post-exec-controller-fault').touch(); time.sleep(60)",
+            ],
+            cwd="/workspace",
+            env={},
+        )
+    assert marker.exists()
+    _assert_no_task_units(m4a_runner)
+
+
+def test_unreadable_cgroup_evidence_is_not_treated_as_empty(
+    m4a_runner, monkeypatch
+):
+    original_populated = m4a_runner.backend.cgroup_populated
+    calls = 0
+
+    def fail_once(cgroup_path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError("injected unreadable cgroup.events")
+        return original_populated(cgroup_path)
+
+    monkeypatch.setattr(m4a_runner.backend, "cgroup_populated", fail_once)
+    with pytest.raises(PermissionError, match="unreadable cgroup.events"):
+        m4a_runner.run(
+            ["/usr/bin/python3", "-c", "print('worker-finished')"],
+            cwd="/workspace",
+            env={},
+        )
+    _assert_no_task_units(m4a_runner)
 
 
 @pytest.mark.parametrize(

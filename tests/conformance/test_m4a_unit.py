@@ -98,14 +98,16 @@ def test_bubblewrap_probe_rejects_setuid_metadata(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         boundary,
-        "_stat_executable",
-        lambda _path: SimpleNamespace(
+        "_fstat_executable",
+        lambda _fd: SimpleNamespace(
             st_uid=0,
             st_gid=0,
             st_mode=stat.S_IFREG | stat.S_ISUID | 0o755,
+            st_dev=1,
+            st_ino=2,
         ),
     )
-    monkeypatch.setattr(boundary, "_read_file_capabilities", lambda _path: "")
+    monkeypatch.setattr(boundary, "_read_fd_capabilities", lambda _fd: "")
     result = boundary.probe_bubblewrap(executable, run_behavior_probe=False)
 
     assert result.supported is False
@@ -120,8 +122,8 @@ def test_bubblewrap_probe_rejects_file_capabilities(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         boundary,
-        "_read_file_capabilities",
-        lambda _path: f"{executable} cap_sys_admin=ep",
+        "_read_fd_capabilities",
+        lambda _fd: f"{executable} cap_sys_admin=ep",
     )
     result = boundary.probe_bubblewrap(executable, run_behavior_probe=False)
 
@@ -462,6 +464,89 @@ def test_bounded_status_reader_rejects_oversized_record():
         os.close(read_fd)
         if write_fd >= 0:
             os.close(write_fd)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux pipe polling")
+def test_bounded_status_reader_rejects_queued_duplicate_setup_record():
+    boundary = _runtime_boundary()
+    read_fd, write_fd = os.pipe()
+    try:
+        first = _valid_bwrap_setup(boundary)
+        second = dict(first, **{"child-pid": 99})
+        os.write(
+            write_fd,
+            (json.dumps(first) + "\n" + json.dumps(second) + "\n").encode(),
+        )
+        with pytest.raises(boundary.NamespaceEvidenceError, match="duplicate"):
+            boundary.read_bwrap_setup_status(read_fd, timeout=1.0)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_cgroup_populated_distinguishes_gone_from_unreadable_and_malformed(
+    tmp_path, monkeypatch
+):
+    from agenticos.sandbox.containment import (
+        ContainmentUnavailableError,
+        SystemdScopeBackend,
+    )
+
+    backend = object.__new__(SystemdScopeBackend)
+    cgroup = tmp_path / "task.scope"
+    assert backend.cgroup_populated(cgroup) is None
+
+    cgroup.mkdir()
+    events = cgroup / "cgroup.events"
+    events.write_text("frozen 0\n")
+    with pytest.raises(ContainmentUnavailableError, match="lacks populated"):
+        backend.cgroup_populated(cgroup)
+
+    original = Path.read_text
+
+    def deny_read(path, *args, **kwargs):
+        if path == events:
+            raise PermissionError("injected unreadable cgroup evidence")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_read)
+    with pytest.raises(PermissionError, match="unreadable"):
+        backend.cgroup_populated(cgroup)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux openat2")
+def test_verified_bubblewrap_reopen_rejects_identity_or_content_change(tmp_path):
+    from dataclasses import replace
+
+    boundary = _runtime_boundary()
+    executable = tmp_path / "bwrap"
+    executable.write_bytes(b"first")
+    executable.chmod(0o755)
+    observed = executable.stat()
+    capability = boundary.BubblewrapCapability(
+        path=executable,
+        supported=True,
+        reasons=(),
+        version="synthetic",
+        sha256=boundary.hashlib.sha256(b"first").hexdigest(),
+        uid=observed.st_uid,
+        gid=observed.st_gid,
+        mode=0o755,
+        setuid=False,
+        setgid=False,
+        file_capabilities="",
+        unprivileged_user_namespace=True,
+        nested_user_namespace_denied=True,
+        device=observed.st_dev,
+        inode=observed.st_ino,
+    )
+
+    with pytest.raises(boundary.RuntimeBoundaryUnavailable, match="identity changed"):
+        boundary.open_verified_bwrap(replace(capability, inode=observed.st_ino + 1))
+
+    executable.write_bytes(b"other")
+    with pytest.raises(boundary.RuntimeBoundaryUnavailable, match="content changed"):
+        boundary.open_verified_bwrap(capability)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux procfs")

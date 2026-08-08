@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import select
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
@@ -45,6 +46,7 @@ from .runtime_boundary import (
     build_bwrap_argv,
     build_runtime_plan,
     probe_bubblewrap,
+    open_verified_bwrap,
     read_bwrap_setup_status,
     read_namespace_snapshot,
     secure_open_source,
@@ -86,9 +88,10 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
         self.setup_timeout = float(setup_timeout)
         if self.setup_timeout <= 0:
             raise ValueError("setup_timeout must be positive")
-        self.last_ordering_observations: dict[str, bool] = {}
+        self.last_ordering_observations: dict[str, Optional[bool]] = {}
         self.last_namespace_evidence: Optional[NamespaceEvidence] = None
         self.last_launch_outcome: Optional[dict] = None
+        self._bwrap_capability = None
 
     def check_support(self, refresh: bool = False) -> ContainmentSupport:
         support = super().check_support(refresh=refresh)
@@ -97,6 +100,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             support.reasons.append(f"native launcher missing: {self.launcher_path}")
         if support.supported:
             bwrap = probe_bubblewrap()
+            self._bwrap_capability = bwrap
             self._emit(
                 EV_NAMESPACE_CAPABILITY,
                 backend="bubblewrap",
@@ -109,6 +113,8 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 setuid=bwrap.setuid,
                 setgid=bwrap.setgid,
                 file_capabilities=bool(bwrap.file_capabilities),
+                device=bwrap.device,
+                inode=bwrap.inode,
                 unprivileged_user_namespace=bwrap.unprivileged_user_namespace,
                 nested_user_namespace_denied=bwrap.nested_user_namespace_denied,
             )
@@ -125,8 +131,13 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
     @staticmethod
     def _move_fd(fd: int, minimum: int) -> int:
         if fcntl is None:
+            os.close(fd)
             raise RuntimeBoundaryUnavailable("M4A descriptor setup requires Linux fcntl")
-        moved = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, minimum)
+        try:
+            moved = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, minimum)
+        except BaseException:
+            os.close(fd)
+            raise
         os.close(fd)
         os.set_inheritable(moved, True)
         return moved
@@ -181,8 +192,77 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
         return "/" + relative.as_posix()
 
     @staticmethod
-    def _marker_absent(marker: Optional[Path]) -> bool:
-        return marker is None or not marker.exists()
+    def _marker_absent(marker: Optional[Path]) -> Optional[bool]:
+        return None if marker is None else not marker.exists()
+
+    @staticmethod
+    def _communicate_process(
+        proc: subprocess.Popen, timeout: Optional[float]
+    ) -> tuple[bytes, bytes]:
+        return proc.communicate(timeout=timeout)
+
+    @staticmethod
+    def _write_all(fd: int, payload: bytes, *, budget: float) -> None:
+        """Write one bounded control payload without blocking past its deadline."""
+        deadline = time.monotonic() + budget
+        offset = 0
+        original_blocking = os.get_blocking(fd)
+        os.set_blocking(fd, False)
+        try:
+            while offset < len(payload):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ContainmentUnavailableError(
+                        "timed out streaming trusted launcher request"
+                    )
+                _, writable, _ = select.select([], [fd], [], min(remaining, 0.2))
+                if not writable:
+                    continue
+                try:
+                    written = os.write(fd, payload[offset:])
+                except BlockingIOError:
+                    continue
+                if written <= 0:
+                    raise ContainmentUnavailableError(
+                        "trusted launcher request channel closed"
+                    )
+                offset += written
+        finally:
+            os.set_blocking(fd, original_blocking)
+
+    def _cleanup_failed_process(
+        self,
+        scope: str,
+        cgroup_path: Optional[Path],
+        proc: subprocess.Popen,
+        cause: BaseException,
+    ) -> None:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+        cleanup_state = ContainmentState.FAILED
+        try:
+            cleanup_state = self._cancel(scope, cgroup_path, proc)
+        except BaseException:  # Preserve cleanup progress even if evidence I/O fails.
+            cleanup_state = ContainmentState.FAILED
+        finally:
+            self.backend.stop_unit(scope)
+        try:
+            self._communicate_process(proc, 5.0)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            cleanup_state = ContainmentState.FAILED
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            if self.backend.unit_active(scope):
+                cleanup_state = ContainmentState.FAILED
+        except BaseException:
+            cleanup_state = ContainmentState.FAILED
+        if cleanup_state is not ContainmentState.TERMINATED:
+            raise ContainmentUnavailableError(
+                "M4A failure cleanup was not proven"
+            ) from cause
 
     def _emit_v2_progress(self, scope: str, outcome: dict) -> None:
         events = {
@@ -224,51 +304,90 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 "M4A runtime boundary unavailable: " + "; ".join(support.reasons)
             )
         timeout = self.default_timeout if timeout is None else float(timeout)
+        if self._bwrap_capability is None:
+            raise ContainmentUnavailableError("Bubblewrap capability evidence is missing")
         worker_argv = [str(item) for item in argv]
-        sources = self._open_runtime_sources()
-        (
-            workspace,
-            runtime_usr,
-            launcher,
-            worker,
-            task_tmp,
-            synthetic_home,
-        ) = sources
-        plan = build_runtime_plan(
-            profile=self.profile,
-            workspace=workspace,
-            runtime_usr=runtime_usr,
-            launcher=launcher,
-            worker=worker,
-            task_tmp=task_tmp,
-            synthetic_home=synthetic_home,
-        )
-        workspace_mount = plan.mount_for("/workspace")
-        authorized_root_records = [
-            (
-                mount.destination,
-                mount.source.identity.device,
-                mount.source.identity.inode,
-                mount.landlock_mode,
+        bwrap_fd = -1
+        sources: tuple[AuthorizedSource, ...] = ()
+        namespace_gate_r0 = namespace_gate_r = namespace_gate_w = -1
+        json_status_r = json_status_w0 = json_status_w = -1
+        native_status_r = native_status_w0 = native_status_w = -1
+        try:
+            bwrap_fd = self._move_fd(
+                open_verified_bwrap(self._bwrap_capability), 20
             )
-            for mount in plan.mounts
-        ]
-        namespace_gate_r0, namespace_gate_w = os.pipe()
-        json_status_r, json_status_w0 = os.pipe()
-        native_status_r, native_status_w0 = os.pipe()
-        namespace_gate_r = self._move_fd(namespace_gate_r0, 32)
-        json_status_w = self._move_fd(json_status_w0, 33)
-        native_status_w = self._move_fd(native_status_w0, 34)
-        bwrap_argv = build_bwrap_argv(
-            plan,
-            namespace_gate_fd=namespace_gate_r,
-            json_status_fd=json_status_w,
-            launcher_status_fd=native_status_w,
-        )
+            sources = self._open_runtime_sources()
+            (
+                workspace,
+                runtime_usr,
+                launcher,
+                worker,
+                task_tmp,
+                synthetic_home,
+            ) = sources
+            plan = build_runtime_plan(
+                profile=self.profile,
+                workspace=workspace,
+                runtime_usr=runtime_usr,
+                launcher=launcher,
+                worker=worker,
+                task_tmp=task_tmp,
+                synthetic_home=synthetic_home,
+            )
+            workspace_mount = plan.mount_for("/workspace")
+            authorized_root_records = [
+                (
+                    mount.destination,
+                    mount.source.identity.device,
+                    mount.source.identity.inode,
+                    mount.landlock_mode,
+                )
+                for mount in plan.mounts
+            ]
+            namespace_gate_r0, namespace_gate_w = os.pipe()
+            json_status_r, json_status_w0 = os.pipe()
+            native_status_r, native_status_w0 = os.pipe()
+            namespace_gate_r = self._move_fd(namespace_gate_r0, 32)
+            namespace_gate_r0 = -1
+            json_status_w = self._move_fd(json_status_w0, 33)
+            json_status_w0 = -1
+            native_status_w = self._move_fd(native_status_w0, 34)
+            native_status_w0 = -1
+            bwrap_argv = build_bwrap_argv(
+                plan,
+                namespace_gate_fd=namespace_gate_r,
+                json_status_fd=json_status_w,
+                launcher_status_fd=native_status_w,
+                executable=Path(f"/proc/self/fd/{bwrap_fd}"),
+            )
+        except BaseException:
+            for source in sources:
+                try:
+                    os.close(source.fd)
+                except OSError:
+                    pass
+            for fd in {
+                bwrap_fd,
+                namespace_gate_r0,
+                namespace_gate_r,
+                namespace_gate_w,
+                json_status_r,
+                json_status_w0,
+                json_status_w,
+                native_status_r,
+                native_status_w0,
+                native_status_w,
+            }:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            raise
         unit = f"aos-task-{uuid.uuid4().hex[:12]}"
         scope = f"{unit}.scope"
         pass_fds = tuple(
-            [source.fd for source in sources]
+            [bwrap_fd, *[source.fd for source in sources]]
             + [namespace_gate_r, json_status_w, native_status_w]
             + list(_leak_fds)
         )
@@ -315,6 +434,8 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             for source in sources:
                 os.close(source.fd)
             sources = ()
+            os.close(bwrap_fd)
+            bwrap_fd = -1
 
             setup_status = read_bwrap_setup_status(
                 json_status_r,
@@ -357,9 +478,6 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 ],
                 policy_digest_override=plan.combined_policy_digest,
             )
-            assert proc.stdin is not None
-            proc.stdin.write(prepared.wire)
-            proc.stdin.flush()
             self._emit(EV_CONTAINMENT_VERIFIED, unit=scope, cgroup_path=str(cgroup_path))
             self._emit(
                 EV_NAMESPACE_VERIFIED,
@@ -379,14 +497,18 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             ] = not launcher_absent
             self.last_ordering_observations[
                 "worker_entered_before_namespace_release"
-            ] = not worker_absent
-            if not launcher_absent or not worker_absent:
+            ] = None if worker_absent is None else not worker_absent
+            if not launcher_absent or worker_absent is False:
                 raise ContainmentUnavailableError(
                     "launcher or worker entered before namespace gate release"
                 )
             os.write(namespace_gate_w, b"G")
             os.close(namespace_gate_w)
             namespace_gate_w = -1
+
+            assert proc.stdin is not None
+            control_fd = proc.stdin.fileno()
+            self._write_all(control_fd, prepared.wire, budget=self.setup_timeout)
 
             first = NativeLandlockRunner._read_status(
                 native_status_r, budget=self.setup_timeout, max_bytes=1
@@ -399,8 +521,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 "launcher_entered_after_namespace_release"
             ] = True
             self._emit(EV_LAUNCHER_ENTERED, unit=scope)
-            proc.stdin.write(b"G")
-            proc.stdin.flush()
+            self._write_all(control_fd, b"G", budget=self.setup_timeout)
             rest = NativeLandlockRunner._read_status(
                 native_status_r, budget=self.setup_timeout
             )
@@ -423,13 +544,12 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             worker_absent = self._marker_absent(_marker_path)
             self.last_ordering_observations[
                 "worker_entered_before_exec_release"
-            ] = not worker_absent
-            if not worker_absent:
+            ] = None if worker_absent is None else not worker_absent
+            if worker_absent is False:
                 raise ContainmentUnavailableError(
                     "worker entered before authenticated exec release"
                 )
-            proc.stdin.write(b"X")
-            proc.stdin.flush()
+            self._write_all(control_fd, b"X", budget=self.setup_timeout)
             proc.stdin.close()
             trailing, status_eof = NativeLandlockRunner._read_post_release_status(
                 native_status_r, budget=self.setup_timeout
@@ -462,18 +582,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 error_type=type(launch_error).__name__,
             )
             if proc is not None:
-                if proc.stdin is not None and not proc.stdin.closed:
-                    proc.stdin.close()
-                cleanup_state = self._cancel(scope, cgroup_path, proc)
-                try:
-                    proc.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    cleanup_state = ContainmentState.FAILED
-                self.backend.stop_unit(scope)
-                if cleanup_state is not ContainmentState.TERMINATED:
-                    raise ContainmentUnavailableError(
-                        "M4A launch failed and cgroup cleanup was not proven"
-                    ) from launch_error
+                self._cleanup_failed_process(scope, cgroup_path, proc, launch_error)
             if isinstance(
                 launch_error, (NamespaceEvidenceError, RuntimeBoundaryUnavailable)
             ):
@@ -492,6 +601,11 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                     os.close(source.fd)
                 except OSError:
                     pass
+            if bwrap_fd >= 0:
+                try:
+                    os.close(bwrap_fd)
+                except OSError:
+                    pass
             if namespace_gate_w >= 0:
                 os.close(namespace_gate_w)
 
@@ -502,77 +616,96 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                     except OSError:
                         pass
 
-        os.close(native_status_r)
-        timed_out = False
-        containment_state = ContainmentState.RUNNING.value
+        assert proc is not None
         try:
-            out_b, err_b = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            containment_state = self._cancel(scope, cgroup_path, proc).value
-            out_b, err_b = proc.communicate()
-        finally:
-            os.close(json_status_r)
+            os.close(native_status_r)
+            native_status_r = -1
+            timed_out = False
+            containment_state = ContainmentState.RUNNING.value
+            try:
+                out_b, err_b = self._communicate_process(proc, timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                containment_state = self._cancel(scope, cgroup_path, proc).value
+                out_b, err_b = self._communicate_process(proc, None)
 
-        if cgroup_path is not None and not wait_cgroup_empty(
-            self.backend,
-            cgroup_path,
-            0.2,
-            self.cancellation.poll_interval,
-        ):
-            containment_state = self._cancel(scope, cgroup_path, proc).value
-        elif cgroup_path is not None:
-            containment_state = ContainmentState.TERMINATED.value
-            self._emit(EV_CGROUP_EMPTY_VERIFIED, unit=scope, after="clean exit")
-        else:
-            containment_state = ContainmentState.FAILED.value
-        self.backend.stop_unit(scope)
-        if self.backend.unit_active(scope):
-            containment_state = ContainmentState.FAILED.value
-        if containment_state == ContainmentState.TERMINATED.value:
-            self._emit(
-                EV_RUNTIME_VERIFIED,
-                profile=plan.profile.value,
-                workspace_destination="/workspace",
-                workspace_identity={
-                    "device": workspace_mount.source.identity.device,
-                    "inode": workspace_mount.source.identity.inode,
-                    "file_type": workspace_mount.source.identity.file_type,
-                },
-                worker_cwd=plan.cwd,
-                environment_names=[name for name, _ in plan.worker_environment],
-                filesystem_view_digest=plan.filesystem_view_digest,
-                environment_policy_digest=plan.environment_policy_digest,
-                combined_policy_digest=plan.combined_policy_digest,
-                network_policy=plan.network_policy,
-                namespace_identities=dict(evidence.child.identities),
-                child_cgroup=evidence.child.cgroup,
-                gate_ordering=dict(self.last_ordering_observations),
-                landlock_abi=outcome.get("abi"),
-                handled_access_fs=outcome.get("handled_access_fs"),
-                identity_verified=outcome.get("identity_verified"),
-                policy_applied=outcome.get("policy_applied"),
-                exec_succeeded=outcome.get("exec_succeeded"),
+            if cgroup_path is not None and not wait_cgroup_empty(
+                self.backend,
+                cgroup_path,
+                0.2,
+                self.cancellation.poll_interval,
+            ):
+                containment_state = self._cancel(scope, cgroup_path, proc).value
+            elif cgroup_path is not None:
+                if containment_state == ContainmentState.RUNNING.value:
+                    containment_state = ContainmentState.TERMINATED.value
+                self._emit(EV_CGROUP_EMPTY_VERIFIED, unit=scope, after="clean exit")
+            else:
+                containment_state = ContainmentState.FAILED.value
+            self.backend.stop_unit(scope)
+            if self.backend.unit_active(scope):
+                containment_state = ContainmentState.FAILED.value
+            if containment_state == ContainmentState.TERMINATED.value:
+                self._emit(
+                    EV_RUNTIME_VERIFIED,
+                    profile=plan.profile.value,
+                    workspace_destination="/workspace",
+                    workspace_identity={
+                        "device": workspace_mount.source.identity.device,
+                        "inode": workspace_mount.source.identity.inode,
+                        "file_type": workspace_mount.source.identity.file_type,
+                    },
+                    worker_cwd=plan.cwd,
+                    environment_names=[name for name, _ in plan.worker_environment],
+                    filesystem_view_digest=plan.filesystem_view_digest,
+                    environment_policy_digest=plan.environment_policy_digest,
+                    combined_policy_digest=plan.combined_policy_digest,
+                    network_policy=plan.network_policy,
+                    namespace_identities=dict(evidence.child.identities),
+                    child_cgroup=evidence.child.cgroup,
+                    gate_ordering=dict(self.last_ordering_observations),
+                    worker_marker_instrumented=_marker_path is not None,
+                    landlock_abi=outcome.get("abi"),
+                    handled_access_fs=outcome.get("handled_access_fs"),
+                    identity_verified=outcome.get("identity_verified"),
+                    policy_applied=outcome.get("policy_applied"),
+                    exec_succeeded=outcome.get("exec_succeeded"),
+                    containment_state=containment_state,
+                    cleanup="recursive_cgroup_empty",
+                )
+            self._emit(EV_TASK_EXITED, unit=scope, containment_state=containment_state)
+
+            finished_at = utc_now_iso()
+            rc = proc.returncode
+            return ProcessResult(
+                pid=proc.pid,
+                argv=worker_argv,
+                exit_code=rc if rc is not None and rc >= 0 else None,
+                signal=-rc if rc is not None and rc < 0 else None,
+                stdout=(out_b or b"").decode(errors="replace"),
+                stderr=(err_b or b"").decode(errors="replace"),
+                timed_out=timed_out,
+                started_at=started_at,
+                finished_at=finished_at,
+                process_group_id=identity.process_group_id if identity else None,
+                identity=identity,
+                containment_unit=scope,
+                containment_cgroup=str(cgroup_path) if cgroup_path else None,
                 containment_state=containment_state,
-                cleanup="recursive_cgroup_empty",
             )
-        self._emit(EV_TASK_EXITED, unit=scope, containment_state=containment_state)
-
-        finished_at = utc_now_iso()
-        rc = proc.returncode
-        return ProcessResult(
-            pid=proc.pid,
-            argv=worker_argv,
-            exit_code=rc if rc is not None and rc >= 0 else None,
-            signal=-rc if rc is not None and rc < 0 else None,
-            stdout=(out_b or b"").decode(errors="replace"),
-            stderr=(err_b or b"").decode(errors="replace"),
-            timed_out=timed_out,
-            started_at=started_at,
-            finished_at=finished_at,
-            process_group_id=identity.process_group_id if identity else None,
-            identity=identity,
-            containment_unit=scope,
-            containment_cgroup=str(cgroup_path) if cgroup_path else None,
-            containment_state=containment_state,
-        )
+        except BaseException as runtime_error:
+            self._emit(
+                EV_RUNTIME_FAILURE,
+                unit=scope,
+                stage="host_lifecycle",
+                error_type=type(runtime_error).__name__,
+            )
+            self._cleanup_failed_process(scope, cgroup_path, proc, runtime_error)
+            raise
+        finally:
+            for fd in (native_status_r, json_status_r):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass

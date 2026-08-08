@@ -13,7 +13,6 @@ import json
 import os
 import platform
 import select
-import shutil
 import stat
 import subprocess
 import sys
@@ -86,6 +85,8 @@ class BubblewrapCapability:
     file_capabilities: Optional[str]
     unprivileged_user_namespace: bool
     nested_user_namespace_denied: bool
+    device: Optional[int]
+    inode: Optional[int]
 
 
 class M4AProfile(str, Enum):
@@ -267,38 +268,35 @@ def secure_open_source(locator: Path, *, expected_type: int) -> AuthorizedSource
         raise
 
 
-def _read_file_capabilities(path: Path) -> Optional[str]:
-    getcap = shutil.which("getcap")
-    if getcap is None:
+def _read_fd_capabilities(fd: int) -> Optional[str]:
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
         return None
     try:
-        completed = subprocess.run(
-            [getcap, str(path)],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        value = getxattr(fd, "security.capability")
+    except OSError as exc:
+        if exc.errno in {errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)}:
+            return ""
         return None
-    if completed.returncode != 0:
-        return None
-    return completed.stdout.strip()
+    return "security.capability=" + bytes(value).hex() if value else ""
 
 
-def _stat_executable(path: Path) -> os.stat_result:
-    return os.stat(path, follow_symlinks=False)
+def _fstat_executable(fd: int) -> os.stat_result:
+    return os.fstat(fd)
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_fd(fd: int) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with os.fdopen(os.dup(fd), "rb") as stream:
+        stream.seek(0)
         for chunk in iter(lambda: stream.read(128 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def _probe_unprivileged_bwrap(path: Path) -> tuple[bool, bool, str]:
+def _probe_unprivileged_bwrap(
+    executable_ref: str, executable_fd: int
+) -> tuple[bool, bool, str]:
     names = ("user", "mnt", "net", "pid", "ipc", "uts")
     host = {name: os.readlink(f"/proc/self/ns/{name}") for name in names}
     inner_code = (
@@ -309,63 +307,100 @@ def _probe_unprivileged_bwrap(path: Path) -> tuple[bool, bool, str]:
         "capture_output=True,text=True);"
         "print(json.dumps({'ns':ns,'nested_rc':p.returncode}))"
     )
-    command = [
-        str(path),
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--disable-userns",
-        "--new-session",
-        "--die-with-parent",
-        "--clearenv",
-        "--tmpfs",
-        "/",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "--symlink",
-        "usr/bin",
-        "/bin",
-        "--symlink",
-        "usr/sbin",
-        "/sbin",
-        "--symlink",
-        "usr/lib",
-        "/lib",
-        "--symlink",
-        "usr/lib64",
-        "/lib64",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--setenv",
-        "PATH",
-        "/usr/bin",
-        "--",
-        "/usr/bin/python3",
-        "-c",
-        inner_code,
-    ]
+    usr_fd = -1
+    gate_r = gate_w = status_r = status_w = -1
+    proc: Optional[subprocess.Popen] = None
     try:
-        completed = subprocess.run(
+        usr_fd = os.open("/usr", O_PATH_FLAGS | O_DIRECTORY)
+        gate_r, gate_w = os.pipe()
+        status_r, status_w = os.pipe()
+        for fd in (executable_fd, usr_fd, gate_r, status_w):
+            os.set_inheritable(fd, True)
+        command = [
+            executable_ref,
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--disable-userns",
+            "--new-session",
+            "--die-with-parent",
+            "--clearenv",
+            "--tmpfs",
+            "/",
+            "--ro-bind-fd",
+            str(usr_fd),
+            "/usr",
+            "--symlink",
+            "usr/bin",
+            "/bin",
+            "--symlink",
+            "usr/sbin",
+            "/sbin",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--setenv",
+            "PATH",
+            "/usr/bin",
+            "--block-fd",
+            str(gate_r),
+            "--json-status-fd",
+            str(status_w),
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            inner_code,
+        ]
+        proc = subprocess.Popen(
             command,
-            capture_output=True,
-            text=True,
-            timeout=15.0,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            pass_fds=(executable_fd, usr_fd, gate_r, status_w),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        os.close(gate_r)
+        gate_r = -1
+        os.close(status_w)
+        status_w = -1
+        read_bwrap_setup_status(status_r, timeout=10.0)
+        if proc.poll() is not None:
+            return False, False, "behavior probe crossed block-fd before release"
+        assert proc.stdout is not None
+        ready, _, _ = select.select([proc.stdout.fileno()], [], [], 0)
+        if ready:
+            return False, False, "behavior probe worker emitted before block-fd release"
+        os.write(gate_w, b"G")
+        os.close(gate_w)
+        gate_w = -1
+        stdout, stderr = proc.communicate(timeout=15.0)
+    except (OSError, subprocess.TimeoutExpired, NamespaceEvidenceError) as exc:
         return False, False, f"behavior probe raised {type(exc).__name__}"
-    if completed.returncode != 0:
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        for fd in (usr_fd, gate_r, gate_w, status_r, status_w):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    if proc is None or proc.returncode != 0:
         return False, False, (
-            f"behavior probe rc={completed.returncode}: "
-            f"{completed.stderr.strip()[:160]}"
+            f"behavior probe rc={None if proc is None else proc.returncode}: "
+            f"{stderr.decode(errors='replace').strip()[:160]}"
         )
     try:
-        payload = json.loads(completed.stdout)
+        payload = json.loads(stdout)
         namespace_ok = all(payload["ns"][name] != host[name] for name in names)
         nested_denied = int(payload["nested_rc"]) != 0
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -388,13 +423,27 @@ def probe_bubblewrap(
     mode: Optional[int] = None
     setuid = False
     setgid = False
-    file_capabilities = _read_file_capabilities(executable)
+    file_capabilities: Optional[str] = None
     unprivileged_user_namespace = False
     nested_user_namespace_denied = False
+    device: Optional[int] = None
+    inode: Optional[int] = None
+    executable_fd = -1
 
     try:
-        observed = _stat_executable(executable)
-        uid, gid, mode = int(observed.st_uid), int(observed.st_gid), stat.S_IMODE(observed.st_mode)
+        executable_fd = os.open(
+            executable,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        observed = _fstat_executable(executable_fd)
+        device, inode = int(observed.st_dev), int(observed.st_ino)
+        uid, gid, mode = (
+            int(observed.st_uid),
+            int(observed.st_gid),
+            stat.S_IMODE(observed.st_mode),
+        )
         setuid = bool(observed.st_mode & stat.S_ISUID)
         setgid = bool(observed.st_mode & stat.S_ISGID)
         if not stat.S_ISREG(observed.st_mode):
@@ -407,47 +456,56 @@ def probe_bubblewrap(
             reasons.append("Bubblewrap setuid bit is present")
         if setgid:
             reasons.append("Bubblewrap setgid bit is present")
-        sha256 = _sha256_file(executable)
+        sha256 = _sha256_fd(executable_fd)
     except OSError as exc:
         reasons.append(f"Bubblewrap executable unavailable: {type(exc).__name__}")
+
+    file_capabilities = (
+        _read_fd_capabilities(executable_fd) if executable_fd >= 0 else None
+    )
 
     if file_capabilities is None:
         reasons.append("Bubblewrap file capabilities could not be verified")
     elif file_capabilities:
         reasons.append("unexpected Bubblewrap file capabilities are present")
 
-    if run_behavior_probe and not reasons:
-        try:
+    try:
+        if run_behavior_probe and not reasons:
+            executable_ref = f"/proc/self/fd/{executable_fd}"
             completed = subprocess.run(
-                [str(executable), "--version"],
+                [executable_ref, "--version"],
                 capture_output=True,
                 text=True,
                 timeout=5.0,
                 check=False,
+                pass_fds=(executable_fd,),
             )
             lines = completed.stdout.splitlines()
             if completed.returncode != 0 or len(lines) != 1:
                 reasons.append("Bubblewrap version probe failed")
             else:
                 version = lines[0].strip()
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            reasons.append(f"Bubblewrap version probe raised {type(exc).__name__}")
-        if version != EXPECTED_BWRAP_VERSION:
-            reasons.append(f"unexpected Bubblewrap version {version!r}")
-        if sha256 != EXPECTED_BWRAP_SHA256:
-            reasons.append(f"unexpected Bubblewrap SHA-256 {sha256!r}")
-        if not reasons:
-            (
-                unprivileged_user_namespace,
-                nested_user_namespace_denied,
-                behavior_reason,
-            ) = _probe_unprivileged_bwrap(executable)
-            if behavior_reason:
-                reasons.append(behavior_reason)
-            if not unprivileged_user_namespace:
-                reasons.append("required unprivileged namespace separation failed")
-            if not nested_user_namespace_denied:
-                reasons.append("nested user namespace creation was not denied")
+            if version != EXPECTED_BWRAP_VERSION:
+                reasons.append(f"unexpected Bubblewrap version {version!r}")
+            if sha256 != EXPECTED_BWRAP_SHA256:
+                reasons.append(f"unexpected Bubblewrap SHA-256 {sha256!r}")
+            if not reasons:
+                (
+                    unprivileged_user_namespace,
+                    nested_user_namespace_denied,
+                    behavior_reason,
+                ) = _probe_unprivileged_bwrap(executable_ref, executable_fd)
+                if behavior_reason:
+                    reasons.append(behavior_reason)
+                if not unprivileged_user_namespace:
+                    reasons.append("required unprivileged namespace separation failed")
+                if not nested_user_namespace_denied:
+                    reasons.append("nested user namespace creation was not denied")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        reasons.append(f"Bubblewrap version probe raised {type(exc).__name__}")
+    finally:
+        if executable_fd >= 0:
+            os.close(executable_fd)
 
     return BubblewrapCapability(
         path=executable,
@@ -463,7 +521,36 @@ def probe_bubblewrap(
         file_capabilities=file_capabilities,
         unprivileged_user_namespace=unprivileged_user_namespace,
         nested_user_namespace_denied=nested_user_namespace_denied,
+        device=device,
+        inode=inode,
     )
+
+
+def open_verified_bwrap(capability: BubblewrapCapability) -> int:
+    """Reopen the accepted Bubblewrap object and reprove its exact identity."""
+    if not capability.supported or capability.device is None or capability.inode is None:
+        raise RuntimeBoundaryUnavailable("Bubblewrap capability was not authenticated")
+    fd = _openat2_from_root(
+        capability.path,
+        flags=os.O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+    )
+    try:
+        observed = os.fstat(fd)
+        if not stat.S_ISREG(observed.st_mode):
+            raise RuntimeBoundaryUnavailable("Bubblewrap object type changed")
+        if (int(observed.st_dev), int(observed.st_ino)) != (
+            capability.device,
+            capability.inode,
+        ):
+            raise RuntimeBoundaryUnavailable("Bubblewrap object identity changed")
+        if _sha256_fd(fd) != capability.sha256:
+            raise RuntimeBoundaryUnavailable("Bubblewrap object content changed")
+        if _read_fd_capabilities(fd) != "":
+            raise RuntimeBoundaryUnavailable("Bubblewrap capabilities changed")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def build_worker_env(_controller_env: Optional[Mapping[str, str]] = None) -> dict[str, str]:
@@ -748,7 +835,7 @@ def read_bwrap_setup_status(
     max_total_bytes: int = 16384,
     max_objects: int = 16,
 ) -> BwrapSetupStatus:
-    """Read bounded newline-delimited JSON until the one setup object arrives."""
+    """Read bounded JSON through a quiet window after the one setup object."""
     if timeout <= 0:
         raise ValueError("status timeout must be positive")
     deadline = time.monotonic() + timeout
@@ -756,8 +843,15 @@ def read_bwrap_setup_status(
     total = 0
     documents: list[object] = []
     setup_keys = {"child-pid", *REPORTED_NAMESPACE_KEYS.values()}
+    settle_deadline: Optional[float] = None
     while time.monotonic() < deadline:
-        ready, _, _ = select.select([fd], [], [], min(0.1, deadline - time.monotonic()))
+        now = time.monotonic()
+        if settle_deadline is not None and now >= settle_deadline:
+            return parse_bwrap_documents(documents)
+        wait_until = deadline
+        if settle_deadline is not None:
+            wait_until = min(wait_until, settle_deadline)
+        ready, _, _ = select.select([fd], [], [], min(0.1, wait_until - now))
         if not ready:
             continue
         chunk = os.read(fd, 1)
@@ -782,9 +876,14 @@ def read_bwrap_setup_status(
         if len(documents) > max_objects:
             raise NamespaceEvidenceError("Bubblewrap status exceeded bounded objects")
         if isinstance(document, dict) and setup_keys.intersection(document):
-            return parse_bwrap_documents(documents)
+            # Bubblewrap keeps the status descriptor open while blocked.  Drain
+            # immediately queued records before accepting the setup evidence so
+            # duplicate or contradictory setup objects cannot be ignored.
+            settle_deadline = time.monotonic() + min(0.05, timeout)
     if line:
         raise NamespaceEvidenceError("Bubblewrap status ended with truncated JSON")
+    if documents:
+        return parse_bwrap_documents(documents)
     raise NamespaceEvidenceError("Bubblewrap setup status missing before deadline")
 
 
