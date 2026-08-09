@@ -191,6 +191,17 @@ class NamespaceEvidence:
     status: BwrapSetupStatus
 
 
+def exact_cgroup_relative(cgroup_root: Path, cgroup_path: Path) -> str:
+    """Return the canonical cgroup-v2 path only within the configured root."""
+    try:
+        relative = Path(cgroup_path).resolve().relative_to(Path(cgroup_root).resolve())
+    except ValueError as exc:
+        raise RuntimeBoundaryUnavailable(
+            "verified task cgroup is outside the configured hierarchy"
+        ) from exc
+    return "/" + relative.as_posix()
+
+
 class _OpenHow(ctypes.Structure):
     _fields_ = [
         ("flags", ctypes.c_uint64),

@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import importlib
 import importlib.util
+import inspect
 import json
 import os
 import select
@@ -4188,3 +4189,1420 @@ def test_broker_boundary_real_bwrap_bootstrap_emits_strict_readiness(
                     os.close(fd)
                 except OSError:
                     pass
+
+
+M4B_RUNNER_EVENTS = (
+    "CONTAINMENT_VERIFIED",
+    "NAMESPACE_BOUNDARY_VERIFIED",
+    "BROKER_PROCESS_VERIFIED",
+    "TRUSTED_LAUNCHER_ENTERED",
+    "NETWORK_LISTENER_EXPORTED",
+    "NETWORK_BROKER_READY",
+    "FD_SET_SANITIZED",
+    "SANDBOX_IDENTITIES_VERIFIED",
+    "FILESYSTEM_POLICY_PREPARED",
+    "NO_NEW_PRIVS_SET",
+    "FILESYSTEM_POLICY_APPLIED",
+    "WORKER_EXEC_ATTEMPTED",
+)
+
+M4B_RUNNER_WRITES = (
+    ("namespace_gate", b"G"),
+    ("launcher_setup_gate", b"G"),
+    ("network_close_gate", b"C"),
+    ("final_exec_gate", b"X"),
+)
+
+M4B_WRITES_AFTER_EVENT = {
+    "BROKER_PROCESS_VERIFIED": ("namespace_gate", b"G"),
+    "TRUSTED_LAUNCHER_ENTERED": ("launcher_setup_gate", b"G"),
+    "NETWORK_BROKER_READY": ("network_close_gate", b"C"),
+    "FILESYSTEM_POLICY_APPLIED": ("final_exec_gate", b"X"),
+}
+
+
+def _m4b_runner():
+    try:
+        return importlib.import_module("agenticos.sandbox.m4b_runner")
+    except ModuleNotFoundError as exc:
+        pytest.fail(f"M4B capability transport runner is missing: {exc}")
+
+
+def _valid_m4b_coordinator_inputs(runner):
+    boundary = _network_boundary()
+    broker = _network_broker()
+    identity = _network_identity()
+    launcher = importlib.import_module("agenticos.sandbox.launcher")
+    runtime = importlib.import_module("agenticos.sandbox.runtime_boundary")
+    models = _network_models()
+    policy = models.TransportPolicy(
+        version="AOSNET/1",
+        task_id="task-boundary",
+        task_generation=9,
+        launch_nonce="cd" * 16,
+        mode=models.TransportMode.DENY,
+        proxy_host="127.0.0.1",
+        proxy_port=18080,
+        activated_at_monotonic_ns=100,
+        expires_at_monotonic_ns=1_000,
+        connection_limit=1,
+        byte_limit=4096,
+    )
+    policy_digest = models.policy_digest(policy)
+    base_ready = _ready_record(broker)
+    policy_size = len(models.canonical_policy_bytes(policy))
+    required_seals = (
+        fcntl.F_SEAL_WRITE
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_SEAL
+    )
+    sealed_policy = broker.SealedPolicyEvidence(
+        device=40,
+        inode=50,
+        size=policy_size,
+        seals=required_seals,
+    )
+    verified_policy = identity.VerifiedSealedPolicy(
+        policy=policy,
+        digest=policy_digest,
+        device=sealed_policy.device,
+        inode=sealed_policy.inode,
+        size=sealed_policy.size,
+        seals=sealed_policy.seals,
+    )
+    expected_environment = dict(broker.BROKER_ENVIRONMENT)
+    environment = broker.EnvironmentEvidence(
+        names=tuple(expected_environment),
+        digest=hashlib.sha256(
+            json.dumps(
+                expected_environment, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+        ).hexdigest(),
+    )
+    filesystem_payload = {
+        "cwd": broker.BROKER_ROOT,
+        "empty": ["/home/broker", "/run", "/tmp"],
+        "identities": {
+            "broker_code": dataclasses.asdict(base_ready.broker_code_identity),
+            "identity_code": dataclasses.asdict(base_ready.identity_code_identity),
+            "models_code": dataclasses.asdict(base_ready.models_code_identity),
+            "runtime": dataclasses.asdict(base_ready.runtime_identity),
+        },
+        "root_entries": [
+            "bin", "dev", "home", "lib", "lib64", "opt", "proc", "run",
+            "sbin", "tmp", "usr",
+        ],
+        "symlinks": {
+            "/bin": "usr/bin",
+            "/lib": "usr/lib",
+            "/lib64": "usr/lib64",
+            "/sbin": "usr/sbin",
+        },
+    }
+    filesystem_digest = hashlib.sha256(
+        json.dumps(
+            filesystem_payload, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+    ).hexdigest()
+    proc_status = broker.ProcStatusEvidence(0, 0, 0, 0, 0, 1)
+    fd_numbers = (0, 1, 2, 30, 31, 32, 33)
+    ready = dataclasses.replace(
+        base_ready,
+        ready=dataclasses.replace(
+            base_ready.ready, policy_digest=policy_digest
+        ),
+        sealed_policy=sealed_policy,
+        boundary=dataclasses.replace(
+            base_ready.boundary,
+            proc_status=proc_status,
+            environment=environment,
+            filesystem_digest=filesystem_digest,
+            fd_numbers=fd_numbers,
+        ),
+    )
+    expected_cgroup = "/user.slice/task.scope"
+    host_netns = 13
+    bwrap_identity = runtime.FileIdentity(501, 601, stat.S_IFREG)
+    supervisor_identity = runtime.FileIdentity(502, 602, stat.S_IFREG)
+    network_record = launcher.NetworkLaunchRecord(
+        task_id=ready.ready.task_id,
+        task_generation=ready.ready.task_generation,
+        launch_nonce=ready.ready.launch_nonce,
+        network_policy_digest=ready.ready.policy_digest,
+        handoff_fd=35,
+        proxy_host="127.0.0.1",
+        proxy_port=18080,
+    )
+    frame = identity.ListenerAdoptionFrame(
+        version="AOSLISTENER/1",
+        task_id=network_record.task_id,
+        task_generation=network_record.task_generation,
+        launch_nonce=network_record.launch_nonce,
+        policy_digest=network_record.network_policy_digest,
+        evidence=ready.listener,
+    )
+    launcher_prefix = (
+        b"R:" + network_record.launch_nonce.encode("ascii") + b"\n"
+        b"L:" + network_record.network_policy_digest.encode("ascii") + b":"
+        + frame.to_bytes()
+        + b"\n"
+    )
+    launcher_complete = (
+        launcher_prefix
+        + b"S\nI\nP\nN\nA:3:7fff:"
+        + b"d" * 64
+        + b"\n"
+    )
+    controller_namespaces = {
+        "user": 1,
+        "mnt": 2,
+        "pid": 3,
+        "net": host_netns,
+        "ipc": 5,
+        "uts": 6,
+    }
+    worker_namespaces = {
+        "user": 101,
+        "mnt": 102,
+        "pid": 103,
+        "net": 104,
+        "ipc": 105,
+        "uts": 106,
+    }
+    worker_status = runtime.parse_bwrap_documents(
+        [
+            {
+                "child-pid": 321,
+                "user-namespace": 101,
+                "mnt-namespace": 102,
+                "pid-namespace": 103,
+                "net-namespace": 104,
+                "ipc-namespace": 105,
+                "uts-namespace": 106,
+            }
+        ]
+    )
+    worker_namespace = runtime.verify_namespace_evidence(
+        worker_status,
+        controller=runtime.NamespaceSnapshot(
+            999, controller_namespaces, "/controller.scope", ""
+        ),
+        child=runtime.NamespaceSnapshot(
+            321, worker_namespaces, expected_cgroup, "0 1000 1\n"
+        ),
+        expected_cgroup=expected_cgroup,
+        expected_host_uid=1000,
+    )
+    broker_setup = boundary.parse_broker_bwrap_documents(
+        [
+            {
+                "child-pid": ready.process.pid,
+                "ipc-namespace": 11,
+                "mnt-namespace": 12,
+                "pid-namespace": 14,
+                "uts-namespace": 16,
+            }
+        ]
+    )
+    expected_broker_boundary = runner._ExpectedBrokerBoundary(
+        runtime_identity=ready.runtime_identity,
+        broker_code_identity=ready.broker_code_identity,
+        identity_code_identity=ready.identity_code_identity,
+        models_code_identity=ready.models_code_identity,
+        interpreter_identity=ready.interpreter_identity,
+        sealed_policy=sealed_policy,
+        verified_policy=verified_policy,
+        proc_status=proc_status,
+        fd_numbers=fd_numbers,
+        environment=environment,
+        filesystem_digest=filesystem_digest,
+    )
+    return runner._CoordinatorInputs(
+        expected_cgroup=expected_cgroup,
+        host_netns=host_netns,
+        expected_bwrap_identity=bwrap_identity,
+        expected_supervisor_identity=supervisor_identity,
+        expected_broker_code_identity=ready.broker_code_identity,
+        expected_broker_interpreter_identity=runtime.FileIdentity(
+            ready.interpreter_identity.device,
+            ready.interpreter_identity.inode,
+            ready.interpreter_identity.file_type,
+        ),
+        expected_broker_boundary=expected_broker_boundary,
+        transport_policy=policy,
+        observed_at_monotonic_ns=500,
+        supervisor_initial=runner._ObservedProcess(
+            pid=111,
+            start_time_ticks=211,
+            boot_id=ready.process.boot_id,
+            executable_identity=supervisor_identity,
+            cgroup=expected_cgroup,
+            netns=host_netns,
+        ),
+        worker_outer=runner._ObservedProcess(
+            pid=111,
+            start_time_ticks=211,
+            boot_id=ready.process.boot_id,
+            executable_identity=bwrap_identity,
+            cgroup=expected_cgroup,
+            netns=host_netns,
+        ),
+        supervisor_status_stream=b"AOSSUP/1 BROKER_PID 222\n",
+        broker_outer=runner._ObservedProcess(
+            pid=222,
+            start_time_ticks=322,
+            boot_id=ready.process.boot_id,
+            executable_identity=bwrap_identity,
+            cgroup=expected_cgroup,
+            netns=host_netns,
+        ),
+        worker_namespace=worker_namespace,
+        broker_setup=broker_setup,
+        launcher_network_record=network_record,
+        launcher_entry_status=launcher_prefix.splitlines(keepends=True)[0],
+        launcher_status_before_ready=launcher_prefix,
+        broker_ready_payloads=(ready.to_bytes(),),
+        broker_recheck=runner._ObservedProcess(
+            pid=ready.process.pid,
+            start_time_ticks=ready.process.start_time_ticks,
+            boot_id=ready.process.boot_id,
+            executable_identity=runtime.FileIdentity(
+                ready.interpreter_identity.device,
+                ready.interpreter_identity.inode,
+                ready.interpreter_identity.file_type,
+            ),
+            cgroup=expected_cgroup,
+            netns=host_netns,
+        ),
+        launcher_status_after_close=launcher_complete,
+        expected_filesystem_policy_digest="d" * 64,
+        readiness_preserved=True,
+        ready_before_namespace_release=False,
+        worker_marker_absent=True,
+    )
+
+
+class _FakeM4BLaunchOperations:
+    def __init__(self, fault_at=None):
+        self.fault_at = fault_at
+        self.events = []
+        self.controller_writes = []
+
+    def transition(self, event):
+        if event == self.fault_at:
+            raise RuntimeError(f"fault:{event}")
+        self.events.append(event)
+
+    def controller_write(self, gate, payload):
+        self.controller_writes.append((gate, payload))
+
+
+def test_m4b_runner_coordinator_has_exact_success_order():
+    runner = _m4b_runner()
+    operations = _FakeM4BLaunchOperations()
+    inputs = _valid_m4b_coordinator_inputs(runner)
+
+    runner._coordinate_capability_transport(
+        inputs,
+        transition=operations.transition,
+        controller_write=operations.controller_write,
+    )
+
+    assert operations.events == list(M4B_RUNNER_EVENTS)
+    assert operations.controller_writes == list(M4B_RUNNER_WRITES)
+
+
+@pytest.mark.parametrize("fault_at", M4B_RUNNER_EVENTS)
+def test_m4b_runner_coordinator_stops_at_every_failed_transition(
+    fault_at,
+):
+    runner = _m4b_runner()
+    operations = _FakeM4BLaunchOperations(fault_at=fault_at)
+    inputs = _valid_m4b_coordinator_inputs(runner)
+    fault_index = M4B_RUNNER_EVENTS.index(fault_at)
+    successful_events = M4B_RUNNER_EVENTS[:fault_index]
+    expected_writes = [
+        M4B_WRITES_AFTER_EVENT[event]
+        for event in successful_events
+        if event in M4B_WRITES_AFTER_EVENT
+    ]
+
+    with pytest.raises(RuntimeError, match=f"fault:{fault_at}"):
+        runner._coordinate_capability_transport(
+            inputs,
+            transition=operations.transition,
+            controller_write=operations.controller_write,
+        )
+
+    assert operations.events == list(successful_events)
+    assert operations.controller_writes == expected_writes
+
+
+M4B_NAMED_RUNNER_FAULTS = (
+    ("missing_supervisor_status", 0),
+    ("duplicate_supervisor_status", 0),
+    ("malformed_supervisor_status", 0),
+    ("wrong_supervisor_executable", 0),
+    ("wrong_worker_outer_executable", 0),
+    ("wrong_broker_pid", 0),
+    ("wrong_broker_executable", 0),
+    ("wrong_broker_host_netns", 0),
+    ("wrong_broker_cgroup", 0),
+    ("early_broker_readiness", 0),
+    ("wrong_broker_start_time", 2),
+    ("wrong_runtime_identity", 2),
+    ("wrong_broker_code_identity", 2),
+    ("wrong_identity_code_identity", 2),
+    ("wrong_models_code_identity", 2),
+    ("wrong_readiness_interpreter_identity", 2),
+    ("wrong_live_interpreter_identity", 2),
+    ("wrong_sealed_policy_device", 2),
+    ("wrong_sealed_policy_inode", 2),
+    ("wrong_sealed_policy_size", 2),
+    ("wrong_sealed_policy_seals", 2),
+    ("wrong_verified_policy_content", 2),
+    ("wrong_verified_policy_digest", 2),
+    ("wrong_verified_policy_seals", 2),
+    ("wrong_cap_inheritable", 2),
+    ("wrong_cap_permitted", 2),
+    ("wrong_cap_effective", 2),
+    ("wrong_cap_bounding", 2),
+    ("wrong_cap_ambient", 2),
+    ("wrong_no_new_privs", 2),
+    ("wrong_fd_numbers", 2),
+    ("wrong_environment_names", 2),
+    ("wrong_environment_digest", 2),
+    ("wrong_filesystem_digest", 2),
+    ("policy_not_active", 2),
+    ("policy_expired", 2),
+    ("wrong_listener_evidence", 2),
+    ("wrong_task_id", 2),
+    ("wrong_task_generation", 2),
+    ("wrong_launch_nonce", 2),
+    ("wrong_policy_digest", 2),
+    ("readiness_lost_before_close", 2),
+    ("launcher_s_before_readiness", 2),
+    ("worker_marker_before_exec", 3),
+)
+
+
+def _replace_ready_payload(inputs, broker, **record_changes):
+    record = broker.NetworkBrokerReadyRecord.from_bytes(
+        inputs.broker_ready_payloads[0]
+    )
+    return dataclasses.replace(
+        inputs,
+        broker_ready_payloads=(
+            dataclasses.replace(record, **record_changes).to_bytes(),
+        ),
+    )
+
+
+def _mutate_m4b_coordinator_inputs(runner, inputs, fault):
+    broker = _network_broker()
+    if fault == "missing_supervisor_status":
+        return dataclasses.replace(inputs, supervisor_status_stream=b"")
+    if fault == "duplicate_supervisor_status":
+        return dataclasses.replace(
+            inputs,
+            supervisor_status_stream=(
+                b"AOSSUP/1 BROKER_PID 222\nAOSSUP/1 BROKER_PID 222\n"
+            ),
+        )
+    if fault == "malformed_supervisor_status":
+        return dataclasses.replace(
+            inputs,
+            supervisor_status_stream=b"AOSSUP/1 BROKER_PID +222\n",
+        )
+    if fault == "wrong_supervisor_executable":
+        return dataclasses.replace(
+            inputs,
+            supervisor_initial=dataclasses.replace(
+                inputs.supervisor_initial,
+                executable_identity=dataclasses.replace(
+                    inputs.expected_supervisor_identity, inode=999
+                ),
+            ),
+        )
+    if fault == "wrong_worker_outer_executable":
+        return dataclasses.replace(
+            inputs,
+            worker_outer=dataclasses.replace(
+                inputs.worker_outer,
+                executable_identity=dataclasses.replace(
+                    inputs.expected_bwrap_identity, inode=999
+                ),
+            ),
+        )
+    if fault == "wrong_broker_pid":
+        return dataclasses.replace(
+            inputs,
+            supervisor_status_stream=b"AOSSUP/1 BROKER_PID 223\n",
+        )
+    if fault == "wrong_broker_executable":
+        return dataclasses.replace(
+            inputs,
+            broker_outer=dataclasses.replace(
+                inputs.broker_outer,
+                executable_identity=dataclasses.replace(
+                    inputs.expected_bwrap_identity, inode=999
+                ),
+            ),
+        )
+    if fault == "wrong_broker_host_netns":
+        return dataclasses.replace(
+            inputs,
+            broker_outer=dataclasses.replace(inputs.broker_outer, netns=999),
+        )
+    if fault == "wrong_broker_cgroup":
+        return dataclasses.replace(
+            inputs,
+            broker_outer=dataclasses.replace(
+                inputs.broker_outer, cgroup="/wrong.scope"
+            ),
+        )
+    if fault == "early_broker_readiness":
+        return dataclasses.replace(inputs, ready_before_namespace_release=True)
+    if fault == "wrong_broker_start_time":
+        return dataclasses.replace(
+            inputs,
+            broker_recheck=dataclasses.replace(
+                inputs.broker_recheck, start_time_ticks=999
+            ),
+        )
+    if fault in {
+        "wrong_runtime_identity",
+        "wrong_broker_code_identity",
+        "wrong_identity_code_identity",
+        "wrong_models_code_identity",
+        "wrong_readiness_interpreter_identity",
+    }:
+        record = broker.NetworkBrokerReadyRecord.from_bytes(
+            inputs.broker_ready_payloads[0]
+        )
+        field = {
+            "wrong_runtime_identity": "runtime_identity",
+            "wrong_broker_code_identity": "broker_code_identity",
+            "wrong_identity_code_identity": "identity_code_identity",
+            "wrong_models_code_identity": "models_code_identity",
+            "wrong_readiness_interpreter_identity": "interpreter_identity",
+        }[fault]
+        return _replace_ready_payload(
+            inputs,
+            broker,
+            **{field: dataclasses.replace(getattr(record, field), inode=999)},
+        )
+    if fault.startswith("wrong_sealed_policy_"):
+        record = broker.NetworkBrokerReadyRecord.from_bytes(
+            inputs.broker_ready_payloads[0]
+        )
+        field = fault.removeprefix("wrong_sealed_policy_")
+        return _replace_ready_payload(
+            inputs,
+            broker,
+            sealed_policy=dataclasses.replace(
+                record.sealed_policy,
+                **{field: getattr(record.sealed_policy, field) + 1},
+            ),
+        )
+    if fault.startswith("wrong_verified_policy_"):
+        expected = inputs.expected_broker_boundary
+        verified = expected.verified_policy
+        field = fault.removeprefix("wrong_verified_policy_")
+        if field == "content":
+            changed = dataclasses.replace(
+                verified,
+                policy=dataclasses.replace(
+                    verified.policy, byte_limit=verified.policy.byte_limit + 1
+                ),
+            )
+        elif field == "digest":
+            changed = dataclasses.replace(verified, digest="f" * 64)
+        else:
+            changed = dataclasses.replace(
+                verified, seals=verified.seals & ~fcntl.F_SEAL_WRITE
+            )
+        return dataclasses.replace(
+            inputs,
+            expected_broker_boundary=dataclasses.replace(
+                expected, verified_policy=changed
+            ),
+        )
+    if fault.startswith("wrong_cap_") or fault == "wrong_no_new_privs":
+        record = broker.NetworkBrokerReadyRecord.from_bytes(
+            inputs.broker_ready_payloads[0]
+        )
+        field = (
+            fault.removeprefix("wrong_")
+            if fault.startswith("wrong_cap_")
+            else "no_new_privs"
+        )
+        proc_status = dataclasses.replace(
+            record.boundary.proc_status,
+            **{field: 1 if field != "no_new_privs" else 0},
+        )
+        return _replace_ready_payload(
+            inputs,
+            broker,
+            boundary=dataclasses.replace(
+                record.boundary, proc_status=proc_status
+            ),
+        )
+    if fault == "wrong_fd_numbers":
+        record = broker.NetworkBrokerReadyRecord.from_bytes(
+            inputs.broker_ready_payloads[0]
+        )
+        return _replace_ready_payload(
+            inputs,
+            broker,
+            boundary=dataclasses.replace(
+                record.boundary,
+                fd_numbers=record.boundary.fd_numbers[:-1],
+            ),
+        )
+    if fault in {"wrong_environment_names", "wrong_environment_digest"}:
+        record = broker.NetworkBrokerReadyRecord.from_bytes(
+            inputs.broker_ready_payloads[0]
+        )
+        environment = record.boundary.environment
+        if fault == "wrong_environment_names":
+            environment = dataclasses.replace(
+                environment, names=tuple(reversed(environment.names))
+            )
+        else:
+            environment = dataclasses.replace(environment, digest="f" * 64)
+        return _replace_ready_payload(
+            inputs,
+            broker,
+            boundary=dataclasses.replace(
+                record.boundary, environment=environment
+            ),
+        )
+    if fault == "wrong_filesystem_digest":
+        record = broker.NetworkBrokerReadyRecord.from_bytes(
+            inputs.broker_ready_payloads[0]
+        )
+        return _replace_ready_payload(
+            inputs,
+            broker,
+            boundary=dataclasses.replace(
+                record.boundary, filesystem_digest="f" * 64
+            ),
+        )
+    if fault == "wrong_live_interpreter_identity":
+        return dataclasses.replace(
+            inputs,
+            broker_recheck=dataclasses.replace(
+                inputs.broker_recheck,
+                executable_identity=dataclasses.replace(
+                    inputs.expected_broker_interpreter_identity, inode=999
+                ),
+            ),
+        )
+    if fault == "policy_not_active":
+        return dataclasses.replace(inputs, observed_at_monotonic_ns=99)
+    if fault == "policy_expired":
+        return dataclasses.replace(inputs, observed_at_monotonic_ns=1_000)
+    if fault == "wrong_listener_evidence":
+        record = broker.NetworkBrokerReadyRecord.from_bytes(
+            inputs.broker_ready_payloads[0]
+        )
+        return _replace_ready_payload(
+            inputs,
+            broker,
+            listener=dataclasses.replace(record.listener, inode=999),
+        )
+    if fault in {
+        "wrong_task_id",
+        "wrong_task_generation",
+        "wrong_launch_nonce",
+        "wrong_policy_digest",
+    }:
+        record = broker.NetworkBrokerReadyRecord.from_bytes(
+            inputs.broker_ready_payloads[0]
+        )
+        updates = {
+            "wrong_task_id": {"task_id": "wrong-task"},
+            "wrong_task_generation": {"task_generation": 10},
+            "wrong_launch_nonce": {"launch_nonce": "ef" * 16},
+            "wrong_policy_digest": {"policy_digest": "e" * 64},
+        }[fault]
+        return _replace_ready_payload(
+            inputs,
+            broker,
+            ready=dataclasses.replace(record.ready, **updates),
+        )
+    if fault == "readiness_lost_before_close":
+        return dataclasses.replace(inputs, readiness_preserved=False)
+    if fault == "launcher_s_before_readiness":
+        return dataclasses.replace(
+            inputs,
+            launcher_status_before_ready=inputs.launcher_status_before_ready + b"S\n",
+        )
+    if fault == "worker_marker_before_exec":
+        return dataclasses.replace(inputs, worker_marker_absent=False)
+    raise AssertionError(f"unknown M4B runner fault: {fault}")
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_write_count"), M4B_NAMED_RUNNER_FAULTS
+)
+def test_m4b_runner_rejects_named_evidence_fault_without_later_gate(
+    fault,
+    expected_write_count,
+):
+    runner = _m4b_runner()
+    operations = _FakeM4BLaunchOperations()
+    inputs = _mutate_m4b_coordinator_inputs(
+        runner, _valid_m4b_coordinator_inputs(runner), fault
+    )
+
+    with pytest.raises(runner.CapabilityTransportError):
+        runner._coordinate_capability_transport(
+            inputs,
+            transition=operations.transition,
+            controller_write=operations.controller_write,
+        )
+
+    assert operations.controller_writes == list(
+        M4B_RUNNER_WRITES[:expected_write_count]
+    )
+    if expected_write_count < len(M4B_RUNNER_WRITES):
+        assert M4B_RUNNER_WRITES[expected_write_count] not in operations.controller_writes
+    assert "WORKER_EXEC_ATTEMPTED" not in operations.events
+
+
+def test_m4b_runner_public_surface_is_narrow_m4a_extension():
+    sandbox = importlib.import_module("agenticos.sandbox")
+    m4a = importlib.import_module("agenticos.sandbox.m4a_runner")
+    runner = _m4b_runner()
+
+    assert sandbox.CapabilityTransportRunner is runner.CapabilityTransportRunner
+    assert issubclass(runner.CapabilityTransportRunner, m4a.NamespaceLandlockRunner)
+    parameters = inspect.signature(runner.CapabilityTransportRunner.__init__).parameters
+    assert "transport_policy" in parameters
+    assert "supervisor_path" in parameters
+    assert "broker_code_path" not in parameters
+    assert "identity_code_path" not in parameters
+    assert "models_code_path" not in parameters
+
+
+def test_m4b_runner_requires_exact_transport_policy(tmp_path):
+    runner = _m4b_runner()
+
+    with pytest.raises(TypeError, match="transport_policy"):
+        runner.CapabilityTransportRunner(
+            tmp_path / "worker",
+            workspace=tmp_path,
+            profile=importlib.import_module(
+                "agenticos.sandbox.runtime_boundary"
+            ).M4AProfile.INSPECT,
+            launcher_path=tmp_path / "launcher",
+            task_tmp=tmp_path / "tmp",
+            synthetic_home=tmp_path / "home",
+            transport_policy=object(),
+            supervisor_path=tmp_path / "supervisor",
+        )
+
+
+def test_m4b_runner_live_operations_are_observed_only_at_each_gate():
+    runner = _m4b_runner()
+    log = []
+    listener = {"listener": "authenticated"}
+    ready = object()
+    outcome = {"policy_applied": True}
+
+    def step(name, value=None):
+        def operation(*args):
+            log.append((name, *args))
+            return value
+
+        return operation
+
+    operations = runner._CoordinatorOperations(
+        verify_containment=step("observe_containment"),
+        verify_worker_namespace=step("observe_worker_namespace"),
+        verify_broker_process=step("observe_broker_process"),
+        authenticate_launcher_entry=step("read_launcher_entry"),
+        authenticate_listener=step("read_listener", listener),
+        authenticate_readiness=step("read_and_recheck_ready", ready),
+        authenticate_post_close=step("read_post_close", outcome),
+        verify_worker_marker_absent=step("observe_worker_marker", True),
+        transition=lambda event: log.append(("transition", event)),
+        controller_write=lambda gate, payload: log.append(
+            ("write", gate, payload)
+        ),
+    )
+
+    result = runner._coordinate_operations(operations)
+
+    assert result.ready is ready
+    assert result.launcher_outcome is outcome
+    assert log == [
+        ("observe_containment",),
+        ("transition", "CONTAINMENT_VERIFIED"),
+        ("observe_worker_namespace",),
+        ("transition", "NAMESPACE_BOUNDARY_VERIFIED"),
+        ("observe_broker_process",),
+        ("transition", "BROKER_PROCESS_VERIFIED"),
+        ("write", "namespace_gate", b"G"),
+        ("read_launcher_entry",),
+        ("transition", "TRUSTED_LAUNCHER_ENTERED"),
+        ("write", "launcher_setup_gate", b"G"),
+        ("read_listener",),
+        ("transition", "NETWORK_LISTENER_EXPORTED"),
+        ("read_and_recheck_ready", listener),
+        ("transition", "NETWORK_BROKER_READY"),
+        ("write", "network_close_gate", b"C"),
+        ("read_post_close",),
+        ("transition", "FD_SET_SANITIZED"),
+        ("transition", "SANDBOX_IDENTITIES_VERIFIED"),
+        ("transition", "FILESYSTEM_POLICY_PREPARED"),
+        ("transition", "NO_NEW_PRIVS_SET"),
+        ("transition", "FILESYSTEM_POLICY_APPLIED"),
+        ("observe_worker_marker",),
+        ("write", "final_exec_gate", b"X"),
+        ("transition", "WORKER_EXEC_ATTEMPTED"),
+    ]
+
+
+def test_m4b_runner_live_r_then_g_then_l_uses_point_in_time_status():
+    runner = _m4b_runner()
+    inputs = _valid_m4b_coordinator_inputs(runner)
+    first, second = inputs.launcher_status_before_ready.splitlines(
+        keepends=True
+    )
+    authority = runner._LiveAuthority()
+    authority.launcher_network_record = inputs.launcher_network_record
+    authority.launcher_entry_status = first
+    authority.launcher_status_before_ready = first
+    operations = _FakeM4BLaunchOperations()
+    status_r, status_w = os.pipe()
+    os.write(status_w, first)
+
+    def authenticate_entry():
+        line = runner._read_line(status_r, budget=0.5, maximum=128)
+        authority.launcher_entry_status = line
+        authority.launcher_status_before_ready = line
+        runner._parse_launcher_prefix(authority)
+        runner._require_launcher_entry_quiescent(status_r)
+
+    def authenticate_listener():
+        line = runner._read_line(status_r, budget=0.5, maximum=4096)
+        authority.launcher_status_before_ready += line
+        return runner._parse_listener_prefix(authority)
+
+    def controller_write(gate, payload):
+        operations.controller_write(gate, payload)
+        if gate == "launcher_setup_gate":
+            os.write(status_w, second)
+
+    coordinator = runner._CoordinatorOperations(
+        verify_containment=lambda: None,
+        verify_worker_namespace=lambda: None,
+        verify_broker_process=lambda: None,
+        authenticate_launcher_entry=authenticate_entry,
+        authenticate_listener=authenticate_listener,
+        authenticate_readiness=lambda _listener: object(),
+        authenticate_post_close=lambda: {},
+        verify_worker_marker_absent=lambda: True,
+        transition=operations.transition,
+        controller_write=controller_write,
+    )
+
+    try:
+        runner._coordinate_operations(coordinator)
+    finally:
+        os.close(status_r)
+        os.close(status_w)
+
+    assert operations.events == list(M4B_RUNNER_EVENTS)
+    assert operations.controller_writes == list(M4B_RUNNER_WRITES)
+
+
+@pytest.mark.parametrize(
+    "entry_fault", ("malformed", "duplicate", "early_listener")
+)
+def test_m4b_runner_bad_point_in_time_r_withholds_setup_and_later_gates(
+    entry_fault,
+):
+    runner = _m4b_runner()
+    inputs = _valid_m4b_coordinator_inputs(runner)
+    first, second = inputs.launcher_status_before_ready.splitlines(
+        keepends=True
+    )
+    authority = runner._LiveAuthority()
+    authority.launcher_network_record = inputs.launcher_network_record
+    entry_wire = {
+        "malformed": b"R:not-the-authorized-nonce\n",
+        "duplicate": first + first,
+        "early_listener": first + second,
+    }[entry_fault]
+    authority.launcher_entry_status = b""
+    authority.launcher_status_before_ready = b""
+    operations = _FakeM4BLaunchOperations()
+    status_r, status_w = os.pipe()
+    os.write(status_w, entry_wire)
+
+    def authenticate_entry():
+        line = runner._read_line(status_r, budget=0.5, maximum=128)
+        authority.launcher_entry_status = line
+        authority.launcher_status_before_ready = line
+        runner._parse_launcher_prefix(authority)
+        runner._require_launcher_entry_quiescent(status_r)
+
+    coordinator = runner._CoordinatorOperations(
+        verify_containment=lambda: None,
+        verify_worker_namespace=lambda: None,
+        verify_broker_process=lambda: None,
+        authenticate_launcher_entry=authenticate_entry,
+        authenticate_listener=lambda: runner._parse_listener_prefix(authority),
+        authenticate_readiness=lambda _listener: object(),
+        authenticate_post_close=lambda: {},
+        verify_worker_marker_absent=lambda: True,
+        transition=operations.transition,
+        controller_write=operations.controller_write,
+    )
+
+    try:
+        with pytest.raises(runner.CapabilityTransportError):
+            runner._coordinate_operations(coordinator)
+    finally:
+        os.close(status_r)
+        os.close(status_w)
+
+    assert operations.events == list(M4B_RUNNER_EVENTS[:3])
+    assert operations.controller_writes == [M4B_RUNNER_WRITES[0]]
+
+
+def test_m4b_runner_launcher_eof_after_r_withholds_setup_gate():
+    runner = _m4b_runner()
+    inputs = _valid_m4b_coordinator_inputs(runner)
+    first = inputs.launcher_entry_status
+    status_r, status_w = os.pipe()
+    try:
+        os.write(status_w, first)
+        os.close(status_w)
+        status_w = -1
+        assert runner._read_line(status_r, budget=0.5, maximum=128) == first
+        with pytest.raises(runner.CapabilityTransportError, match="queued or closed"):
+            runner._require_launcher_entry_quiescent(status_r)
+    finally:
+        os.close(status_r)
+        if status_w >= 0:
+            os.close(status_w)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires /proc")
+def test_m4b_runner_owns_stable_live_process_observation():
+    runner = _m4b_runner()
+    runtime = importlib.import_module("agenticos.sandbox.runtime_boundary")
+
+    observed = runner._read_observed_process(os.getpid())
+
+    assert observed.pid == os.getpid()
+    assert observed.start_time_ticks > 0
+    assert observed.boot_id
+    assert observed.executable_identity == runtime.FileIdentity.from_stat(
+        os.stat("/proc/self/exe")
+    )
+    assert observed.cgroup.startswith("/")
+    assert observed.netns > 0
+
+
+def test_m4b_runner_owned_descriptors_close_once_and_can_transfer():
+    runner = _m4b_runner()
+    first_r, first_w = os.pipe()
+    second_r, second_w = os.pipe()
+    owned = runner._OwnedDescriptors()
+    owned.add(first_r, first_w, second_r, second_w)
+
+    owned.release(second_r)
+    owned.close()
+    owned.close()
+
+    for fd in (first_r, first_w, second_w):
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(fd)
+        assert exc_info.value.errno == errno.EBADF
+    os.fstat(second_r)
+    os.close(second_r)
+
+
+def test_m4b_runner_full_live_failure_closes_fds_before_scope_cleanup():
+    runner_module = _m4b_runner()
+    runner = object.__new__(runner_module.CapabilityTransportRunner)
+    read_fd, write_fd = os.pipe()
+    owned = runner_module._OwnedDescriptors()
+    owned.add(read_fd, write_fd)
+    calls = []
+    runner._cleanup_failed_process = lambda scope, cgroup, proc, cause: calls.append(
+        (scope, cgroup, proc, cause)
+    )
+    proc = object()
+    cause = RuntimeError("live failure")
+
+    runner._cleanup_live_launch_failure(
+        owned, "task.scope", Path("/sys/fs/cgroup/task.scope"), proc, cause
+    )
+
+    for fd in (read_fd, write_fd):
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(fd)
+        assert exc_info.value.errno == errno.EBADF
+    assert calls == [
+        ("task.scope", Path("/sys/fs/cgroup/task.scope"), proc, cause)
+    ]
+
+
+def test_m4b_runner_rejects_delayed_duplicate_readiness_before_close():
+    runner = _m4b_runner()
+    broker_end, controller_end = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    try:
+        broker_end.sendall(b"first")
+        broker_end.sendall(b"duplicate")
+        broker_end.shutdown(socket.SHUT_WR)
+        with pytest.raises(runner.CapabilityTransportError, match="duplicate"):
+            runner._read_ready_packet(controller_end.fileno(), budget=0.5)
+    finally:
+        broker_end.close()
+        controller_end.close()
+
+
+def test_m4b_runner_rejects_oversized_seqpacket_readiness():
+    runner = _m4b_runner()
+    broker_end, controller_end = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    try:
+        broker_end.sendall(b"x" * (runner.MAX_READY_BYTES + 1))
+        broker_end.shutdown(socket.SHUT_WR)
+        with pytest.raises(runner.CapabilityTransportError, match="exceeded"):
+            runner._read_ready_packet(controller_end.fileno(), budget=0.5)
+    finally:
+        broker_end.close()
+        controller_end.close()
+
+
+def test_m4b_runner_accepts_one_readiness_packet_followed_by_eof():
+    runner = _m4b_runner()
+    broker_end, controller_end = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    try:
+        broker_end.sendall(b"ready")
+        broker_end.shutdown(socket.SHUT_WR)
+        assert runner._read_ready_packet(
+            controller_end.fileno(), budget=0.5
+        ) == b"ready"
+        assert controller_end.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PASSCRED
+        ) == 0
+    finally:
+        broker_end.close()
+        controller_end.close()
+
+
+@pytest.mark.parametrize("shutdown_after_zero", (False, True))
+def test_m4b_runner_zero_readiness_record_is_never_eof(shutdown_after_zero):
+    runner = _m4b_runner()
+    broker_end, controller_end = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    try:
+        broker_end.sendall(b"ready")
+        assert broker_end.send(b"") == 0
+        if shutdown_after_zero:
+            broker_end.shutdown(socket.SHUT_WR)
+
+        with pytest.raises(
+            runner.CapabilityTransportError, match="extra|zero|duplicate"
+        ):
+            runner._read_ready_packet(controller_end.fileno(), budget=0.2)
+
+        assert controller_end.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PASSCRED
+        ) == 0
+    finally:
+        broker_end.close()
+        controller_end.close()
+
+
+def test_m4b_runner_readiness_restores_passcred_after_verification_failure():
+    runner = _m4b_runner()
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+
+    class VerificationFailingSocket:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.passcred_reads = 0
+
+        def fileno(self):
+            return self.wrapped.fileno()
+
+        def getsockopt(self, level, option):
+            if level == socket.SOL_SOCKET and option == socket.SO_PASSCRED:
+                self.passcred_reads += 1
+                if self.passcred_reads == 2:
+                    return 0
+            return self.wrapped.getsockopt(level, option)
+
+        def setsockopt(self, level, option, value):
+            return self.wrapped.setsockopt(level, option, value)
+
+    wrapped = VerificationFailingSocket(receiver)
+    try:
+        assert receiver.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) == 0
+        with pytest.raises(runner.CapabilityTransportError, match="PASSCRED"):
+            runner._require_exact_ready_eof(
+                wrapped, deadline=time.monotonic() + 0.2
+            )
+        assert receiver.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) == 0
+    finally:
+        receiver.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 0)
+        sender.close()
+        receiver.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires SCM_RIGHTS")
+@pytest.mark.parametrize(
+    ("rights_count", "failure"), ((1, "ancillary"), (64, "truncated"))
+)
+def test_m4b_runner_readiness_rejects_rights_without_fd_leak(
+    rights_count, failure
+):
+    runner = _m4b_runner()
+    broker_end, controller_end = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    source_fd = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        baseline = len(os.listdir("/proc/self/fd"))
+        rights = array.array("i", [source_fd] * rights_count)
+        broker_end.sendmsg(
+            [b"ready"],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights.tobytes())],
+        )
+        broker_end.shutdown(socket.SHUT_WR)
+
+        with pytest.raises(runner.CapabilityTransportError, match=failure):
+            runner._read_ready_packet(controller_end.fileno(), budget=0.5)
+
+        assert len(os.listdir("/proc/self/fd")) == baseline
+    finally:
+        os.close(source_fd)
+        broker_end.close()
+        controller_end.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux FDs")
+def test_m4b_runner_constructs_exact_live_fd_and_protocol_contract(tmp_path):
+    workspace = tmp_path / "workspace"
+    task_tmp = tmp_path / "task-tmp"
+    synthetic_home = tmp_path / "home"
+    for directory in (workspace, task_tmp, synthetic_home):
+        directory.mkdir()
+    worker = tmp_path / "worker"
+    launcher = tmp_path / "launcher"
+    supervisor = tmp_path / "supervisor"
+    for executable in (worker, launcher, supervisor):
+        executable.write_bytes(b"fixture")
+    script = r'''
+import json, os, sys, time
+from pathlib import Path
+import agenticos.sandbox.m4b_runner as module
+from agenticos.sandbox.network_models import TransportMode, TransportPolicy
+from agenticos.sandbox.runtime_boundary import M4AProfile
+
+root = Path(sys.argv[1])
+module.open_verified_bwrap = lambda capability: os.open(
+    "/dev/null", os.O_RDONLY | os.O_CLOEXEC
+)
+instance = object.__new__(module.CapabilityTransportRunner)
+instance.workspace = root / "workspace"
+instance.profile = M4AProfile.INSPECT
+instance.launcher_path = root / "launcher"
+instance.worker_path = root / "worker"
+instance.task_tmp = root / "task-tmp"
+instance.synthetic_home = root / "home"
+instance.supervisor_path = root / "supervisor"
+now = time.monotonic_ns()
+instance.transport_policy = TransportPolicy(
+    version="AOSNET/1", task_id="task-live", task_generation=1,
+    launch_nonce="ab" * 16, mode=TransportMode.DENY,
+    proxy_host="127.0.0.1", proxy_port=18080,
+    activated_at_monotonic_ns=now - 1_000_000,
+    expires_at_monotonic_ns=now + 10_000_000_000,
+    connection_limit=1, byte_limit=4096,
+)
+instance._bwrap_capability = object()
+prepared = instance._prepare_live_launch(["/worker", "arg"])
+roles = sorted(prepared.pass_fds)
+request = prepared.prepared_request.wire
+supervisor_argv = prepared.supervisor_argv
+for fd in roles:
+    os.fstat(fd)
+child_inheritable = all(os.get_inheritable(fd) for fd in roles)
+controller_fds = (
+    prepared.namespace_gate_w, prepared.worker_json_status_r,
+    prepared.launcher_status_r, prepared.broker_json_status_r,
+    prepared.supervisor_status_r, prepared.broker_ready_r,
+    prepared.broker_control_w,
+)
+controller_cloexec = all(not os.get_inheritable(fd) for fd in controller_fds)
+prepared.owned.close()
+closed = []
+for fd in roles:
+    try:
+        os.fstat(fd)
+    except OSError:
+        closed.append(fd)
+baseline = len(os.listdir("/proc/self/fd"))
+module.build_runtime_plan = lambda **kwargs: (_ for _ in ()).throw(
+    RuntimeError("construction fault")
+)
+try:
+    instance._prepare_live_launch(["/worker", "arg"])
+except RuntimeError:
+    pass
+failure_cleanup = len(os.listdir("/proc/self/fd")) == baseline
+print(json.dumps({
+    "roles": roles,
+    "closed": closed,
+    "request_v3": request.startswith(b"AOSLAUNCH/3\n"),
+    "network_record": b"network task-live 1 " in request,
+    "supervisor": supervisor_argv[0] == "task_supervisor",
+    "worker_vector": "worker" in supervisor_argv,
+    "child_inheritable": child_inheritable,
+    "controller_cloexec": controller_cloexec,
+    "failure_cleanup": failure_cleanup,
+}))
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        close_fds=True,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+        },
+    )
+    observed = json.loads(completed.stdout)
+
+    assert observed["request_v3"] is True
+    assert observed["network_record"] is True
+    assert observed["supervisor"] is True
+    assert observed["worker_vector"] is True
+    assert observed["child_inheritable"] is True
+    assert observed["controller_cloexec"] is True
+    assert observed["failure_cleanup"] is True
+    assert observed["closed"] == observed["roles"]
+    assert {5, 6, 7, 8, 20, 21, 22, 23, 30, 31, 32, 33}.issubset(
+        observed["roles"]
+    )
+    assert {35, 40, 41, 42}.issubset(observed["roles"])
+
+
+def test_m4b_runner_live_containment_accepts_fast_supervisor_exec():
+    runner = _m4b_runner()
+    runtime = importlib.import_module("agenticos.sandbox.runtime_boundary")
+    models = importlib.import_module("agenticos.sandbox.models")
+    boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    authority = runner._LiveAuthority()
+    authority.expected_supervisor_identity = runtime.FileIdentity(
+        1, 2, stat.S_IFREG
+    )
+    authority.supervisor_exec_contract_verified = True
+    authority.expected_bwrap_identity = runtime.FileIdentity(
+        3, 4, stat.S_IFREG
+    )
+    authority.expected_cgroup = "/task.scope"
+    authority.host_netns = 55
+    authority.supervisor_process_identity = models.ProcessIdentity(
+        pid=101,
+        process_group_id=101,
+        start_time_ticks=202,
+        boot_id=boot_id,
+    )
+    authority.worker_outer = runner._ObservedProcess(
+        pid=101,
+        start_time_ticks=202,
+        boot_id=boot_id,
+        executable_identity=authority.expected_bwrap_identity,
+        cgroup=authority.expected_cgroup,
+        netns=authority.host_netns,
+    )
+
+    runner._require_live_containment(authority)
+
+    authority.supervisor_exec_contract_verified = False
+    with pytest.raises(runner.CapabilityTransportError, match="supervisor"):
+        runner._require_live_containment(authority)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "invalid_supervisor_pid",
+        "invalid_supervisor_start",
+        "invalid_supervisor_boot",
+        "worker_pid_mismatch",
+        "worker_start_mismatch",
+        "worker_boot_mismatch",
+        "worker_cgroup_mismatch",
+    ),
+)
+def test_m4b_runner_stable_supervisor_identity_fault_blocks_namespace_g(fault):
+    runner = _m4b_runner()
+    runtime = importlib.import_module("agenticos.sandbox.runtime_boundary")
+    models = importlib.import_module("agenticos.sandbox.models")
+    boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    authority = runner._LiveAuthority()
+    authority.expected_supervisor_identity = runtime.FileIdentity(
+        1, 2, stat.S_IFREG
+    )
+    authority.supervisor_exec_contract_verified = True
+    authority.expected_bwrap_identity = runtime.FileIdentity(
+        3, 4, stat.S_IFREG
+    )
+    authority.expected_cgroup = "/task.scope"
+    authority.host_netns = 55
+    authority.supervisor_process_identity = models.ProcessIdentity(
+        pid=101,
+        process_group_id=101,
+        start_time_ticks=202,
+        boot_id=boot_id,
+    )
+    authority.worker_outer = runner._ObservedProcess(
+        pid=101,
+        start_time_ticks=202,
+        boot_id=boot_id,
+        executable_identity=authority.expected_bwrap_identity,
+        cgroup=authority.expected_cgroup,
+        netns=authority.host_netns,
+    )
+    if fault == "invalid_supervisor_pid":
+        authority.supervisor_process_identity.pid = 0
+    elif fault == "invalid_supervisor_start":
+        authority.supervisor_process_identity.start_time_ticks = None
+    elif fault == "invalid_supervisor_boot":
+        authority.supervisor_process_identity.boot_id = "not-a-boot-id"
+    elif fault == "worker_pid_mismatch":
+        authority.worker_outer = dataclasses.replace(
+            authority.worker_outer, pid=102
+        )
+    elif fault == "worker_start_mismatch":
+        authority.worker_outer = dataclasses.replace(
+            authority.worker_outer, start_time_ticks=203
+        )
+    elif fault == "worker_boot_mismatch":
+        authority.worker_outer = dataclasses.replace(
+            authority.worker_outer,
+            boot_id="ffffffff-1111-2222-3333-444444444444",
+        )
+    elif fault == "worker_cgroup_mismatch":
+        authority.worker_outer = dataclasses.replace(
+            authority.worker_outer, cgroup="/wrong.scope"
+        )
+    operations = _FakeM4BLaunchOperations()
+    coordinator = runner._CoordinatorOperations(
+        verify_containment=lambda: runner._require_live_containment(authority),
+        verify_worker_namespace=lambda: None,
+        verify_broker_process=lambda: None,
+        authenticate_launcher_entry=lambda: None,
+        authenticate_listener=lambda: {},
+        authenticate_readiness=lambda _listener: object(),
+        authenticate_post_close=lambda: {},
+        verify_worker_marker_absent=lambda: True,
+        transition=operations.transition,
+        controller_write=operations.controller_write,
+    )
+
+    with pytest.raises(runner.CapabilityTransportError):
+        runner._coordinate_operations(coordinator)
+
+    assert operations.events == []
+    assert operations.controller_writes == []
+
+
+def test_m4b_runner_normal_completion_sends_exact_broker_revoke():
+    runner = _m4b_runner()
+    broker_end, controller_end = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    try:
+        runner._revoke_broker_control(controller_end.fileno(), budget=0.5)
+        assert broker_end.recv(128) == _network_broker().CONTROL_REVOKE
+        assert broker_end.recv(1) == b""
+    finally:
+        broker_end.close()
+        controller_end.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_m4b_runner_pumps_large_worker_output_before_lingering_broker_eof():
+    runner = _m4b_runner()
+    size = 2 * 1024 * 1024
+    script = (
+        "import os,time;"
+        "pid=os.fork();"
+        "time.sleep(0.5) if pid==0 else None;"
+        "os._exit(0) if pid==0 else None;"
+        f"os.write(1,b'x'*{size})"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    started = time.monotonic()
+
+    first_out, first_err = runner._pump_process_output_until_exit(
+        proc, timeout=2.0
+    )
+    worker_elapsed = time.monotonic() - started
+    trailing_out, trailing_err = proc.communicate(timeout=2.0)
+
+    assert worker_elapsed < 0.5
+    assert first_out + trailing_out == b"x" * size
+    assert first_err + trailing_err == b""
+
+
+def test_m4b_runner_output_pump_preserves_bounded_bytes_on_timeout():
+    runner = _m4b_runner()
+    size = 1024 * 1024
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"import os,time;os.write(1,b'x'*{size});time.sleep(2)",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+            runner._pump_process_output_until_exit(proc, timeout=0.2)
+        assert exc_info.value.output == b"x" * size
+        assert exc_info.value.stderr == b""
+    finally:
+        proc.kill()
+        proc.communicate(timeout=2.0)
+
+
+def test_m4b_runner_trailing_output_cannot_exceed_end_to_end_cap():
+    runner = _m4b_runner()
+
+    with pytest.raises(runner.CapabilityTransportError, match="bounded capture"):
+        runner._combine_captured_output(
+            b"x" * runner._MAX_CAPTURE_BYTES,
+            b"",
+            b"y",
+            b"",
+        )

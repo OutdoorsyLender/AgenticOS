@@ -6,6 +6,7 @@ boundaries and fail closed when their required host capabilities are absent.
 """
 
 from .m4a_runner import NamespaceLandlockRunner
+from .m4b_runner import CapabilityTransportRunner
 from .network_models import (
     BrokerProcessEvidence,
     BrokerReadyEvidence,
@@ -19,6 +20,7 @@ from .network_models import (
 __all__ = [
     "BrokerProcessEvidence",
     "BrokerReadyEvidence",
+    "CapabilityTransportRunner",
     "ListenerEvidence",
     "NamespaceLandlockRunner",
     "TransportMode",

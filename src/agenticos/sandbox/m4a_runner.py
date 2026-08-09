@@ -45,6 +45,7 @@ from .runtime_boundary import (
     RuntimeBoundaryUnavailable,
     build_bwrap_argv,
     build_runtime_plan,
+    exact_cgroup_relative,
     probe_bubblewrap,
     open_verified_bwrap,
     read_bwrap_setup_status,
@@ -181,15 +182,71 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 os.close(source.fd)
             raise
 
+    @classmethod
+    def _pipe_with_moved_end(
+        cls, *, move_read: bool, minimum: int
+    ) -> tuple[int, int]:
+        """Create one pipe and move only the child-owned end above a floor."""
+        read_fd, write_fd = os.pipe()
+        try:
+            if move_read:
+                return cls._move_fd(read_fd, minimum), write_fd
+            return read_fd, cls._move_fd(write_fd, minimum)
+        except BaseException:
+            for fd in (read_fd, write_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+
+    @staticmethod
+    def _close_source_fds(sources: Sequence[AuthorizedSource]) -> None:
+        for source in sources:
+            try:
+                os.close(source.fd)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _assemble_process_result(
+        *,
+        proc: subprocess.Popen,
+        worker_argv: list[str],
+        out_b: bytes,
+        err_b: bytes,
+        timed_out: bool,
+        started_at: str,
+        finished_at: str,
+        identity: Optional[ProcessIdentity],
+        scope: str,
+        cgroup_path: Optional[Path],
+        containment_state: str,
+    ) -> ProcessResult:
+        rc = proc.returncode
+        return ProcessResult(
+            pid=proc.pid,
+            argv=worker_argv,
+            exit_code=rc if rc is not None and rc >= 0 else None,
+            signal=-rc if rc is not None and rc < 0 else None,
+            stdout=(out_b or b"").decode(errors="replace"),
+            stderr=(err_b or b"").decode(errors="replace"),
+            timed_out=timed_out,
+            started_at=started_at,
+            finished_at=finished_at,
+            process_group_id=identity.process_group_id if identity else None,
+            identity=identity,
+            containment_unit=scope,
+            containment_cgroup=str(cgroup_path) if cgroup_path else None,
+            containment_state=containment_state,
+        )
+
     @staticmethod
     def _cgroup_relative(cgroup_root: Path, cgroup_path: Path) -> str:
         try:
-            relative = cgroup_path.resolve().relative_to(cgroup_root.resolve())
-        except ValueError as exc:
-            raise ContainmentUnavailableError(
-                "verified task cgroup is outside the configured hierarchy"
-            ) from exc
-        return "/" + relative.as_posix()
+            return exact_cgroup_relative(cgroup_root, cgroup_path)
+        except RuntimeBoundaryUnavailable as exc:
+            raise ContainmentUnavailableError(str(exc)) from exc
 
     @staticmethod
     def _marker_absent(marker: Optional[Path]) -> Optional[bool]:
@@ -344,15 +401,15 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 )
                 for mount in plan.mounts
             ]
-            namespace_gate_r0, namespace_gate_w = os.pipe()
-            json_status_r, json_status_w0 = os.pipe()
-            native_status_r, native_status_w0 = os.pipe()
-            namespace_gate_r = self._move_fd(namespace_gate_r0, 32)
-            namespace_gate_r0 = -1
-            json_status_w = self._move_fd(json_status_w0, 33)
-            json_status_w0 = -1
-            native_status_w = self._move_fd(native_status_w0, 34)
-            native_status_w0 = -1
+            namespace_gate_r, namespace_gate_w = self._pipe_with_moved_end(
+                move_read=True, minimum=32
+            )
+            json_status_r, json_status_w = self._pipe_with_moved_end(
+                move_read=False, minimum=33
+            )
+            native_status_r, native_status_w = self._pipe_with_moved_end(
+                move_read=False, minimum=34
+            )
             bwrap_argv = build_bwrap_argv(
                 plan,
                 namespace_gate_fd=namespace_gate_r,
@@ -361,11 +418,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 executable=Path(f"/proc/self/fd/{bwrap_fd}"),
             )
         except BaseException:
-            for source in sources:
-                try:
-                    os.close(source.fd)
-                except OSError:
-                    pass
+            self._close_source_fds(sources)
             for fd in {
                 bwrap_fd,
                 namespace_gate_r0,
@@ -431,8 +484,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             for fd in child_ends:
                 os.close(fd)
             child_ends = ()
-            for source in sources:
-                os.close(source.fd)
+            self._close_source_fds(sources)
             sources = ()
             os.close(bwrap_fd)
             bwrap_fd = -1
@@ -596,11 +648,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                     os.close(fd)
                 except OSError:
                     pass
-            for source in sources:
-                try:
-                    os.close(source.fd)
-                except OSError:
-                    pass
+            self._close_source_fds(sources)
             if bwrap_fd >= 0:
                 try:
                     os.close(bwrap_fd)
@@ -684,21 +732,17 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             self._emit(EV_TASK_EXITED, unit=scope, containment_state=containment_state)
 
             finished_at = utc_now_iso()
-            rc = proc.returncode
-            return ProcessResult(
-                pid=proc.pid,
-                argv=worker_argv,
-                exit_code=rc if rc is not None and rc >= 0 else None,
-                signal=-rc if rc is not None and rc < 0 else None,
-                stdout=(out_b or b"").decode(errors="replace"),
-                stderr=(err_b or b"").decode(errors="replace"),
+            return self._assemble_process_result(
+                proc=proc,
+                worker_argv=worker_argv,
+                out_b=out_b,
+                err_b=err_b,
                 timed_out=timed_out,
                 started_at=started_at,
                 finished_at=finished_at,
-                process_group_id=identity.process_group_id if identity else None,
                 identity=identity,
-                containment_unit=scope,
-                containment_cgroup=str(cgroup_path) if cgroup_path else None,
+                scope=scope,
+                cgroup_path=cgroup_path,
                 containment_state=containment_state,
             )
         except BaseException as runtime_error:
