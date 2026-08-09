@@ -19,4 +19,5 @@ markers = [
     "cgroup_linux: integration tests requiring Linux cgroup v2 + systemd user scopes (run inside Ubuntu WSL2)",
     "fs_isolation_linux: filesystem-isolation experiments requiring Linux (Landlock and/or bubblewrap + namespaces)",
     "m4a_linux: serialized real-host M4A namespace/runtime-boundary tests",
+    "m4b_linux: serialized real-host M4B capability-transport tests",
 ]

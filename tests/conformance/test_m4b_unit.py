@@ -15,8 +15,12 @@ import os
 import select
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -2379,3 +2383,1808 @@ def test_channel_claim_release_does_not_retry_close_after_eintr(monkeypatch):
         pinned.socket.close()
         sender.close()
         receiver.close()
+
+
+# Task 4: authoritative same-scope supervisor and least-authority broker.
+
+BOUNDARY_MODULE = "agenticos.sandbox.network_boundary"
+BROKER_MODULE = "agenticos.sandbox.network_broker"
+
+
+def _network_boundary():
+    try:
+        return importlib.import_module(BOUNDARY_MODULE)
+    except ModuleNotFoundError as exc:
+        pytest.fail(f"M4B broker boundary is missing: {exc}")
+
+
+def _network_broker():
+    try:
+        return importlib.import_module(BROKER_MODULE)
+    except ModuleNotFoundError as exc:
+        pytest.fail(f"M4B broker core is missing: {exc}")
+
+
+def _boundary_policy(models, *, mode=None, **changes):
+    now = time.monotonic_ns()
+    values = {
+        "version": "AOSNET/1",
+        "task_id": "task-boundary",
+        "task_generation": 9,
+        "launch_nonce": "cd" * 16,
+        "mode": mode or models.TransportMode.SYNTHETIC_FIXTURE_FD,
+        "proxy_host": "127.0.0.1",
+        "proxy_port": 18080,
+        "activated_at_monotonic_ns": now - 1_000_000_000,
+        "expires_at_monotonic_ns": now + 10_000_000_000,
+        "connection_limit": 1,
+        "byte_limit": 4096,
+    }
+    values.update(changes)
+    return models.TransportPolicy(**values)
+
+
+def _fixed_source(boundary, *, locator, fd, device, inode, file_type):
+    return boundary.AuthorizedSource(
+        locator=Path(locator),
+        fd=fd,
+        identity=boundary.FileIdentity(
+            device=device,
+            inode=inode,
+            file_type=file_type,
+        ),
+    )
+
+
+def _boundary_sources(boundary):
+    return {
+        "runtime_usr": _fixed_source(
+            boundary,
+            locator="/trusted/runtime/usr",
+            fd=boundary.BROKER_RUNTIME_USR_FD,
+            device=101,
+            inode=201,
+            file_type=stat.S_IFDIR,
+        ),
+        "broker_code": _fixed_source(
+            boundary,
+            locator="/trusted/code/network_broker.py",
+            fd=boundary.BROKER_CODE_FD,
+            device=102,
+            inode=202,
+            file_type=stat.S_IFREG,
+        ),
+        "identity_code": _fixed_source(
+            boundary,
+            locator="/trusted/code/network_identity.py",
+            fd=boundary.BROKER_IDENTITY_CODE_FD,
+            device=103,
+            inode=203,
+            file_type=stat.S_IFREG,
+        ),
+        "models_code": _fixed_source(
+            boundary,
+            locator="/trusted/code/network_models.py",
+            fd=boundary.BROKER_MODELS_CODE_FD,
+            device=104,
+            inode=204,
+            file_type=stat.S_IFREG,
+        ),
+        "supervisor": _fixed_source(
+            boundary,
+            locator="/trusted/native/task_supervisor",
+            fd=boundary.SUPERVISOR_EXECUTABLE_FD,
+            device=105,
+            inode=205,
+            file_type=stat.S_IFREG,
+        ),
+    }
+
+
+def _boundary_plan(*, mode=None):
+    boundary = _network_boundary()
+    models = _network_models()
+    return boundary, boundary.build_network_boundary_plan(
+        transport_policy=_boundary_policy(models, mode=mode),
+        **_boundary_sources(boundary),
+    )
+
+
+def _adjacent_pairs(values):
+    return set(zip(values, values[1:]))
+
+
+def test_broker_boundary_plan_has_exact_environment_mounts_and_host_network():
+    boundary, plan = _boundary_plan()
+
+    assert plan.broker_environment == (
+        ("HOME", "/home/broker"),
+        ("PATH", "/usr/bin:/bin"),
+        ("LANG", "C.UTF-8"),
+        ("LC_ALL", "C.UTF-8"),
+        ("TMPDIR", "/tmp"),
+        ("PWD", "/opt/agenticos/python"),
+        ("PYTHONDONTWRITEBYTECODE", "1"),
+    )
+    argv = plan.broker_bwrap_argv
+    assert argv[0] == "bwrap"
+    assert "--unshare-net" not in argv
+    assert "--unshare-cgroup" not in argv
+    assert "--unshare-all" not in argv
+    for flag in (
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--disable-userns",
+        "--new-session",
+        "--die-with-parent",
+        "--clearenv",
+    ):
+        assert flag in argv
+    assert ("--cap-drop", "ALL") in _adjacent_pairs(argv)
+    assert ("--tmpfs", "/") in _adjacent_pairs(argv)
+    assert ("--proc", "/proc") in _adjacent_pairs(argv)
+    assert ("--dev", "/dev") in _adjacent_pairs(argv)
+    assert ("--chdir", "/opt/agenticos/python") in _adjacent_pairs(argv)
+
+    expected_destinations = (
+        "/usr",
+        "/opt/agenticos/python/agenticos/sandbox/network_broker.py",
+        "/opt/agenticos/python/agenticos/sandbox/network_identity.py",
+        "/opt/agenticos/python/agenticos/sandbox/network_models.py",
+    )
+    assert tuple(mount.destination for mount in plan.mounts) == expected_destinations
+    assert all(mount.bind_option == "--ro-bind-fd" for mount in plan.mounts)
+    assert tuple(plan.synthetic_directories) == (
+        "/opt",
+        "/opt/agenticos",
+        "/opt/agenticos/python",
+        "/opt/agenticos/python/agenticos",
+        "/opt/agenticos/python/agenticos/sandbox",
+        "/home",
+        "/home/broker",
+        "/run",
+        "/tmp",
+    )
+    for forbidden in (
+        "/workspace",
+        "/etc/resolv.conf",
+        "/etc/ssl",
+        "/run/user",
+        "/home/brand",
+        "PYTHONPATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+    ):
+        assert all(forbidden not in item for item in argv)
+    for source in _boundary_sources(boundary).values():
+        assert str(source.locator) not in argv
+
+
+def test_broker_boundary_command_uses_only_fixed_isolated_bootstrap():
+    boundary, plan = _boundary_plan()
+    argv = plan.broker_bwrap_argv
+    separator = argv.index("--")
+
+    assert argv[separator + 1 : separator + 6] == (
+        "/usr/bin/python3",
+        "-I",
+        "-S",
+        "-B",
+        "-c",
+    )
+    assert argv[separator + 6] == boundary.BROKER_BOOTSTRAP
+    assert "/opt/agenticos/python" in boundary.BROKER_BOOTSTRAP
+    assert "PYTHONPATH" not in boundary.BROKER_BOOTSTRAP
+    assert "site" not in boundary.BROKER_BOOTSTRAP
+    assert argv[separator + 7] == "AOSBROKER/1"
+    assert boundary.BROKER_JSON_STATUS_FD == 8
+    assert ("--json-status-fd", "8") in _adjacent_pairs(argv)
+    assert "--close-fd" not in argv
+    for mount in plan.mounts:
+        assert (
+            "--ro-bind-fd",
+            str(mount.source.fd),
+            mount.destination,
+        ) in set(zip(argv, argv[1:], argv[2:]))
+
+
+@pytest.mark.m4b_linux
+def test_broker_bootstrap_ignores_competing_regular_package(tmp_path):
+    boundary = _network_boundary()
+    repo_sandbox = Path(__file__).parents[2] / "src/agenticos/sandbox"
+    exact_root = tmp_path / "exact"
+    exact_sandbox = exact_root / "agenticos/sandbox"
+    exact_sandbox.mkdir(parents=True)
+    for name in ("network_broker.py", "network_identity.py", "network_models.py"):
+        (exact_sandbox / name).write_bytes((repo_sandbox / name).read_bytes())
+
+    marker = tmp_path / "competing-package-ran"
+    competing = tmp_path / "competing"
+    competing_sandbox = competing / "agenticos/sandbox"
+    competing_sandbox.mkdir(parents=True)
+    (competing / "agenticos/__init__.py").write_text("", encoding="utf-8")
+    (competing_sandbox / "__init__.py").write_text("", encoding="utf-8")
+    (competing_sandbox / "network_broker.py").write_text(
+        "from pathlib import Path\n"
+        f"def main():\n    Path({str(marker)!r}).write_text('ran')\n    return 0\n",
+        encoding="utf-8",
+    )
+    bootstrap = boundary.BROKER_BOOTSTRAP.replace(
+        "/opt/agenticos/python", str(exact_root)
+    ).replace(
+        "sys.path[:]=[",
+        f"sys.path[:]=[{str(competing)!r},",
+        1,
+    )
+
+    completed = subprocess.run(
+        ["/usr/bin/python3", "-I", "-S", "-B", "-c", bootstrap],
+        env=dict(_network_broker().BROKER_ENVIRONMENT),
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 111
+    assert not marker.exists()
+
+
+def test_broker_boundary_digest_is_deterministic_and_binds_policy_and_identities():
+    boundary, first = _boundary_plan()
+    _boundary, second = _boundary_plan()
+    # Replace the time-varying policy with one shared instance for the determinism proof.
+    models = _network_models()
+    policy = _boundary_policy(models)
+    sources = _boundary_sources(boundary)
+    first = boundary.build_network_boundary_plan(transport_policy=policy, **sources)
+    second = boundary.build_network_boundary_plan(transport_policy=policy, **sources)
+
+    assert first.transport_policy_digest == models.policy_digest(policy)
+    assert first.boundary_policy_digest == second.boundary_policy_digest
+    changed = dict(sources)
+    changed["broker_code"] = dataclasses.replace(
+        changed["broker_code"],
+        identity=dataclasses.replace(changed["broker_code"].identity, inode=999),
+    )
+    third = boundary.build_network_boundary_plan(
+        transport_policy=policy,
+        **changed,
+    )
+    assert third.boundary_policy_digest != first.boundary_policy_digest
+    assert b"/trusted/" not in first.canonical_boundary_policy
+
+
+@pytest.mark.parametrize(
+    ("source_name", "mutation", "message"),
+    [
+        ("runtime_usr", lambda b, s: dataclasses.replace(s, fd=999), "fixed descriptor"),
+        (
+            "broker_code",
+            lambda b, s: dataclasses.replace(
+                s, identity=dataclasses.replace(s.identity, file_type=stat.S_IFDIR)
+            ),
+            "regular file",
+        ),
+        (
+            "identity_code",
+            lambda b, s: dataclasses.replace(s, locator=Path("relative.py")),
+            "absolute",
+        ),
+        (
+            "models_code",
+            lambda b, s: dataclasses.replace(
+                s, identity=dataclasses.replace(s.identity, inode=True)
+            ),
+            "positive integer",
+        ),
+    ],
+)
+def test_broker_boundary_rejects_wrong_source_fd_type_locator_or_primitive(
+    source_name, mutation, message
+):
+    boundary = _network_boundary()
+    models = _network_models()
+    sources = _boundary_sources(boundary)
+    sources[source_name] = mutation(boundary, sources[source_name])
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        boundary.build_network_boundary_plan(
+            transport_policy=_boundary_policy(models),
+            **sources,
+        )
+
+
+def test_broker_boundary_rejects_source_identity_collision():
+    boundary = _network_boundary()
+    models = _network_models()
+    sources = _boundary_sources(boundary)
+    sources["models_code"] = dataclasses.replace(
+        sources["models_code"],
+        identity=sources["identity_code"].identity,
+    )
+
+    with pytest.raises(ValueError, match="identity collision"):
+        boundary.build_network_boundary_plan(
+            transport_policy=_boundary_policy(models),
+            **sources,
+        )
+
+
+def test_supervisor_contract_is_exact_versioned_and_count_bounded():
+    _boundary, plan = _boundary_plan()
+    worker = ("bwrap", "--clearenv", "--", "/usr/bin/true")
+
+    argv = plan.supervisor_contract.argv_for(worker)
+
+    assert argv == (
+        "task_supervisor",
+        "AOSSUP/1",
+        "bwrap_fd",
+        "5",
+        "status_fd",
+        "6",
+        "broker_passc",
+        str(len(plan.supervisor_contract.broker_pass_fds)),
+        "broker_pass",
+        *(str(fd) for fd in plan.supervisor_contract.broker_pass_fds),
+        "worker_passc",
+        "0",
+        "worker_pass",
+        "broker_argc",
+        str(len(plan.broker_bwrap_argv)),
+        "broker",
+        *plan.broker_bwrap_argv,
+        "worker_argc",
+        "4",
+        "worker",
+        *worker,
+        "END",
+    )
+    assert plan.supervisor_source.role == "supervisor"
+    assert plan.supervisor_source.source.fd == 7
+    assert plan.supervisor_contract.broker_pass_fds == (
+        8,
+        20,
+        21,
+        22,
+        23,
+        30,
+        31,
+        32,
+        33,
+        34,
+    )
+    with pytest.raises(ValueError, match="worker argv"):
+        plan.supervisor_contract.argv_for(())
+    with pytest.raises(ValueError, match="bounded"):
+        plan.supervisor_contract.argv_for(("bwrap", "x" * 4097))
+    with pytest.raises(ValueError, match="overlap"):
+        plan.supervisor_contract.argv_for(
+            worker,
+            worker_pass_fds=(8,),
+        )
+    with pytest.raises(ValueError, match="sorted unique"):
+        plan.supervisor_contract.argv_for(
+            worker,
+            worker_pass_fds=(40, 40),
+        )
+    with pytest.raises(ValueError, match="sorted unique"):
+        plan.supervisor_contract.argv_for(
+            worker,
+            worker_pass_fds=(5,),
+        )
+
+
+def test_broker_contract_round_trips_fixed_argv_and_restores_only_fixed_roles():
+    broker = _network_broker()
+    _boundary, plan = _boundary_plan()
+    contract = plan.broker_contract
+
+    assert broker.BrokerContract.from_argv(contract.to_argv()) == contract
+    assert contract.capability_fds == (30, 31, 32, 33, 34)
+    assert len(set(contract.capability_fds)) == len(contract.capability_fds)
+    deny_boundary, deny_plan = _boundary_plan(
+        mode=_network_models().TransportMode.DENY
+    )
+    assert deny_boundary is not None
+    assert deny_plan.broker_contract.fixture_fd is None
+    assert deny_plan.broker_contract.capability_fds == (30, 31, 32, 33)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda argv: ["AOSBROKER/2", *argv[1:]],
+        lambda argv: [*argv, "trailing"],
+        lambda argv: [*argv[:2], "+30", *argv[3:]],
+        lambda argv: [*argv[:2], "030", *argv[3:]],
+        lambda argv: [*argv[:2], "31", *argv[3:]],
+        lambda argv: [*argv[:4], "30", *argv[5:]],
+        lambda argv: [*argv[:6], "not-a-number", *argv[7:]],
+    ],
+)
+def test_broker_contract_rejects_malformed_noncanonical_or_colliding_argv(mutation):
+    broker = _network_broker()
+    _boundary, plan = _boundary_plan()
+    malformed = mutation(list(plan.broker_contract.to_argv()))
+
+    with pytest.raises(broker.BrokerBoundaryError):
+        broker.BrokerContract.from_argv(malformed)
+
+
+def _zero_proc_status(*, no_new_privs=1, cap_eff="0000000000000000"):
+    return (
+        "Name:\tpython3\n"
+        "CapInh:\t0000000000000000\n"
+        "CapPrm:\t0000000000000000\n"
+        f"CapEff:\t{cap_eff}\n"
+        "CapBnd:\t0000000000000000\n"
+        "CapAmb:\t0000000000000000\n"
+        f"NoNewPrivs:\t{no_new_privs}\n"
+    )
+
+
+def test_broker_proc_status_requires_all_zero_capability_sets_and_nnp():
+    broker = _network_broker()
+
+    evidence = broker.parse_proc_status(_zero_proc_status())
+
+    assert evidence == broker.ProcStatusEvidence(
+        cap_inheritable=0,
+        cap_permitted=0,
+        cap_effective=0,
+        cap_bounding=0,
+        cap_ambient=0,
+        no_new_privs=1,
+    )
+    broker.require_minimal_proc_status(evidence)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _zero_proc_status(no_new_privs=0),
+        _zero_proc_status(cap_eff="0000000000000001"),
+        _zero_proc_status().replace("CapAmb:\t0000000000000000\n", ""),
+        _zero_proc_status() + "CapEff:\t0000000000000000\n",
+        _zero_proc_status().replace("0000000000000000", "0", 1),
+    ],
+)
+def test_broker_proc_status_rejects_missing_duplicate_noncanonical_or_privileged(payload):
+    broker = _network_broker()
+
+    with pytest.raises(broker.BrokerBoundaryError):
+        evidence = broker.parse_proc_status(payload)
+        broker.require_minimal_proc_status(evidence)
+
+
+def test_broker_environment_is_exact_and_rejects_ambient_credentials():
+    broker = _network_broker()
+    expected = dict(broker.BROKER_ENVIRONMENT)
+
+    evidence = broker.validate_broker_environment(expected)
+
+    assert evidence.names == tuple(expected)
+    assert evidence.digest == hashlib.sha256(
+        json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    for name in (
+        "OPENAI_API_KEY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "AWS_SECRET_ACCESS_KEY",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "SSH_AUTH_SOCK",
+        "PYTHONPATH",
+    ):
+        with pytest.raises(broker.BrokerBoundaryError, match="environment"):
+            broker.validate_broker_environment({**expected, name: "canary"})
+
+
+def test_broker_fd_observation_excludes_its_own_closed_proc_directory_fd():
+    broker = _network_broker()
+
+    observed = broker._observe_fd_numbers()
+
+    for fd in observed:
+        fcntl.fcntl(fd, fcntl.F_GETFD)
+
+
+@pytest.mark.m4b_linux
+def test_broker_prctl_runtime_import_leaves_no_loader_descriptor():
+    broker = _network_broker()
+    repo_src = Path(__file__).parents[2] / "src"
+    package_root = repo_src / "agenticos"
+    sandbox_root = package_root / "sandbox"
+    script = (
+        "import json,os,sys,types;"
+        "agenticos=types.ModuleType('agenticos');"
+        f"agenticos.__path__=[{str(package_root)!r}];"
+        "sys.modules['agenticos']=agenticos;"
+        "sandbox=types.ModuleType('agenticos.sandbox');"
+        f"sandbox.__path__=[{str(sandbox_root)!r}];"
+        "sys.modules['agenticos.sandbox']=sandbox;"
+        "from agenticos.sandbox import network_broker as broker;"
+        "before=broker._observe_fd_numbers();"
+        "ctypes_before='ctypes' in sys.modules;"
+        "runtime=broker.ObservedFileIdentity.from_stat(os.stat('/usr'));"
+        "status=broker._establish_no_new_privs(before,runtime);"
+        "after=broker._observe_fd_numbers();"
+        "print(json.dumps({'before':before,'after':after,"
+        "'ctypes_before':ctypes_before,'nnp':status.no_new_privs},"
+        "sort_keys=True,separators=(',',':')))"
+    )
+
+    completed = subprocess.run(
+        [
+            "/usr/bin/bwrap",
+            "--unshare-user",
+            "--disable-userns",
+            "--cap-drop",
+            "ALL",
+            "--ro-bind",
+            "/",
+            "/",
+            "--",
+            broker.INTERPRETER_PATH,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            script,
+        ],
+        cwd=Path(__file__).parents[2],
+        env=dict(broker.BROKER_ENVIRONMENT),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "after": [0, 1, 2],
+        "before": [0, 1, 2],
+        "ctypes_before": False,
+        "nnp": 1,
+    }
+
+
+@pytest.mark.m4b_linux
+def test_broker_prctl_rejects_fixed_fd_close_and_numeric_reuse():
+    broker = _network_broker()
+    repo_src = Path(__file__).parents[2] / "src"
+    package_root = repo_src / "agenticos"
+    sandbox_root = package_root / "sandbox"
+    script = f"""
+import builtins
+import json
+import os
+import sys
+import types
+
+agenticos = types.ModuleType("agenticos")
+agenticos.__path__ = [{str(package_root)!r}]
+sys.modules["agenticos"] = agenticos
+sandbox = types.ModuleType("agenticos.sandbox")
+sandbox.__path__ = [{str(sandbox_root)!r}]
+sys.modules["agenticos.sandbox"] = sandbox
+from agenticos.sandbox import network_broker as broker
+
+source = os.open("/usr/bin/python3", os.O_RDONLY | os.O_CLOEXEC)
+os.dup2(source, 40, inheritable=False)
+if source != 40:
+    os.close(source)
+before = broker._observe_fd_numbers()
+original_import = builtins.__import__
+
+def replacing_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "ctypes":
+        replacement = os.open("/usr/bin/true", os.O_RDONLY | os.O_CLOEXEC)
+        os.close(40)
+        os.dup2(replacement, 40, inheritable=False)
+        if replacement != 40:
+            os.close(replacement)
+    return original_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = replacing_import
+runtime = broker.ObservedFileIdentity.from_stat(os.stat("/usr"))
+try:
+    broker._establish_no_new_privs(before, runtime)
+except broker.BrokerBoundaryError as exc:
+    print(json.dumps({{"accepted": False, "error": str(exc),
+                      "after": broker._observe_fd_numbers()}}, sort_keys=True))
+else:
+    print(json.dumps({{"accepted": True,
+                      "after": broker._observe_fd_numbers()}}, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [
+            "/usr/bin/bwrap",
+            "--unshare-user",
+            "--disable-userns",
+            "--cap-drop",
+            "ALL",
+            "--ro-bind",
+            "/",
+            "/",
+            "--",
+            broker.INTERPRETER_PATH,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            script,
+        ],
+        cwd=Path(__file__).parents[2],
+        env=dict(broker.BROKER_ENVIRONMENT),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["accepted"] is False
+    assert "fixed descriptor" in result["error"]
+    assert result["after"] == [0, 1, 2, 40]
+
+
+def _ready_record(broker):
+    models = _network_models()
+    return broker.NetworkBrokerReadyRecord(
+        version="AOSBROKERREADY/1",
+        event="NETWORK_BROKER_READY",
+        ready=models.BrokerReadyEvidence(
+            task_id="task-boundary",
+            task_generation=9,
+            launch_nonce="cd" * 16,
+            policy_digest="a" * 64,
+            broker_pid=123,
+            broker_start_time_ticks=456,
+            broker_boot_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            ready_at_monotonic_ns=789,
+        ),
+        process=models.BrokerProcessEvidence(
+            pid=123,
+            start_time_ticks=456,
+            boot_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        ),
+        listener=models.ListenerEvidence(
+            family=int(socket.AF_INET),
+            socket_type=int(socket.SOCK_STREAM),
+            address="127.0.0.1",
+            port=18080,
+            device=10,
+            inode=20,
+            file_type=stat.S_IFSOCK,
+            netns_cookie=30,
+            accepting=True,
+        ),
+        sealed_policy=broker.SealedPolicyEvidence(
+            device=40,
+            inode=50,
+            size=60,
+            seals=70,
+        ),
+        runtime_identity=broker.ObservedFileIdentity(101, 201, stat.S_IFDIR),
+        broker_code_identity=broker.ObservedFileIdentity(102, 202, stat.S_IFREG),
+        identity_code_identity=broker.ObservedFileIdentity(103, 203, stat.S_IFREG),
+        models_code_identity=broker.ObservedFileIdentity(104, 204, stat.S_IFREG),
+        interpreter_identity=broker.ObservedFileIdentity(105, 205, stat.S_IFREG),
+        boundary=broker.BrokerBoundaryEvidence(
+            proc_status=broker.ProcStatusEvidence(0, 0, 0, 0, 0, 1),
+            environment=broker.EnvironmentEvidence(
+                names=tuple(dict(broker.BROKER_ENVIRONMENT)),
+                digest="b" * 64,
+            ),
+            filesystem_digest="c" * 64,
+            fd_numbers=(0, 1, 2, 30, 31, 32, 33, 34),
+            cgroup="/user.slice/task.scope",
+            namespaces=(
+                ("ipc", 11),
+                ("mnt", 12),
+                ("net", 13),
+                ("pid", 14),
+                ("user", 15),
+                ("uts", 16),
+            ),
+        ),
+    )
+
+
+def test_broker_ready_record_is_canonical_bounded_and_one_shot():
+    broker = _network_broker()
+    record = _ready_record(broker)
+    payload = record.to_bytes()
+
+    assert len(payload) <= broker.MAX_READY_BYTES
+    assert payload == json.dumps(
+        json.loads(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    assert broker.NetworkBrokerReadyRecord.from_bytes(payload) == record
+
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        broker.emit_network_broker_ready(sender.fileno(), record)
+        assert receiver.recv(broker.MAX_READY_BYTES + 1) == payload
+        assert receiver.recv(1) == b""
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_broker_ready_record_rejects_nonfixed_listener_or_process_mismatch():
+    broker = _network_broker()
+    record = _ready_record(broker)
+
+    with pytest.raises(broker.BrokerBoundaryError, match="listener"):
+        dataclasses.replace(
+            record,
+            listener=dataclasses.replace(record.listener, address="127.0.0.2"),
+        )
+    with pytest.raises(broker.BrokerBoundaryError, match="identities"):
+        dataclasses.replace(
+            record,
+            process=dataclasses.replace(record.process, pid=999),
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"",
+        b"{malformed}",
+        b'{"event":"NETWORK_BROKER_READY"}',
+        b'{"event":"NETWORK_BROKER_READY","event":"NETWORK_BROKER_READY"}',
+        b"x" * 16384,
+    ],
+)
+def test_broker_ready_parser_rejects_malformed_duplicate_or_oversized(payload):
+    broker = _network_broker()
+    with pytest.raises(broker.BrokerBoundaryError):
+        broker.NetworkBrokerReadyRecord.from_bytes(payload)
+
+
+def _relay_policy(*, mode=None, lifetime_ns=5_000_000_000, byte_limit=4096):
+    models = _network_models()
+    now = time.monotonic_ns()
+    return _boundary_policy(
+        models,
+        mode=mode or models.TransportMode.SYNTHETIC_FIXTURE_FD,
+        activated_at_monotonic_ns=now - 1_000_000,
+        expires_at_monotonic_ns=now + lifetime_ns,
+        byte_limit=byte_limit,
+        connection_limit=1,
+    )
+
+
+def _dup_cloexec(fd):
+    return fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 100)
+
+
+def _run_relay_thread(broker, policy, listener, fixture, control):
+    owned = (
+        _dup_cloexec(listener.fileno()),
+        None if fixture is None else _dup_cloexec(fixture.fileno()),
+        _dup_cloexec(control.fileno()),
+    )
+    outcomes = []
+
+    def run():
+        try:
+            outcomes.append(
+                broker.serve_transport(
+                    policy,
+                    listener_fd=owned[0],
+                    fixture_fd=owned[1],
+                    control_fd=owned[2],
+                )
+            )
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, outcomes, owned
+
+
+class _ScriptedRelaySelector:
+    def __init__(self, broker, steps):
+        self._broker = broker
+        self._steps = list(steps)
+        self._keys = {}
+
+    def register(self, fileobj, events, data=None):
+        if fileobj in self._keys:
+            raise KeyError(fileobj)
+        key = self._broker.selectors.SelectorKey(
+            fileobj, fileobj.fileno(), events, data
+        )
+        self._keys[fileobj] = key
+        return key
+
+    def unregister(self, fileobj):
+        try:
+            return self._keys.pop(fileobj)
+        except KeyError:
+            raise KeyError(fileobj) from None
+
+    def key(self, fileobj):
+        return self._keys[fileobj]
+
+    def select(self, _timeout=None):
+        if not self._steps:
+            return []
+        return self._steps.pop(0)(self)
+
+    def close(self):
+        self._keys.clear()
+
+
+def test_broker_revoke_preempts_simultaneous_endpoint_io(monkeypatch):
+    broker = _network_broker()
+    fixture_broker, fixture_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    control_broker, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    payload = b"must-remain-after-revoke"
+    with _fixed_listener() as listener:
+        scripted = _ScriptedRelaySelector(
+            broker,
+            [
+                lambda selected: [
+                    (selected.key(listener), broker.selectors.EVENT_READ)
+                ],
+                lambda selected: [
+                    (selected.key(fixture_broker), broker.selectors.EVENT_READ),
+                    (selected.key(control_broker), broker.selectors.EVENT_READ),
+                ],
+            ],
+        )
+        monkeypatch.setattr(
+            broker.selectors, "DefaultSelector", lambda: scripted
+        )
+        try:
+            client.connect(("127.0.0.1", 18080))
+            fixture_peer.sendall(payload)
+            control_peer.send(broker.CONTROL_REVOKE)
+
+            outcome = broker._relay_loop(
+                _relay_policy(), listener, fixture_broker, control_broker
+            )
+
+            assert outcome is broker.TransportTermination.REVOKED
+            assert fixture_broker.recv(len(payload)) == payload
+        finally:
+            client.close()
+            fixture_broker.close()
+            fixture_peer.close()
+            control_broker.close()
+            control_peer.close()
+
+
+def test_broker_expiry_crossed_during_select_preempts_endpoint_io(monkeypatch):
+    broker = _network_broker()
+    fixture_broker, fixture_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    control_broker, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    payload = b"must-remain-after-expiry"
+    policy = _relay_policy()
+    clock = {"now": policy.expires_at_monotonic_ns - 1}
+
+    def expire_then_report_fixture(selected):
+        clock["now"] = policy.expires_at_monotonic_ns
+        return [(selected.key(fixture_broker), broker.selectors.EVENT_READ)]
+
+    with _fixed_listener() as listener:
+        scripted = _ScriptedRelaySelector(
+            broker,
+            [
+                lambda selected: [
+                    (selected.key(listener), broker.selectors.EVENT_READ)
+                ],
+                expire_then_report_fixture,
+            ],
+        )
+        monkeypatch.setattr(
+            broker.selectors, "DefaultSelector", lambda: scripted
+        )
+        monkeypatch.setattr(broker.time, "monotonic_ns", lambda: clock["now"])
+        try:
+            client.connect(("127.0.0.1", 18080))
+            fixture_peer.sendall(payload)
+
+            outcome = broker._relay_loop(
+                policy, listener, fixture_broker, control_broker
+            )
+
+            assert outcome is broker.TransportTermination.EXPIRED
+            assert fixture_broker.recv(len(payload)) == payload
+        finally:
+            client.close()
+            fixture_broker.close()
+            fixture_peer.close()
+            control_broker.close()
+            control_peer.close()
+
+
+def test_broker_relay_never_reads_beyond_exact_buffer_capacity(monkeypatch):
+    broker = _network_broker()
+    fixture_broker, fixture_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    control_broker, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    payload = b"0123456789abcdefghijklmnopqrstuv"
+    assert len(payload) == 32
+    with _fixed_listener() as listener:
+        scripted = _ScriptedRelaySelector(
+            broker,
+            [
+                lambda selected: [
+                    (selected.key(listener), broker.selectors.EVENT_READ)
+                ],
+                lambda selected: [
+                    (selected.key(fixture_broker), broker.selectors.EVENT_READ)
+                ],
+                lambda selected: [
+                    (selected.key(fixture_broker), broker.selectors.EVENT_READ)
+                ],
+                lambda selected: [
+                    (selected.key(control_broker), broker.selectors.EVENT_READ)
+                ],
+            ],
+        )
+        monkeypatch.setattr(
+            broker.selectors, "DefaultSelector", lambda: scripted
+        )
+        monkeypatch.setattr(broker, "RELAY_BUFFER_BYTES", 20)
+        monkeypatch.setattr(broker, "RELAY_CHUNK_BYTES", 16)
+        try:
+            client.connect(("127.0.0.1", 18080))
+            fixture_peer.sendall(payload)
+            control_peer.send(broker.CONTROL_REVOKE)
+
+            outcome = broker._relay_loop(
+                _relay_policy(byte_limit=128),
+                listener,
+                fixture_broker,
+                control_broker,
+            )
+
+            assert outcome is broker.TransportTermination.REVOKED
+            assert fixture_broker.recv(len(payload)) == payload[20:]
+        finally:
+            client.close()
+            fixture_broker.close()
+            fixture_peer.close()
+            control_broker.close()
+            control_peer.close()
+
+
+def test_broker_synthetic_fixture_relays_only_inherited_socket_and_revokes_cleanly():
+    broker = _network_broker()
+    fixture_broker, fixture_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    control_broker, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    with _fixed_listener() as listener:
+        thread, outcomes, owned = _run_relay_thread(
+            broker,
+            _relay_policy(),
+            listener,
+            fixture_broker,
+            control_broker,
+        )
+        try:
+            client.settimeout(2)
+            fixture_peer.settimeout(2)
+            client.connect(("127.0.0.1", 18080))
+            client.sendall(b"from-worker")
+            assert fixture_peer.recv(64) == b"from-worker"
+            fixture_peer.sendall(b"from-fixture")
+            assert client.recv(64) == b"from-fixture"
+            control_peer.send(b"AOSBROKERCTL/1 REVOKE\n")
+            thread.join(3)
+            assert not thread.is_alive()
+            assert outcomes == [broker.TransportTermination.REVOKED]
+            for fd in owned:
+                if fd is not None:
+                    with pytest.raises(OSError) as closed:
+                        fcntl.fcntl(fd, fcntl.F_GETFD)
+                    assert closed.value.errno == errno.EBADF
+        finally:
+            client.close()
+            fixture_broker.close()
+            fixture_peer.close()
+            control_broker.close()
+            control_peer.close()
+
+
+def test_broker_deny_mode_never_accepts_listener():
+    broker = _network_broker()
+    models = _network_models()
+    control_broker, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    with _fixed_listener() as listener:
+        policy = _relay_policy(
+            mode=models.TransportMode.DENY,
+            lifetime_ns=150_000_000,
+        )
+        thread, outcomes, _owned = _run_relay_thread(
+            broker, policy, listener, None, control_broker
+        )
+        try:
+            client.connect(("127.0.0.1", 18080))
+            thread.join(2)
+            assert not thread.is_alive()
+            assert outcomes == [broker.TransportTermination.EXPIRED]
+            listener.setblocking(False)
+            accepted, _address = listener.accept()
+            broker._abort_socket(accepted)
+        finally:
+            client.close()
+            control_broker.close()
+            control_peer.close()
+
+
+@pytest.mark.parametrize(
+    ("control_payload", "expected"),
+    [
+        (b"", "CONTROL_EOF"),
+        (b"malformed", "MALFORMED_CONTROL"),
+        (b"AOSBROKERCTL/1 REVOKE\n", "REVOKED"),
+    ],
+)
+def test_broker_control_eof_revoke_or_malformed_terminates_fail_closed(
+    control_payload, expected
+):
+    broker = _network_broker()
+    models = _network_models()
+    control_broker, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with _fixed_listener() as listener:
+        thread, outcomes, _owned = _run_relay_thread(
+            broker,
+            _relay_policy(mode=models.TransportMode.DENY),
+            listener,
+            None,
+            control_broker,
+        )
+        try:
+            if control_payload:
+                control_peer.send(control_payload)
+            else:
+                control_peer.shutdown(socket.SHUT_WR)
+            thread.join(2)
+            assert not thread.is_alive()
+            assert outcomes == [getattr(broker.TransportTermination, expected)]
+        finally:
+            control_broker.close()
+            control_peer.close()
+
+
+def test_broker_malformed_control_closes_received_ancillary_descriptors():
+    broker = _network_broker()
+    receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    try:
+        baseline = _open_fd_numbers()
+        sender.sendmsg(
+            [b"malformed"],
+            [
+                (
+                    socket.SOL_SOCKET,
+                    socket.SCM_RIGHTS,
+                    array.array("i", [read_fd]).tobytes(),
+                )
+            ],
+        )
+        assert broker._read_control(receiver) is broker.TransportTermination.MALFORMED_CONTROL
+        assert _open_fd_numbers() == baseline
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+        receiver.close()
+        sender.close()
+
+
+def test_broker_byte_limit_fails_closed():
+    broker = _network_broker()
+    fixture_broker, fixture_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    control_broker, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    with _fixed_listener() as listener:
+        thread, outcomes, _owned = _run_relay_thread(
+            broker,
+            _relay_policy(byte_limit=4),
+            listener,
+            fixture_broker,
+            control_broker,
+        )
+        try:
+            first.connect(("127.0.0.1", 18080))
+            first.sendall(b"12345")
+            thread.join(2)
+            assert not thread.is_alive()
+            assert outcomes == [broker.TransportTermination.BYTE_LIMIT]
+            fixture_peer.settimeout(1)
+            assert len(fixture_peer.recv(64)) <= 4
+        finally:
+            first.close()
+            fixture_broker.close()
+            fixture_peer.close()
+            control_broker.close()
+            control_peer.close()
+
+
+def test_broker_extra_connection_fails_closed():
+    broker = _network_broker()
+    fixture_broker, fixture_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    control_broker, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    with _fixed_listener() as listener:
+        thread, outcomes, _owned = _run_relay_thread(
+            broker,
+            _relay_policy(),
+            listener,
+            fixture_broker,
+            control_broker,
+        )
+        try:
+            fixture_peer.settimeout(2)
+            first.connect(("127.0.0.1", 18080))
+            first.sendall(b"first")
+            assert fixture_peer.recv(16) == b"first"
+            second.connect(("127.0.0.1", 18080))
+            thread.join(2)
+            assert not thread.is_alive()
+            assert outcomes == [broker.TransportTermination.CONNECTION_LIMIT]
+        finally:
+            first.close()
+            second.close()
+            fixture_broker.close()
+            fixture_peer.close()
+            control_broker.close()
+            control_peer.close()
+
+
+def test_broker_fixture_rejects_wrong_fd_type_or_unconnected_socket():
+    broker = _network_broker()
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    unconnected = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+    try:
+        with pytest.raises(broker.BrokerBoundaryError):
+            broker.validate_fixture_fd(read_fd)
+        with pytest.raises(broker.BrokerBoundaryError):
+            broker.validate_fixture_fd(unconnected.fileno())
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+        unconnected.close()
+
+
+def test_broker_transport_validation_failure_closes_every_owned_descriptor():
+    broker = _network_broker()
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    bad_fixture_r, bad_fixture_w = os.pipe2(os.O_CLOEXEC)
+    with _fixed_listener() as listener:
+        owned = (
+            _dup_cloexec(listener.fileno()),
+            _dup_cloexec(bad_fixture_r),
+            _dup_cloexec(control_broker.fileno()),
+        )
+        try:
+            with pytest.raises(broker.BrokerBoundaryError):
+                broker.serve_transport(
+                    _relay_policy(),
+                    listener_fd=owned[0],
+                    fixture_fd=owned[1],
+                    control_fd=owned[2],
+                )
+            for fd in owned:
+                with pytest.raises(OSError) as closed:
+                    fcntl.fcntl(fd, fcntl.F_GETFD)
+                assert closed.value.errno == errno.EBADF
+        finally:
+            for fd in owned:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            os.close(bad_fixture_r)
+            os.close(bad_fixture_w)
+            control_broker.close()
+            control_peer.close()
+
+
+def test_broker_rejects_distinct_fd_numbers_that_alias_one_kernel_object():
+    broker = _network_broker()
+    first, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    alias_fd = fcntl.fcntl(first.fileno(), fcntl.F_DUPFD_CLOEXEC, 100)
+    try:
+        with pytest.raises(broker.BrokerBoundaryError, match="alias"):
+            broker._require_distinct_fd_identities((first.fileno(), alias_fd))
+    finally:
+        os.close(alias_fd)
+        first.close()
+        peer.close()
+
+
+def test_broker_source_has_no_outbound_resolution_or_protocol_surface():
+    module = _network_broker()
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    tree = __import__("ast").parse(source)
+    forbidden_calls = {
+        "connect",
+        "connect_ex",
+        "create_connection",
+        "getaddrinfo",
+        "gethostbyname",
+    }
+    observed_calls = {
+        node.func.attr
+        for node in __import__("ast").walk(tree)
+        if isinstance(node, __import__("ast").Call)
+        and isinstance(node.func, __import__("ast").Attribute)
+    }
+    assert forbidden_calls.isdisjoint(observed_calls)
+    for forbidden_import in ("ssl", "http", "urllib"):
+        assert not any(
+            (
+                isinstance(node, __import__("ast").Import)
+                and any(alias.name == forbidden_import for alias in node.names)
+            )
+            or (
+                isinstance(node, __import__("ast").ImportFrom)
+                and node.module == forbidden_import
+            )
+            for node in __import__("ast").walk(tree)
+        )
+
+
+@pytest.fixture(scope="module")
+def task_supervisor_binary(tmp_path_factory):
+    source = (
+        Path(__file__).parents[2]
+        / "native"
+        / "task_supervisor"
+        / "task_supervisor.c"
+    )
+    output = tmp_path_factory.mktemp("task-supervisor") / "task_supervisor"
+    subprocess.run(
+        [
+            "cc",
+            "-std=c11",
+            "-D_GNU_SOURCE",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-O2",
+            str(source),
+            "-o",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return output
+
+
+def _run_native_supervisor(
+    binary,
+    contract_argv,
+    *,
+    status_is_pipe=True,
+    pass_fd_numbers=(),
+    aliased_pass_pair=None,
+    aliased_pass_kind=None,
+):
+    bwrap_fd = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    pass_sources = {}
+    for target in pass_fd_numbers:
+        raw = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            pass_sources[target] = fcntl.fcntl(
+                raw, fcntl.F_DUPFD_CLOEXEC, 128
+            )
+        finally:
+            os.close(raw)
+    if aliased_pass_pair is not None:
+        source_target, alias_target = aliased_pass_pair
+        if (
+            source_target not in pass_sources
+            or alias_target not in pass_sources
+            or source_target == alias_target
+            or aliased_pass_kind not in {"pipe", "socket"}
+        ):
+            raise ValueError("invalid aliased pass-descriptor fixture")
+        os.close(pass_sources.pop(source_target))
+        os.close(pass_sources.pop(alias_target))
+        if aliased_pass_kind == "socket":
+            source, peer = socket.socketpair(
+                socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC
+            )
+            source_fd = source.fileno()
+            close_sources = (source, peer)
+        else:
+            source_fd, peer_fd = os.pipe2(os.O_CLOEXEC)
+            close_sources = (source_fd, peer_fd)
+        try:
+            pass_sources[source_target] = fcntl.fcntl(
+                source_fd, fcntl.F_DUPFD_CLOEXEC, 128
+            )
+            pass_sources[alias_target] = fcntl.fcntl(
+                source_fd, fcntl.F_DUPFD_CLOEXEC, 128
+            )
+        finally:
+            for owned_source in close_sources:
+                if type(owned_source) is socket.socket:
+                    owned_source.close()
+                else:
+                    os.close(owned_source)
+    status_r = status_w = -1
+    if status_is_pipe:
+        status_r, status_w = os.pipe2(os.O_CLOEXEC)
+    else:
+        status_w = os.open("/dev/null", os.O_WRONLY | os.O_CLOEXEC)
+    output_r, output_w = os.pipe2(os.O_CLOEXEC)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            if status_r >= 0:
+                os.close(status_r)
+            os.close(output_r)
+            os.dup2(bwrap_fd, 5, inheritable=True)
+            os.dup2(status_w, 6, inheritable=True)
+            os.dup2(output_w, 1, inheritable=True)
+            os.dup2(output_w, 2, inheritable=True)
+            for target, source in pass_sources.items():
+                os.dup2(source, target, inheritable=True)
+            keep = {0, 1, 2, 5, 6, *pass_fd_numbers}
+            for fd in (bwrap_fd, status_w, output_w, *pass_sources.values()):
+                if fd not in keep:
+                    os.close(fd)
+            os.execve(
+                str(binary),
+                [str(binary), *contract_argv],
+                {"PATH": "/definitely/not/used"},
+            )
+        except BaseException:
+            os._exit(127)
+    os.close(bwrap_fd)
+    for fd in pass_sources.values():
+        os.close(fd)
+    os.close(status_w)
+    os.close(output_w)
+    _, wait_status = os.waitpid(pid, 0)
+    status_bytes = b""
+    if status_r >= 0:
+        status_bytes = os.read(status_r, 4096)
+        os.close(status_r)
+    chunks = []
+    while True:
+        ready, _, _ = select.select([output_r], [], [], 1)
+        if not ready:
+            break
+        chunk = os.read(output_r, 4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(output_r)
+    return pid, wait_status, status_bytes, b"".join(chunks)
+
+
+@pytest.mark.m4b_linux
+def test_supervisor_partitions_broker_and_worker_capability_descriptors(
+    task_supervisor_binary,
+):
+    _boundary, plan = _boundary_plan()
+    program = (
+        "import json,os,sys,time;"
+        "fds=[fd for fd in range(3,64) "
+        "if os.path.exists('/proc/self/fd/'+str(fd))];"
+        "print(json.dumps({'label':sys.argv[1],'fds':fds}),flush=True);"
+        "time.sleep(0.1)"
+    )
+    broker_argv = ("bwrap", "-c", program, "broker")
+    worker_argv = ("bwrap", "-c", program, "worker")
+    broker_pass = plan.supervisor_contract.broker_pass_fds
+    worker_pass = (40,)
+    contract = plan.supervisor_contract.with_broker_argv(broker_argv)
+    tokens = contract.argument_tokens_for(
+        worker_argv,
+        worker_pass_fds=worker_pass,
+    )
+
+    _pid, wait_status, status_bytes, output = _run_native_supervisor(
+        task_supervisor_binary,
+        tokens,
+        pass_fd_numbers=(*broker_pass, *worker_pass),
+    )
+
+    assert os.waitstatus_to_exitcode(wait_status) == 0
+    assert status_bytes.startswith(b"AOSSUP/1 BROKER_PID ")
+    records = {
+        record["label"]: record
+        for record in (
+            json.loads(line) for line in output.splitlines() if line.startswith(b"{")
+        )
+    }
+    assert records["broker"]["fds"] == list(broker_pass)
+    assert records["worker"]["fds"] == list(worker_pass)
+
+
+@pytest.mark.m4b_linux
+@pytest.mark.parametrize("alias_kind", ["socket", "pipe"])
+def test_supervisor_rejects_cross_branch_open_file_description_aliases(
+    task_supervisor_binary,
+    alias_kind,
+):
+    boundary, plan = _boundary_plan()
+    broker_argv = ("bwrap", "-c", "raise SystemExit(97)")
+    worker_argv = ("bwrap", "-c", "raise SystemExit(98)")
+    worker_pass = (40,)
+    contract = plan.supervisor_contract.with_broker_argv(broker_argv)
+    tokens = contract.argument_tokens_for(
+        worker_argv,
+        worker_pass_fds=worker_pass,
+    )
+
+    _pid, wait_status, status_bytes, output = _run_native_supervisor(
+        task_supervisor_binary,
+        tokens,
+        pass_fd_numbers=(*contract.broker_pass_fds, *worker_pass),
+        aliased_pass_pair=(boundary.BROKER_CONTROL_FD, worker_pass[0]),
+        aliased_pass_kind=alias_kind,
+    )
+
+    assert os.waitstatus_to_exitcode(wait_status) == 66
+    assert status_bytes == b""
+    assert output == b"AOSSUP/1 ERROR pass_fds 22\n"
+
+
+@pytest.mark.m4b_linux
+def test_supervisor_execveat_reports_one_broker_pid_and_preserves_same_cgroup(
+    task_supervisor_binary,
+):
+    _boundary, plan = _boundary_plan()
+    program = (
+        "import json,os,sys,time;"
+        "print(json.dumps({'label':sys.argv[1],'pid':os.getpid(),"
+        "'cgroup':open('/proc/self/cgroup').read(),"
+        "'argv':sys.argv[1:],'env':sorted(os.environ)}),flush=True);"
+        "time.sleep(float(sys.argv[2]))"
+    )
+    broker_argv = ("bwrap", "-c", program, "broker", "0.15")
+    worker_argv = ("bwrap", "-c", program, "worker", "0.25")
+    contract = plan.supervisor_contract.with_broker_argv(broker_argv)
+    full = contract.argv_for(worker_argv)
+
+    root_pid, wait_status, status_bytes, output = _run_native_supervisor(
+        task_supervisor_binary,
+        full[1:],
+        pass_fd_numbers=plan.supervisor_contract.broker_pass_fds,
+    )
+
+    assert os.waitstatus_to_exitcode(wait_status) == 0
+    status_line = status_bytes.decode("ascii").strip().split()
+    assert status_line[:2] == ["AOSSUP/1", "BROKER_PID"]
+    broker_pid = int(status_line[2])
+    records = [json.loads(line) for line in output.splitlines() if line.startswith(b"{")]
+    assert {record["label"] for record in records} == {"broker", "worker"}
+    by_label = {record["label"]: record for record in records}
+    assert by_label["broker"]["pid"] == broker_pid
+    assert by_label["worker"]["pid"] == root_pid
+    assert by_label["broker"]["cgroup"] == by_label["worker"]["cgroup"]
+    assert by_label["broker"]["argv"] == ["broker", "0.15"]
+    assert by_label["worker"]["argv"] == ["worker", "0.25"]
+    assert by_label["broker"]["env"] == ["LANG", "LC_ALL"]
+    assert by_label["worker"]["env"] == ["LANG", "LC_ALL"]
+    deadline = time.monotonic() + 2
+    while Path(f"/proc/{broker_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not Path(f"/proc/{broker_pid}").exists()
+
+
+@pytest.mark.m4b_linux
+def test_supervisor_accepts_the_minimal_one_item_bounded_vectors(
+    task_supervisor_binary,
+):
+    _boundary, plan = _boundary_plan()
+    contract = plan.supervisor_contract.with_broker_argv(("bwrap",))
+    full = contract.argv_for(("bwrap",))
+
+    _pid, wait_status, status_bytes, _output = _run_native_supervisor(
+        task_supervisor_binary,
+        full[1:],
+        pass_fd_numbers=plan.supervisor_contract.broker_pass_fds,
+    )
+
+    assert os.waitstatus_to_exitcode(wait_status) == 0
+    assert status_bytes.startswith(b"AOSSUP/1 BROKER_PID ")
+
+
+@pytest.mark.m4b_linux
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        (),
+        ("AOSSUP/2",),
+        ("AOSSUP/1", "bwrap_fd", "+5"),
+        ("AOSSUP/1", "bwrap_fd", "05"),
+        ("AOSSUP/1", "unknown", "5"),
+    ],
+)
+def test_supervisor_rejects_malformed_contract_without_shell_or_path_lookup(
+    task_supervisor_binary, tokens
+):
+    completed = subprocess.run(
+        [str(task_supervisor_binary), *tokens],
+        env={"PATH": "/definitely/not/used"},
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert completed.returncode != 0
+
+
+@pytest.mark.m4b_linux
+@pytest.mark.parametrize(
+    ("worker_values", "broker_first"),
+    [
+        (("8",), "8"),
+        (("40", "40"), "8"),
+        (("5",), "8"),
+        (("6",), "8"),
+        ((str(1 << 31),), "8"),
+        ((), "9"),
+    ],
+)
+def test_supervisor_native_contract_rejects_overlapping_duplicate_reserved_or_unknown_pass_fds(
+    task_supervisor_binary,
+    worker_values,
+    broker_first,
+):
+    _boundary, plan = _boundary_plan()
+    broker_values = [str(fd) for fd in plan.supervisor_contract.broker_pass_fds]
+    broker_values[0] = broker_first
+    tokens = (
+        "AOSSUP/1",
+        "bwrap_fd",
+        "5",
+        "status_fd",
+        "6",
+        "broker_passc",
+        str(len(broker_values)),
+        "broker_pass",
+        *broker_values,
+        "worker_passc",
+        str(len(worker_values)),
+        "worker_pass",
+        *worker_values,
+        "broker_argc",
+        "1",
+        "broker",
+        "bwrap",
+        "worker_argc",
+        "1",
+        "worker",
+        "bwrap",
+        "END",
+    )
+
+    completed = subprocess.run(
+        [str(task_supervisor_binary), *tokens],
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert completed.returncode == 64
+    assert completed.stderr == b"AOSSUP/1 ERROR contract 22\n"
+
+
+@pytest.mark.m4b_linux
+def test_supervisor_rejects_wrong_status_descriptor_type_before_fork(
+    task_supervisor_binary,
+):
+    _boundary, plan = _boundary_plan()
+    contract = plan.supervisor_contract.with_broker_argv(
+        ("bwrap", "-c", "raise SystemExit(99)")
+    )
+    full = contract.argv_for(("bwrap", "-c", "raise SystemExit(98)"))
+
+    _pid, wait_status, status_bytes, output = _run_native_supervisor(
+        task_supervisor_binary,
+        full[1:],
+        status_is_pipe=False,
+        pass_fd_numbers=plan.supervisor_contract.broker_pass_fds,
+    )
+
+    assert os.waitstatus_to_exitcode(wait_status) != 0
+    assert status_bytes == b""
+    assert output == b"AOSSUP/1 ERROR descriptors 9\n"
+
+
+@pytest.mark.m4b_linux
+def test_broker_boundary_real_bwrap_bootstrap_emits_strict_readiness(
+    task_supervisor_binary,
+):
+    boundary = _network_boundary()
+    broker = _network_broker()
+    identity = _network_identity()
+    models = _network_models()
+    repo_root = Path(__file__).parents[2]
+    policy = _boundary_policy(
+        models,
+        mode=models.TransportMode.DENY,
+        expires_at_monotonic_ns=time.monotonic_ns() + 30_000_000_000,
+    )
+
+    opened = []
+
+    def source(path, fixed_fd, expected_type):
+        flags = os.O_PATH | os.O_CLOEXEC
+        if expected_type == stat.S_IFDIR:
+            flags |= os.O_DIRECTORY
+        fd = os.open(path, flags)
+        opened.append(fd)
+        observed = os.fstat(fd)
+        return boundary.AuthorizedSource(
+            locator=Path(path).resolve(),
+            fd=fixed_fd,
+            identity=boundary.FileIdentity.from_stat(observed),
+        )
+
+    sources = {
+        "runtime_usr": source("/usr", boundary.BROKER_RUNTIME_USR_FD, stat.S_IFDIR),
+        "broker_code": source(
+            repo_root / "src/agenticos/sandbox/network_broker.py",
+            boundary.BROKER_CODE_FD,
+            stat.S_IFREG,
+        ),
+        "identity_code": source(
+            repo_root / "src/agenticos/sandbox/network_identity.py",
+            boundary.BROKER_IDENTITY_CODE_FD,
+            stat.S_IFREG,
+        ),
+        "models_code": source(
+            repo_root / "src/agenticos/sandbox/network_models.py",
+            boundary.BROKER_MODELS_CODE_FD,
+            stat.S_IFREG,
+        ),
+        "supervisor": source(
+            task_supervisor_binary,
+            boundary.SUPERVISOR_EXECUTABLE_FD,
+            stat.S_IFREG,
+        ),
+    }
+    plan = boundary.build_network_boundary_plan(
+        transport_policy=policy,
+        **sources,
+    )
+    policy_fd = identity.create_sealed_policy_fd(policy)
+    handoff_sender, handoff_broker = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+    )
+    status_broker, status_receiver = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+    )
+    control_broker, control_sender = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+    )
+    json_r, json_w = os.pipe2(os.O_CLOEXEC)
+    bwrap_fd = os.open("/usr/bin/bwrap", os.O_RDONLY | os.O_CLOEXEC)
+    with _fixed_listener() as listener:
+        frame = identity.ListenerAdoptionFrame(
+            version="AOSLISTENER/1",
+            task_id=policy.task_id,
+            task_generation=policy.task_generation,
+            launch_nonce=policy.launch_nonce,
+            policy_digest=models.policy_digest(policy),
+            evidence=identity.listener_evidence(listener.fileno()),
+        )
+        identity.send_listener_fd(handoff_sender, listener.fileno(), frame)
+
+        child_sources = {
+            boundary.BROKER_JSON_STATUS_FD: json_w,
+            boundary.BROKER_RUNTIME_USR_FD: opened[0],
+            boundary.BROKER_CODE_FD: opened[1],
+            boundary.BROKER_IDENTITY_CODE_FD: opened[2],
+            boundary.BROKER_MODELS_CODE_FD: opened[3],
+            broker.BROKER_POLICY_FD: policy_fd,
+            broker.BROKER_HANDOFF_FD: handoff_broker.fileno(),
+            broker.BROKER_STATUS_FD: status_broker.fileno(),
+            broker.BROKER_CONTROL_FD: control_broker.fileno(),
+        }
+        high_sources = {
+            target: fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 100)
+            for target, fd in child_sources.items()
+        }
+        high_bwrap = fcntl.fcntl(bwrap_fd, fcntl.F_DUPFD_CLOEXEC, 100)
+        child_pid = os.fork()
+        if child_pid == 0:
+            try:
+                os.dup2(high_bwrap, 19, inheritable=False)
+                for target, high_fd in high_sources.items():
+                    os.dup2(high_fd, target, inheritable=True)
+                keep = {0, 1, 2, 19, *child_sources}
+                for name in os.listdir("/proc/self/fd"):
+                    fd = int(name)
+                    if fd not in keep:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                argv = list(plan.broker_bwrap_argv)
+                argv[0] = "/proc/self/fd/19"
+                os.execve(argv[0], argv, {})
+            except BaseException:
+                os._exit(127)
+
+        for fd in (*high_sources.values(), high_bwrap):
+            os.close(fd)
+        os.close(json_w)
+        status_broker.close()
+        control_broker.close()
+        handoff_broker.close()
+        status_receiver.settimeout(10)
+        try:
+            setup = boundary.read_broker_bwrap_setup_status(json_r, timeout=10)
+            payload = status_receiver.recv(broker.MAX_READY_BYTES + 1)
+            record = broker.NetworkBrokerReadyRecord.from_bytes(payload)
+            assert setup.child_pid > 0
+            assert "net" not in dict(setup.reported_namespaces)
+            assert record.ready.task_id == policy.task_id
+            assert record.ready.policy_digest == models.policy_digest(policy)
+            assert record.listener == frame.evidence
+            assert record.boundary.proc_status == broker.ProcStatusEvidence(
+                0, 0, 0, 0, 0, 1
+            )
+            assert record.boundary.fd_numbers == (0, 1, 2, 30, 31, 32, 33)
+            assert record.runtime_identity == plan.broker_contract.runtime_identity
+            assert (
+                record.broker_code_identity
+                == plan.broker_contract.broker_code_identity
+            )
+            assert status_receiver.recv(1) == b""
+            control_sender.send(b"AOSBROKERCTL/1 REVOKE\n")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                waited, wait_status = os.waitpid(child_pid, os.WNOHANG)
+                if waited == child_pid:
+                    assert os.waitstatus_to_exitcode(wait_status) == 0
+                    break
+                time.sleep(0.01)
+            else:
+                os.kill(child_pid, 9)
+                os.waitpid(child_pid, 0)
+                pytest.fail("real broker boundary did not terminate after revocation")
+        finally:
+            try:
+                waited, _status = os.waitpid(child_pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = child_pid
+            if waited == 0:
+                os.kill(child_pid, 9)
+                os.waitpid(child_pid, 0)
+            try:
+                os.close(json_r)
+            except OSError:
+                pass
+            status_receiver.close()
+            control_sender.close()
+            handoff_sender.close()
+            for fd in (policy_fd, bwrap_fd, *opened):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
