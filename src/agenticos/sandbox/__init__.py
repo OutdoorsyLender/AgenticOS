@@ -5,6 +5,14 @@ backends additionally compose measured cgroup, namespace, and Landlock
 boundaries and fail closed when their required host capabilities are absent.
 """
 
+from .host_qualification import (
+    HostQualificationError,
+    HostQualificationMismatchError,
+    canonical_manifest_bytes,
+    compute_host_manifest,
+    manifest_digest,
+    verify_host_manifest,
+)
 from .m4a_runner import NamespaceLandlockRunner
 from .network_models import (
     BrokerProcessEvidence,
@@ -32,10 +40,16 @@ __all__ = [
     "BrokerProcessEvidence",
     "BrokerReadyEvidence",
     "CapabilityTransportRunner",
+    "HostQualificationError",
+    "HostQualificationMismatchError",
     "ListenerEvidence",
     "NamespaceLandlockRunner",
     "TransportMode",
     "TransportPolicy",
+    "canonical_manifest_bytes",
     "canonical_policy_bytes",
+    "compute_host_manifest",
+    "manifest_digest",
     "policy_digest",
+    "verify_host_manifest",
 ]

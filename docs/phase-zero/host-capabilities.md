@@ -141,3 +141,52 @@ user/mount/PID/network/IPC/UTS namespace configuration, FD binds, JSON status,
 `--block-fd`, and nested-userns denial. The accepted recorded-host result is
 documented in [runtime-boundary.md](runtime-boundary.md). Capability discovery
 remains observation; every task re-gates before scope creation.
+
+## 10. Milestone 4B-2 host qualification manifest
+
+`agenticos.sandbox.host_qualification` converts the M4B-2 security claims
+from environmental assumptions into a canonical, digest-able **host
+qualification manifest** (`compute_host_manifest()`), plus a fail-closed
+verifier (`verify_host_manifest(recorded, observed)` /
+`verify_current_host(recorded)`) that rejects ANY divergence and reports
+exactly which dotted-path field changed (`HostQualificationMismatchError.mismatches`).
+There is no "log and continue" path.
+
+Each of the nine qualified components — `python`, `python_ssl`,
+`openssl_runtime`, `curl`, `git_https`, `gnutls`, `bubblewrap`, `kernel_wsl`,
+`ca_certificates` — records every applicable identity class, never a version
+string alone:
+
+- upstream version (e.g. `OpenSSL 3.5.5 27 Jan 2026`),
+- distro package revision (`dpkg-query` version, carrying the distro
+  security revision; Ubuntu exposes no offline machine-readable USN list, so
+  `security_patch_coverage` records the dpkg revision, or curl's own
+  `security patched:` suffix, and `not-recordable` where neither exists),
+- SHA-256 digest of each runtime executable/shared library actually used
+  (the loaded libssl/libcrypto are resolved from `/proc/self/maps`, not from
+  a guessed path; `git-remote-https` is resolved through its symlink),
+- compiled features — notably the loaded libssl's ECH posture: a ctypes
+  symbol probe requires that no `SSL_ech_*`/`SSL_CTX_set1_echstore`/
+  `OSSL_ech_get1_helper` acceptance machinery is exported
+  (`ech_machinery: absent`), failing closed at compute time otherwise,
+- behavior probes, fail-closed where authoritative: `ssl.OP_NO_RENEGOTIATION`
+  exposure, `MemoryBIO`/`SSLObject` availability, ALPN set/get, curl's
+  inability to emit ECH (`--ech false` must be refused by libcurl), full
+  memfd sealing (`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`
+  verified present via `F_GET_SEALS` plus a denied write attempt), and the
+  bubblewrap identity pin mirroring §9 (root-owned 0755, no setuid/setgid,
+  no file capabilities). The terminal-dot `getaddrinfo` behavior is recorded
+  as a capability only, with no network mutation.
+
+**Dual TLS stacks.** On the recorded host, curl HTTPS and Git HTTPS are two
+independent TLS client stacks: curl links `libcurl.so.4`/OpenSSL, while
+`git-remote-https` links `libcurl-gnutls.so.4`/GnuTLS (`libgnutls.so.30`).
+They are qualified as separate components (`curl` vs `git_https` + `gnutls`);
+qualifying curl never qualifies git.
+
+The manifest canonicalizes to sorted compact ASCII JSON
+(`canonical_manifest_bytes()`) with a SHA-256 digest (`manifest_digest()`),
+following the `network_models.py` canonical-policy pattern. All probing is
+read-only: no system modification, no package installation, no network
+mutation (the curl ECH probe targets `127.0.0.1:1` and is refused during
+option parsing; the resolver probe uses only the local `localhost.` name).
