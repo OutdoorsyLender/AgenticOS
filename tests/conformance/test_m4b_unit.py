@@ -5366,6 +5366,124 @@ def test_m4b_runner_owns_stable_live_process_observation():
     assert observed.netns > 0
 
 
+def test_m4b_normalized_evidence_includes_verified_boundary_and_excludes_locators():
+    runner = _m4b_runner()
+    broker = _network_broker()
+    models = _network_models()
+    inputs = _valid_m4b_coordinator_inputs(runner)
+    ready = broker.NetworkBrokerReadyRecord.from_bytes(
+        inputs.broker_ready_payloads[0]
+    )
+    policy = inputs.transport_policy
+    terminal = broker.NetworkTransportObservation(
+        version="AOSTRANSPORT/1",
+        event="NETWORK_TRANSPORT_TERMINATED",
+        task_id=policy.task_id,
+        task_generation=policy.task_generation,
+        launch_nonce=policy.launch_nonce,
+        policy_digest=models.policy_digest(policy),
+        observed_at_monotonic_ns=700,
+        connection_count=0,
+        accounted_bytes=0,
+        worker_to_fixture_bytes=0,
+        fixture_to_worker_bytes=0,
+        total_bytes=0,
+        discarded_unsent_bytes=0,
+        terminal_reason=broker.TransportTermination.DENY_NO_RELAY,
+    )
+    models_module = importlib.import_module("agenticos.sandbox.models")
+
+    payload = runner._build_normalized_transport_boundary_evidence(
+        supervisor_identity=models_module.ProcessIdentity(
+            pid=inputs.supervisor_initial.pid,
+            start_time_ticks=inputs.supervisor_initial.start_time_ticks,
+            boot_id=inputs.supervisor_initial.boot_id,
+        ),
+        supervisor_executable=inputs.expected_supervisor_identity,
+        worker_outer=inputs.worker_outer,
+        worker_namespace=inputs.worker_namespace,
+        broker_outer=inputs.broker_outer,
+        broker_resolved=inputs.broker_recheck,
+        ready=ready,
+        listener_evidence=ready.listener,
+        transport_policy=policy,
+        transport_observation=terminal,
+        filesystem_policy_digest=inputs.expected_filesystem_policy_digest,
+        launcher_outcome={
+            "progress": ["R", "L", "S", "I", "P", "N", "A"],
+            "abi": 3,
+            "handled_access_fs": 0x7FFF,
+            "identity_verified": True,
+            "policy_applied": True,
+            "exec_succeeded": True,
+        },
+        containment_state="TERMINATED",
+        cgroup_empty_verified=True,
+        scope_inactive_verified=True,
+    )
+
+    assert payload["milestone"] == "M4B-1"
+    assert payload["connected_build_authorized"] is False
+    assert payload["proxy_abi"] == "127.0.0.1:18080"
+    assert payload["broker_cgroup_verified"] is True
+    assert payload["listener_evidence_match"] is True
+    assert payload["broker"]["security_state"] == {
+        "cap_inheritable": 0,
+        "cap_permitted": 0,
+        "cap_effective": 0,
+        "cap_bounding": 0,
+        "cap_ambient": 0,
+        "no_new_privs": 1,
+    }
+    assert payload["terminal_transport"]["terminal_reason"] == "DENY_NO_RELAY"
+    assert payload["filesystem_policy"]["no_new_privs_set"] is True
+    assert payload["cleanup"] == {
+        "containment_state": "TERMINATED",
+        "recursive_cgroup_empty": True,
+        "scope_inactive_verified": True,
+    }
+    serialized = json.dumps(payload, sort_keys=True)
+    assert policy.task_id not in serialized
+    assert policy.launch_nonce not in serialized
+    assert inputs.worker_outer.boot_id not in serialized
+    assert inputs.expected_cgroup not in serialized
+    assert "/home/brand" not in serialized
+    assert "AOS_CANARY_" not in serialized
+
+    with pytest.raises(
+        runner.CapabilityTransportError,
+        match="launcher evidence",
+    ):
+        runner._build_normalized_transport_boundary_evidence(
+            supervisor_identity=models_module.ProcessIdentity(
+                pid=inputs.supervisor_initial.pid,
+                start_time_ticks=inputs.supervisor_initial.start_time_ticks,
+                boot_id=inputs.supervisor_initial.boot_id,
+            ),
+            supervisor_executable=inputs.expected_supervisor_identity,
+            worker_outer=inputs.worker_outer,
+            worker_namespace=inputs.worker_namespace,
+            broker_outer=inputs.broker_outer,
+            broker_resolved=inputs.broker_recheck,
+            ready=ready,
+            listener_evidence=ready.listener,
+            transport_policy=policy,
+            transport_observation=terminal,
+            filesystem_policy_digest=inputs.expected_filesystem_policy_digest,
+            launcher_outcome={
+                "progress": ["R", "L", "S", "I", "P", "A"],
+                "abi": 3,
+                "handled_access_fs": 0x7FFF,
+                "identity_verified": True,
+                "policy_applied": True,
+                "exec_succeeded": True,
+            },
+            containment_state="TERMINATED",
+            cgroup_empty_verified=True,
+            scope_inactive_verified=True,
+        )
+
+
 def test_m4b_runner_owned_descriptors_close_once_and_can_transfer():
     runner = _m4b_runner()
     first_r, first_w = os.pipe()

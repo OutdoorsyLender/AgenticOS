@@ -758,6 +758,71 @@ def test_real_host_fixed_proxy_relay_and_exact_worker_boundary(m4b_runner_factor
     _assert_no_m4b_residue(runner)
 
 
+def test_network_transport_evidence_is_normalized_and_emitted_after_cleanup(
+    m4b_runner_factory, layout, monkeypatch
+):
+    runner = m4b_runner_factory()
+    stopped_units = []
+    original_stop = runner.backend.stop_unit
+    original_emit = runner._emit
+
+    def observe_stop(unit):
+        result = original_stop(unit)
+        stopped_units.append(unit)
+        return result
+
+    def observe_emit(event, **payload):
+        if event == "NETWORK_TRANSPORT_BOUNDARY_VERIFIED":
+            assert any(
+                record.kind == "CGROUP_EMPTY_VERIFIED"
+                for record in runner.collector.records
+            )
+            assert len(stopped_units) == 1
+            assert runner.backend.unit_active(stopped_units[0]) is False
+        return original_emit(event, **payload)
+
+    monkeypatch.setattr(runner.backend, "stop_unit", observe_stop)
+    monkeypatch.setattr(runner, "_emit", observe_emit)
+    process, observed = _run_with_fixture(
+        runner,
+        _worker_argv(
+            "--scenario", "M4B-01", "--canary", "AOS_CANARY_TASK7_PAYLOAD"
+        ),
+    )
+    assert process.exit_code == 0
+    assert observed == [b"AOS_CANARY_TASK7_PAYLOAD"]
+    records = [
+        record
+        for record in runner.collector.records
+        if record.kind == "NETWORK_TRANSPORT_BOUNDARY_VERIFIED"
+    ]
+    assert len(records) == 1
+    payload = records[0].payload
+    assert payload["milestone"] == "M4B-1"
+    assert payload["connected_build_authorized"] is False
+    assert payload["proxy_abi"] == "127.0.0.1:18080"
+    assert payload["broker_cgroup_verified"] is True
+    assert payload["listener_evidence_match"] is True
+    assert payload["terminal_transport"] == {
+        "observed_at_monotonic_ns": runner.last_transport_observation.observed_at_monotonic_ns,
+        "connection_count": 1,
+        "accounted_bytes": len(b"AOS_CANARY_TASK7_PAYLOADfixture-reply"),
+        "worker_to_fixture_bytes": len(b"AOS_CANARY_TASK7_PAYLOAD"),
+        "fixture_to_worker_bytes": len(b"fixture-reply"),
+        "forwarded_total_bytes": len(b"AOS_CANARY_TASK7_PAYLOADfixture-reply"),
+        "discarded_unsent_bytes": 0,
+        "terminal_reason": "COMPLETED",
+    }
+    serialized = json.dumps(payload, sort_keys=True)
+    assert str(layout.root) not in serialized
+    assert str(layout.assigned_worktree) not in serialized
+    assert runner.transport_policy.task_id not in serialized
+    assert runner.transport_policy.launch_nonce not in serialized
+    assert runner.last_broker_process.boot_id not in serialized
+    assert runner.last_broker_process.cgroup not in serialized
+    assert "AOS_CANARY_" not in serialized
+
+
 def test_residue_scan_rejects_exact_listener_object_held_by_same_uid(
     m4b_runner_factory
 ):

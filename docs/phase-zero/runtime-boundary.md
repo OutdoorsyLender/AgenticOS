@@ -13,6 +13,12 @@ This is a host-specific L1/L2 tool-execution result, not a complete sandbox,
 native-Windows claim, provider-safety claim, seccomp claim, malicious-kernel
 defense, arbitrary-Linux equivalence, or L3 network-allowlisting result.
 
+M4B-1 composes one fixed listener/fixture capability with this boundary without
+weakening its filesystem, credential, FD, namespace, or cleanup guarantees.
+That measured extension is documented in
+[connected-build-boundary.md](connected-build-boundary.md). It is not a
+Connected Build authorization.
+
 ## Trust and launch order
 
 Host path strings are locators. Opened object identity is authority.
@@ -156,5 +162,7 @@ hostile-fixture results rather than ambient host enumeration.
   character device; no arbitrary synthetic-root language exists.
 - Capability evidence uses `capget()`/`prctl()` because Landlock intentionally
   denies hostile procfs reads.
+- M4B-1 adds only a fixed synthetic capability relay. M4B-2 DNS/TLS/destination
+  policy remains unavailable pending its dependency and ECH gate.
 
 Models reason. AgenticOS guarantees.

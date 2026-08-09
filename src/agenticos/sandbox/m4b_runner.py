@@ -123,6 +123,26 @@ EV_POLICY_PREPARED = "FILESYSTEM_POLICY_PREPARED"
 EV_NO_NEW_PRIVS = "NO_NEW_PRIVS_SET"
 EV_POLICY_APPLIED = "FILESYSTEM_POLICY_APPLIED"
 EV_WORKER_EXEC_ATTEMPTED = "WORKER_EXEC_ATTEMPTED"
+EV_TRANSPORT_BOUNDARY_VERIFIED = "NETWORK_TRANSPORT_BOUNDARY_VERIFIED"
+
+_AUTHENTICATED_GATE_ORDER = (
+    EV_CONTAINMENT_VERIFIED,
+    EV_NAMESPACE_VERIFIED,
+    EV_BROKER_PROCESS_VERIFIED,
+    "NAMESPACE_GATE_RELEASED",
+    EV_LAUNCHER_ENTERED,
+    "LAUNCHER_SETUP_GATE_RELEASED",
+    EV_LISTENER_EXPORTED,
+    EV_BROKER_READY,
+    "NETWORK_CLOSE_GATE_RELEASED",
+    EV_FD_SANITIZED,
+    EV_IDENTITIES_VERIFIED,
+    EV_POLICY_PREPARED,
+    EV_NO_NEW_PRIVS,
+    EV_POLICY_APPLIED,
+    "FINAL_EXEC_GATE_RELEASED",
+    EV_WORKER_EXEC_ATTEMPTED,
+)
 
 _MAX_SUPERVISOR_STATUS_BYTES = 128
 _SUPERVISOR_PID_RE = re.compile(
@@ -1187,6 +1207,32 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 raise ContainmentUnavailableError(
                     "M4B task cleanup did not reach proven TERMINATED state"
                 )
+            if self.last_transport_observation is None:
+                raise CapabilityTransportError(
+                    "authenticated terminal transport observation is missing"
+                )
+            self._emit(
+                EV_TRANSPORT_BOUNDARY_VERIFIED,
+                **_build_normalized_transport_boundary_evidence(
+                    supervisor_identity=identity,
+                    supervisor_executable=prepared.expected_supervisor_identity,
+                    worker_outer=authority.worker_outer,
+                    worker_namespace=worker_namespace,
+                    broker_outer=authority.broker_outer,
+                    broker_resolved=authority.broker_recheck,
+                    ready=coordinated.ready,
+                    listener_evidence=self.last_listener_evidence,
+                    transport_policy=self.transport_policy,
+                    transport_observation=self.last_transport_observation,
+                    filesystem_policy_digest=(
+                        prepared.runtime_plan.combined_policy_digest
+                    ),
+                    launcher_outcome=outcome,
+                    containment_state=containment_state,
+                    cgroup_empty_verified=True,
+                    scope_inactive_verified=True,
+                ),
+            )
             finished_at = utc_now_iso()
             return self._assemble_process_result(
                 proc=proc,
@@ -1268,6 +1314,282 @@ class _CoordinatorOperations:
     verify_worker_marker_absent: Callable[[], bool]
     transition: Callable[[str], None]
     controller_write: Callable[[str, bytes], None]
+
+
+def _digest_binding(domain: str, value: str) -> str:
+    if type(domain) is not str or type(value) is not str:
+        _reject("evidence digest input is invalid")
+    return hashlib.sha256(
+        domain.encode("ascii") + b"\0" + value.encode("utf-8")
+    ).hexdigest()
+
+
+def _file_identity_evidence(identity: FileIdentity | ObservedFileIdentity) -> dict:
+    if type(identity) not in (FileIdentity, ObservedFileIdentity):
+        _reject("evidence file identity has the wrong exact type")
+    return {
+        "device": identity.device,
+        "inode": identity.inode,
+        "file_type": identity.file_type,
+    }
+
+
+def _observed_process_evidence(process: _ObservedProcess) -> dict:
+    if type(process) is not _ObservedProcess:
+        _reject("evidence process observation has the wrong exact type")
+    return {
+        "pid": process.pid,
+        "start_time_ticks": process.start_time_ticks,
+        "boot_id_digest": _digest_binding(
+            "agenticos:m4b:boot-id:v1", process.boot_id
+        ),
+        "executable_identity": _file_identity_evidence(
+            process.executable_identity
+        ),
+        "netns": process.netns,
+    }
+
+
+def _build_normalized_transport_boundary_evidence(
+    *,
+    supervisor_identity: ProcessIdentity,
+    supervisor_executable: FileIdentity,
+    worker_outer: _ObservedProcess,
+    worker_namespace: NamespaceEvidence,
+    broker_outer: _ObservedProcess,
+    broker_resolved: _ObservedProcess,
+    ready: NetworkBrokerReadyRecord,
+    listener_evidence,
+    transport_policy: TransportPolicy,
+    transport_observation: NetworkTransportObservation,
+    filesystem_policy_digest: str,
+    launcher_outcome: Mapping,
+    containment_state: str,
+    cgroup_empty_verified: bool,
+    scope_inactive_verified: bool,
+) -> dict:
+    """Build the non-secret M4B-1 terminal record from authenticated facts."""
+    if (
+        type(supervisor_identity) is not ProcessIdentity
+        or type(supervisor_executable) is not FileIdentity
+        or type(worker_namespace) is not NamespaceEvidence
+        or type(ready) is not NetworkBrokerReadyRecord
+        or type(transport_policy) is not TransportPolicy
+        or type(transport_observation) is not NetworkTransportObservation
+        or type(launcher_outcome) is not dict
+        or listener_evidence != ready.listener
+    ):
+        _reject("normalized transport evidence inputs are unauthenticated")
+    if (
+        supervisor_identity.start_time_ticks is None
+        or supervisor_identity.boot_id is None
+        or supervisor_identity.pid != worker_outer.pid
+        or supervisor_identity.start_time_ticks != worker_outer.start_time_ticks
+        or supervisor_identity.boot_id != worker_outer.boot_id
+    ):
+        _reject("supervisor and worker process identity evidence disagrees")
+    exact_cgroup = worker_namespace.child.cgroup
+    if (
+        worker_namespace.verified is not True
+        or any(
+            observed != exact_cgroup
+            for observed in (
+                worker_outer.cgroup,
+                broker_outer.cgroup,
+                broker_resolved.cgroup,
+                ready.boundary.cgroup,
+            )
+        )
+    ):
+        _reject("terminal process cgroup evidence disagrees")
+    if (
+        ready.process.start_time_ticks != broker_resolved.start_time_ticks
+        or ready.process.boot_id != broker_resolved.boot_id
+        or ready.ready.broker_start_time_ticks != broker_resolved.start_time_ticks
+        or ready.ready.broker_boot_id != broker_resolved.boot_id
+    ):
+        _reject("terminal broker process identity evidence disagrees")
+    expected_policy_digest = policy_digest(transport_policy)
+    if (
+        ready.ready.task_id != transport_policy.task_id
+        or ready.ready.task_generation != transport_policy.task_generation
+        or ready.ready.launch_nonce != transport_policy.launch_nonce
+        or ready.ready.policy_digest != expected_policy_digest
+        or transport_observation.task_id != transport_policy.task_id
+        or transport_observation.task_generation
+        != transport_policy.task_generation
+        or transport_observation.launch_nonce != transport_policy.launch_nonce
+        or transport_observation.policy_digest != expected_policy_digest
+    ):
+        _reject("terminal transport authority binding disagrees")
+    proc_status = ready.boundary.proc_status
+    if proc_status != ProcStatusEvidence(0, 0, 0, 0, 0, 1):
+        _reject("terminal broker security state is not least authority")
+    if (
+        containment_state != ContainmentState.TERMINATED.value
+        or cgroup_empty_verified is not True
+        or scope_inactive_verified is not True
+    ):
+        _reject("terminal cleanup evidence is incomplete")
+    if (
+        launcher_outcome.get("failed_stage") is not None
+        or launcher_outcome.get("progress")
+        != ["R", "L", "S", "I", "P", "N", "A"]
+        or launcher_outcome.get("identity_verified") is not True
+        or launcher_outcome.get("policy_applied") is not True
+        or launcher_outcome.get("exec_succeeded") is not True
+    ):
+        _reject("terminal launcher evidence is incomplete")
+
+    authority_binding = json.dumps(
+        {
+            "launch_nonce": transport_policy.launch_nonce,
+            "policy_digest": expected_policy_digest,
+            "task_generation": transport_policy.task_generation,
+            "task_id": transport_policy.task_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cgroup_digest = _digest_binding(
+        "agenticos:m4b:cgroup:v1", exact_cgroup
+    )
+    broker_namespaces = dict(ready.boundary.namespaces)
+    security_state = {
+        "cap_inheritable": proc_status.cap_inheritable,
+        "cap_permitted": proc_status.cap_permitted,
+        "cap_effective": proc_status.cap_effective,
+        "cap_bounding": proc_status.cap_bounding,
+        "cap_ambient": proc_status.cap_ambient,
+        "no_new_privs": proc_status.no_new_privs,
+    }
+    return {
+        "milestone": "M4B-1",
+        "connected_build_authorized": False,
+        "proxy_abi": "127.0.0.1:18080",
+        "authority": {
+            "task_generation": transport_policy.task_generation,
+            "policy_digest": expected_policy_digest,
+            "binding_digest": _digest_binding(
+                "agenticos:m4b:authority:v1", authority_binding
+            ),
+            "readiness_binding_match": True,
+            "terminal_binding_match": True,
+        },
+        "supervisor": {
+            "process": {
+                "pid": supervisor_identity.pid,
+                "start_time_ticks": supervisor_identity.start_time_ticks,
+                "boot_id_digest": _digest_binding(
+                    "agenticos:m4b:boot-id:v1", supervisor_identity.boot_id
+                ),
+            },
+            "executable_identity": _file_identity_evidence(
+                supervisor_executable
+            ),
+            "stable_exec_identity_match": True,
+        },
+        "worker": {
+            "outer_process": _observed_process_evidence(worker_outer),
+            "namespace_process_pid": worker_namespace.child.pid,
+            "namespaces": dict(worker_namespace.child.identities),
+            "cgroup_binding_digest": cgroup_digest,
+            "cgroup_membership_verified": True,
+            "cwd": "/workspace",
+        },
+        "broker": {
+            "outer_process": _observed_process_evidence(broker_outer),
+            "resolved_process": _observed_process_evidence(broker_resolved),
+            "readiness_process": {
+                "namespace_pid": ready.process.pid,
+                "start_time_ticks": ready.process.start_time_ticks,
+                "boot_id_digest": _digest_binding(
+                    "agenticos:m4b:boot-id:v1", ready.process.boot_id
+                ),
+            },
+            "namespaces": broker_namespaces,
+            "cgroup_binding_digest": cgroup_digest,
+            "security_state": security_state,
+            "fixed_fd_numbers": list(ready.boundary.fd_numbers),
+            "environment": {
+                "names": list(ready.boundary.environment.names),
+                "digest": ready.boundary.environment.digest,
+            },
+            "filesystem_digest": ready.boundary.filesystem_digest,
+            "source_identities": {
+                "runtime": _file_identity_evidence(ready.runtime_identity),
+                "broker_code": _file_identity_evidence(
+                    ready.broker_code_identity
+                ),
+                "identity_code": _file_identity_evidence(
+                    ready.identity_code_identity
+                ),
+                "models_code": _file_identity_evidence(
+                    ready.models_code_identity
+                ),
+                "interpreter": _file_identity_evidence(
+                    ready.interpreter_identity
+                ),
+            },
+            "sealed_policy": {
+                "device": ready.sealed_policy.device,
+                "inode": ready.sealed_policy.inode,
+                "size": ready.sealed_policy.size,
+                "seals": ready.sealed_policy.seals,
+            },
+        },
+        "broker_cgroup_verified": True,
+        "listener": {
+            "family": ready.listener.family,
+            "socket_type": ready.listener.socket_type,
+            "address": ready.listener.address,
+            "port": ready.listener.port,
+            "device": ready.listener.device,
+            "inode": ready.listener.inode,
+            "file_type": ready.listener.file_type,
+            "netns_cookie": ready.listener.netns_cookie,
+            "accepting": ready.listener.accepting,
+        },
+        "listener_evidence_match": True,
+        "readiness": {
+            "ready_at_monotonic_ns": ready.ready.ready_at_monotonic_ns,
+            "ready_before_namespace_release": False,
+            "authenticated_gate_order": list(_AUTHENTICATED_GATE_ORDER),
+            "gate_order_verified": True,
+        },
+        "filesystem_policy": {
+            "combined_policy_digest": filesystem_policy_digest,
+            "landlock_abi": launcher_outcome.get("abi"),
+            "handled_access_fs": launcher_outcome.get("handled_access_fs"),
+            "no_new_privs_set": True,
+            "identity_verified": True,
+            "policy_applied": True,
+            "exec_succeeded": True,
+        },
+        "terminal_transport": {
+            "observed_at_monotonic_ns": (
+                transport_observation.observed_at_monotonic_ns
+            ),
+            "connection_count": transport_observation.connection_count,
+            "accounted_bytes": transport_observation.accounted_bytes,
+            "worker_to_fixture_bytes": (
+                transport_observation.worker_to_fixture_bytes
+            ),
+            "fixture_to_worker_bytes": (
+                transport_observation.fixture_to_worker_bytes
+            ),
+            "forwarded_total_bytes": transport_observation.total_bytes,
+            "discarded_unsent_bytes": (
+                transport_observation.discarded_unsent_bytes
+            ),
+            "terminal_reason": transport_observation.terminal_reason.value,
+        },
+        "cleanup": {
+            "containment_state": containment_state,
+            "recursive_cgroup_empty": True,
+            "scope_inactive_verified": True,
+        },
+    }
 
 
 def _reject(message: str) -> None:

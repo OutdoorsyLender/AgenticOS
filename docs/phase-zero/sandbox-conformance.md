@@ -186,3 +186,23 @@ inner launch policy.
 The full M4A architecture, evidence fields, adversarial matrix, and limitations
 are recorded in [runtime-boundary.md](runtime-boundary.md). The durable next
 steps and authentication-ownership rules are in [../roadmap.md](../roadmap.md).
+
+## Milestone 4B-1 additions
+
+The corpus now measures one production fixed-loopback listener capability,
+authenticated transfer to a least-authority sibling broker, a bounded
+controller-provided synthetic fixture relay, terminal byte accounting,
+revocation/expiry/limit behavior, and recursive broker/worker cleanup. Positive
+traffic remains local and synthetic; no public service or real credential is
+used.
+
+Successful M4B-1 runs emit normalized
+`NETWORK_TRANSPORT_BOUNDARY_VERIFIED` evidence only after recursive cgroup
+emptiness and the scope is stopped and confirmed inactive. The record explicitly carries
+`connected_build_authorized=false` and excludes raw task/nonce/boot/cgroup
+bindings, host locators, environment values, canaries, and transport payloads.
+
+The measured boundary and adversarial matrix are in
+[connected-build-boundary.md](connected-build-boundary.md). M4B-1 earns no
+Connected Build claim. M4B-2 is unavailable until its dependency and ECH gate
+passes and a separate design is approved.

@@ -1,12 +1,16 @@
 # AgenticOS Roadmap
 
-M4A closes the measured L1/L2 tool-execution boundary. The following work is
-ordered but intentionally not implemented by M4A.
+M4A closes the measured L1/L2 tool-execution boundary. M4B-1 now proves the
+fixed capability-transport and lifecycle substrate described in
+[phase-zero/connected-build-boundary.md](phase-zero/connected-build-boundary.md).
+M4B-1 does not authorize Connected Build.
 
 ## P0 next
 
-1. **M4B Connected Build** — explicit destination allowlists, protocol/host/
-   port approval, DNS policy, network broker, and auditable L3 package access.
+1. **M4B-2 Connected Build policy** — unavailable until its pinned dependency
+   report and ECH gate pass, followed by separate architecture approval. Future
+   scope includes explicit destination allowlists, protocol/host/port approval,
+   DNS/IP policy, TLS verification, redirects, and auditable package access.
 2. **Git worktree manager** — identity-bound assignment, lifecycle, cleanup,
    and the `/workspace` mapping contract.
 3. **Provider adapters** — Codex, Claude, Kimi ACP, then Antigravity in a
