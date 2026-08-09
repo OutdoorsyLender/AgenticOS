@@ -190,3 +190,42 @@ following the `network_models.py` canonical-policy pattern. All probing is
 read-only: no system modification, no package installation, no network
 mutation (the curl ECH probe targets `127.0.0.1:1` and is refused during
 option parsing; the resolver probe uses only the local `localhost.` name).
+
+## 11. M4B-2 frozen IANA special-address registry provenance
+
+Slice 7 (`agenticos.sandbox.special_addresses`) freezes an explicit,
+versioned destination-address policy derived from the IANA Special-Purpose
+Address Registries. The registry fetch is a deliberate, one-time data
+freeze and the only sanctioned network use in that module's history; the
+runtime policy itself is a static table requiring no network.
+
+- IPv4 source:
+  <https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry-1.csv>
+- IPv6 source:
+  <https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry-1.csv>
+- Registry revision ("Last Updated" on both registry pages): `2025-10-09`
+- Fetch date (UTC): `2026-08-09`
+- SHA-256 of fetched IPv4 CSV:
+  `e3e39e76d00b1677335db8e9a805c7b9480ea2f4dc9e33f0b93cd3a905128d73`
+- SHA-256 of fetched IPv6 CSV:
+  `775feea0621dec8735a44fbf30f762e721e8f0a1b3ab7eb341961a88cfce2139`
+- A prior research snapshot was dated `2025-10-09`. The current registry
+  revision is also `2025-10-09` (unchanged since the snapshot); both facts
+  are recorded. The frozen table was re-verified row-for-row against the
+  fetched CSVs at implementation time (every registry row present, every
+  "Globally Reachable" column value transcribed verbatim).
+
+Policy rule: PROHIBIT rather than interpret. Every entry whose IANA
+"Globally Reachable" column is False, N/A, or blank is prohibited; the
+entries marked True (anycast signaling/sinkhole services, NAT64 WKP,
+ORCHIDv2, Drone Remote ID DETs) were each reviewed deliberately — none is
+a clearly global-unicast HTTPS origin case, so the MVP prohibits them too.
+Transition/embedded forms (IPv4-mapped, NAT64 well-known + local-use,
+6to4, Teredo, IPv4-compatible) are prohibited outright, with
+defense-in-depth embedded-IPv4 extraction re-checked against the IPv4
+table. Multicast (224.0.0.0/4, ff00::/8) and IPv4-compatible (::/96) are
+supplementary milestone-mandated rows not present in the special-purpose
+registries. The bound policy version is
+`AOSADDR/1+iana-ipv4-2025-10-09+iana-ipv6-2025-10-09`
+(`ADDRESS_POLICY_VERSION`), chained into the resolver stage as
+`AOSRESOLVE/1+...` (`RESOLUTION_POLICY_VERSION`) for evidence binding.
