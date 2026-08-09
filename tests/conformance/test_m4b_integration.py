@@ -530,7 +530,10 @@ def test_active_full_duplex_relay_revoke_blocks_post_terminal_canary():
         assert workers[0].recv(256) == b"PRE_REVOKE_FIXTURE"
         control.sendall(CONTROL_REVOKE)
         thread.join(timeout=3.0)
-        assert result == [TransportTermination.REVOKED]
+        assert len(result) == 1
+        assert result[0].terminal_reason is TransportTermination.REVOKED
+        assert result[0].worker_to_fixture_bytes == len(b"PRE_REVOKE_WORKER")
+        assert result[0].fixture_to_worker_bytes == len(b"PRE_REVOKE_FIXTURE")
         try:
             workers[0].sendall(b"POST_REVOKE_CANARY")
         except OSError:
@@ -555,7 +558,9 @@ def test_active_full_duplex_absolute_expiry_blocks_post_terminal_canary():
         workers[0].settimeout(2.0)
         assert workers[0].recv(256) == b"PRE_EXPIRY_FIXTURE"
         thread.join(timeout=3.0)
-        assert result == [TransportTermination.EXPIRED]
+        assert len(result) == 1
+        assert result[0].terminal_reason is TransportTermination.EXPIRED
+        assert result[0].observed_at_monotonic_ns > 0
         try:
             workers[0].sendall(b"POST_EXPIRY_CANARY")
         except OSError:
@@ -579,7 +584,9 @@ def test_revoke_cancels_open_half_closed_connection_without_fixture_bytes():
     control.sendall(CONTROL_REVOKE)
     thread.join(timeout=3.0)
     try:
-        assert result == [TransportTermination.REVOKED]
+        assert len(result) == 1
+        assert result[0].terminal_reason is TransportTermination.REVOKED
+        assert result[0].worker_to_fixture_bytes == len(b"PRE_TERMINAL")
         _assert_no_fixture_bytes(fixture)
         workers[0].settimeout(0.2)
         assert workers[0].recv(1) == b""
@@ -606,7 +613,9 @@ def test_expiry_cancels_active_half_closed_connection_without_late_bytes():
             received.extend(chunk)
         assert bytes(received) == b"PRE_EXPIRY_HALF_CLOSE"
         thread.join(timeout=3.0)
-        assert result == [TransportTermination.EXPIRED]
+        assert len(result) == 1
+        assert result[0].terminal_reason is TransportTermination.EXPIRED
+        assert result[0].worker_to_fixture_bytes == len(b"PRE_EXPIRY_HALF_CLOSE")
         try:
             fixture.sendall(b"POST_EXPIRY_HALF_CLOSE_CANARY")
         except OSError:
@@ -650,7 +659,10 @@ def test_worker_fin_is_forwarded_before_eof_dependent_fixture_response():
         assert bytes(response) == b"EOF_DEPENDENT_RESPONSE"
         control.sendall(CONTROL_REVOKE)
         thread.join(timeout=3.0)
-        assert result == [TransportTermination.REVOKED]
+        assert len(result) == 1
+        assert result[0].terminal_reason is TransportTermination.COMPLETED
+        assert result[0].worker_to_fixture_bytes == len(b"REQUEST_THEN_FIN")
+        assert result[0].fixture_to_worker_bytes == len(b"EOF_DEPENDENT_RESPONSE")
     finally:
         _close_relay(resources[:-2])
 
@@ -664,7 +676,9 @@ def test_second_queued_connection_terminates_one_connection_capability():
     thread.start()
     thread.join(timeout=3.0)
     try:
-        assert result == [TransportTermination.CONNECTION_LIMIT]
+        assert len(result) == 1
+        assert result[0].terminal_reason is TransportTermination.CONNECTION_LIMIT
+        assert result[0].connection_count == 1
         _assert_no_fixture_bytes(fixture)
     finally:
         _close_relay(resources[:-2])
@@ -729,6 +743,12 @@ def test_real_host_fixed_proxy_relay_and_exact_worker_boundary(m4b_runner_factor
     assert namespace.child.identities["net"] != broker.netns
     assert runner.last_listener_evidence.port == 18080
     assert runner.last_listener_evidence.netns_cookie > 0
+    transport = runner.last_transport_observation
+    assert transport.connection_count == 1
+    assert transport.worker_to_fixture_bytes == len(b"M4B_REAL_CANARY")
+    assert transport.fixture_to_worker_bytes == len(b"fixture-reply")
+    assert transport.total_bytes == len(b"M4B_REAL_CANARYfixture-reply")
+    assert transport.terminal_reason.value == "COMPLETED"
     mapping = runner.last_broker_identity_mapping
     assert mapping["readiness_namespace_pid"] == 2
     assert mapping["supervisor_broker_outer_pid"] != mapping["bwrap_setup_child_pid"]
@@ -974,12 +994,72 @@ def test_timeout_cancels_active_open_half_closed_relay(
         assert half_closed.wait(2.0)
         assert process.timed_out is True
         assert process.containment_state == ContainmentState.TERMINATED.value
+        observation = runner.last_transport_observation
+        assert observation.terminal_reason.value == "REVOKED"
+        assert observation.connection_count == 1
+        assert observation.worker_to_fixture_bytes == len(b"HALF_CLOSE_TIMEOUT")
+        assert observation.total_bytes <= observation.accounted_bytes
     finally:
         release.set()
         broker.close()
         thread.join(timeout=5.0)
         fixture.close()
     assert not thread.is_alive()
+    _assert_no_m4b_residue(runner)
+
+
+def test_timeout_missing_terminal_record_starts_cancel_within_one_shared_grace(
+    m4b_runner_factory, monkeypatch
+):
+    import agenticos.sandbox.m4b_runner as runner_module
+
+    runner = m4b_runner_factory(TransportMode.DENY)
+    budgets = []
+    cancel_started = []
+    terminal_grace_started = []
+    original_cancel = runner._cancel
+
+    def unresponsive_revoke(_fd, *, budget):
+        terminal_grace_started.append(time.monotonic())
+        budgets.append(budget)
+        time.sleep(min(0.7, budget))
+
+    def missing_observation(_fd, *, expected_policy, expected_policy_digest, budget):
+        del expected_policy, expected_policy_digest
+        budgets.append(budget)
+        time.sleep(budget)
+        raise runner_module.CapabilityTransportError(
+            "injected missing terminal observation"
+        )
+
+    def observe_cancel(*args, **kwargs):
+        cancel_started.append(time.monotonic())
+        return original_cancel(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_revoke_broker_control", unresponsive_revoke)
+    monkeypatch.setattr(
+        runner_module,
+        "_read_authenticated_transport_observation",
+        missing_observation,
+    )
+    monkeypatch.setattr(runner, "_cancel", observe_cancel)
+    with pytest.raises(
+        runner_module.CapabilityTransportError,
+        match="injected missing terminal observation",
+    ):
+        runner.run(
+            ["/usr/bin/python3", "-c", "import time; time.sleep(30)"],
+            cwd="/workspace",
+            env={},
+            timeout=0.1,
+        )
+
+    assert len(budgets) == 2
+    assert budgets[0] <= 1.0
+    assert budgets[1] <= 0.35
+    assert len(cancel_started) >= 1
+    assert len(terminal_grace_started) == 1
+    assert cancel_started[0] - terminal_grace_started[0] < 1.05
     _assert_no_m4b_residue(runner)
 
 

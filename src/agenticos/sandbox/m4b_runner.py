@@ -73,10 +73,13 @@ from .network_broker import (
     EnvironmentEvidence,
     INTERPRETER_PATH,
     MAX_READY_BYTES,
+    MAX_TRANSPORT_OBSERVATION_BYTES,
     NetworkBrokerReadyRecord,
+    NetworkTransportObservation,
     ObservedFileIdentity,
     ProcStatusEvidence,
     SealedPolicyEvidence,
+    TransportTermination,
     validate_broker_environment,
     validate_fixture_fd,
 )
@@ -297,6 +300,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         )
         self.transport_policy = transport_policy
         self.supervisor_path = Path(supervisor_path)
+        self.last_transport_observation: NetworkTransportObservation | None = None
 
     def _claim_transport_authority(self) -> None:
         """Consume exact policy authority once per controller-process lifetime.
@@ -781,6 +785,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         self.last_broker_process = None
         self.last_listener_evidence = None
         self.last_broker_identity_mapping = None
+        self.last_transport_observation = None
         self.last_launch_outcome = outcome
 
         try:
@@ -1080,12 +1085,47 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 )
             except subprocess.TimeoutExpired as timeout_error:
                 timed_out = True
-                cancellation_state = self._cancel(scope, cgroup_path, proc)
+                terminal_error: BaseException | None = None
+                terminal_deadline = time.monotonic() + min(
+                    self.setup_timeout, 1.0
+                )
+
+                def remaining_terminal_budget() -> float:
+                    remaining = terminal_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CapabilityTransportError(
+                            "terminal observation grace expired"
+                        )
+                    return remaining
+
+                try:
+                    _revoke_broker_control(
+                        prepared.broker_control_w,
+                        budget=remaining_terminal_budget(),
+                    )
+                    self.last_transport_observation = (
+                        _read_authenticated_transport_observation(
+                            prepared.broker_control_w,
+                            expected_policy=self.transport_policy,
+                            expected_policy_digest=policy_digest(
+                                self.transport_policy
+                            ),
+                            budget=remaining_terminal_budget(),
+                        )
+                    )
+                except BaseException as exc:
+                    terminal_error = exc
+                finally:
+                    cancellation_state = self._cancel(scope, cgroup_path, proc)
                 if cancellation_state is not ContainmentState.TERMINATED:
                     raise ContainmentUnavailableError(
                         "timed-out M4B task cleanup was not proven"
                     )
+                if terminal_error is not None:
+                    raise terminal_error
                 containment_state = cancellation_state.value
+                owned.release(prepared.broker_control_w)
+                os.close(prepared.broker_control_w)
                 trailing_out, trailing_err = self._communicate_process(
                     proc, self.setup_timeout
                 )
@@ -1111,14 +1151,22 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                         )
                     except (BrokenPipeError, ConnectionResetError):
                         _require_broker_gone(authority)
-                owned.release(prepared.broker_control_w)
-                os.close(prepared.broker_control_w)
                 trailing_out, trailing_err = self._communicate_process(
                     proc, self.setup_timeout
                 )
                 out_b, err_b = _combine_captured_output(
                     first_out, first_err, trailing_out, trailing_err
                 )
+                self.last_transport_observation = (
+                    _read_authenticated_transport_observation(
+                        prepared.broker_control_w,
+                        expected_policy=self.transport_policy,
+                        expected_policy_digest=policy_digest(self.transport_policy),
+                        budget=self.setup_timeout,
+                    )
+                )
+                owned.release(prepared.broker_control_w)
+                os.close(prepared.broker_control_w)
             if cgroup_path is not None and not wait_cgroup_empty(
                 self.backend,
                 cgroup_path,
@@ -1592,6 +1640,164 @@ def _close_received_rights(
                 os.close(received_fd)
             except OSError:
                 pass
+
+
+def _read_authenticated_transport_observation(
+    fd: int,
+    *,
+    expected_policy: TransportPolicy,
+    expected_policy_digest: str,
+    budget: float,
+) -> NetworkTransportObservation:
+    """Read exactly one terminal broker record and authenticate its authority."""
+    if type(fd) is not int or fd < 0 or type(expected_policy) is not TransportPolicy:
+        _reject("transport observation authority is invalid")
+    if expected_policy_digest != policy_digest(expected_policy):
+        _reject("transport observation expected policy digest is invalid")
+    deadline = time.monotonic() + budget
+    channel = socket.socket(fileno=os.dup(fd))
+    ancillary_size = socket.CMSG_SPACE(array.array("i").itemsize * 8)
+    try:
+        while time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            ready, _, _ = select.select(
+                [channel], [], [], min(0.1, remaining)
+            )
+            if not ready:
+                continue
+            payload, ancillary, flags, _address = channel.recvmsg(
+                MAX_TRANSPORT_OBSERVATION_BYTES + 1,
+                ancillary_size,
+                socket.MSG_CMSG_CLOEXEC,
+            )
+            _close_received_rights(ancillary)
+            if not payload:
+                _reject("broker control channel closed before terminal observation")
+            if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+                _reject("transport observation exceeded its bound")
+            allowed_flags = socket.MSG_CMSG_CLOEXEC | socket.MSG_EOR
+            if flags & ~allowed_flags or ancillary:
+                _reject("transport observation carried unauthorized metadata")
+            try:
+                record = NetworkTransportObservation.from_bytes(payload)
+            except BaseException as exc:
+                raise CapabilityTransportError(
+                    "transport observation is invalid"
+                ) from exc
+            if (
+                record.task_id != expected_policy.task_id
+                or record.task_generation != expected_policy.task_generation
+                or record.launch_nonce != expected_policy.launch_nonce
+                or record.policy_digest != expected_policy_digest
+            ):
+                _reject("transport observation does not match launch authority")
+            if (
+                record.connection_count > expected_policy.connection_limit
+                or record.accounted_bytes > expected_policy.byte_limit
+                or record.total_bytes > record.accounted_bytes
+            ):
+                _reject("transport observation exceeds policy authority")
+            if record.observed_at_monotonic_ns < (
+                expected_policy.activated_at_monotonic_ns
+            ):
+                _reject("transport observation precedes policy activation")
+            if record.terminal_reason.value == "EXPIRED":
+                if record.observed_at_monotonic_ns < (
+                    expected_policy.expires_at_monotonic_ns
+                ):
+                    _reject("transport expiry observation is premature")
+            elif record.observed_at_monotonic_ns >= (
+                expected_policy.expires_at_monotonic_ns
+            ):
+                _reject("transport terminal observation is after policy expiry")
+            if expected_policy.mode is TransportMode.DENY:
+                if (
+                    record.terminal_reason
+                    is not TransportTermination.DENY_NO_RELAY
+                    or record.connection_count != 0
+                    or record.accounted_bytes != 0
+                ):
+                    _reject("DENY policy terminal observation is incompatible")
+            else:
+                if record.terminal_reason is TransportTermination.DENY_NO_RELAY:
+                    _reject("synthetic transport reported DENY terminal semantics")
+                if record.terminal_reason in {
+                    TransportTermination.COMPLETED,
+                    TransportTermination.BYTE_LIMIT,
+                    TransportTermination.CONNECTION_LIMIT,
+                } and record.connection_count != 1:
+                    _reject("transport terminal reason requires one accepted connection")
+                if (
+                    record.terminal_reason is TransportTermination.BYTE_LIMIT
+                    and record.accounted_bytes != expected_policy.byte_limit
+                ):
+                    _reject("byte-limit terminal observation did not reach its limit")
+            _require_exact_transport_observation_eof(
+                channel, deadline=deadline, ancillary_size=ancillary_size
+            )
+            return record
+        _reject("transport observation timed out")
+    finally:
+        channel.close()
+
+
+def _require_exact_transport_observation_eof(
+    channel: socket.socket, *, deadline: float, ancillary_size: int
+) -> None:
+    poller = select.poll()
+    poller.register(
+        channel.fileno(),
+        select.POLLIN
+        | select.POLLHUP
+        | _POLL_READ_CLOSED
+        | select.POLLERR
+        | select.POLLNVAL,
+    )
+    credential_space = socket.CMSG_SPACE(array.array("i").itemsize * 3)
+    previous_passcred = channel.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED)
+    changed = False
+    try:
+        changed = True
+        _set_passcred(channel, 1)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _reject("transport observation channel did not close after one record")
+            events = poller.poll(max(1, int(remaining * 1000)))
+            if not events:
+                _reject("transport observation channel did not close after one record")
+            event_mask = 0
+            for _fd, observed_mask in events:
+                event_mask |= observed_mask
+            if event_mask & (select.POLLERR | select.POLLNVAL):
+                _reject("transport observation channel reported a poll error")
+            try:
+                trailing, ancillary, flags, _address = channel.recvmsg(
+                    MAX_TRANSPORT_OBSERVATION_BYTES + 1,
+                    ancillary_size + credential_space,
+                    socket.MSG_CMSG_CLOEXEC | socket.MSG_DONTWAIT,
+                )
+            except BlockingIOError:
+                continue
+            _close_received_rights(ancillary)
+            terminal = bool(event_mask & (_POLL_READ_CLOSED | select.POLLHUP))
+            unexpected_flags = flags & ~socket.MSG_CMSG_CLOEXEC
+            if trailing or ancillary or unexpected_flags or not terminal:
+                _reject(
+                    "transport observation contained a duplicate or zero record before EOF"
+                )
+            return
+    finally:
+        if changed:
+            restore_error: Optional[BaseException] = None
+            try:
+                _set_passcred(channel, previous_passcred)
+            except BaseException as exc:
+                restore_error = exc
+            if restore_error is not None and sys.exception() is None:
+                raise CapabilityTransportError(
+                    "transport observation SO_PASSCRED state could not be restored"
+                ) from restore_error
 
 
 def _revoke_broker_control(fd: int, *, budget: float) -> None:

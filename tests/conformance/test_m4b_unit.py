@@ -3154,6 +3154,205 @@ def test_broker_ready_parser_rejects_malformed_duplicate_or_oversized(payload):
         broker.NetworkBrokerReadyRecord.from_bytes(payload)
 
 
+def _transport_observation(broker, **changes):
+    values = {
+        "version": "AOSTRANSPORT/1",
+        "event": "NETWORK_TRANSPORT_TERMINATED",
+        "task_id": "task-7",
+        "task_generation": 3,
+        "launch_nonce": "ab" * 16,
+        "policy_digest": "c" * 64,
+        "observed_at_monotonic_ns": 175,
+        "connection_count": 1,
+        "accounted_bytes": 27,
+        "worker_to_fixture_bytes": 11,
+        "fixture_to_worker_bytes": 13,
+        "total_bytes": 24,
+        "discarded_unsent_bytes": 3,
+        "terminal_reason": broker.TransportTermination.COMPLETED,
+    }
+    values.update(changes)
+    return broker.NetworkTransportObservation(**values)
+
+
+def test_transport_observation_is_canonical_bounded_and_secret_free():
+    broker = _network_broker()
+    record = _transport_observation(broker)
+
+    encoded = record.to_bytes()
+
+    assert broker.NetworkTransportObservation.from_bytes(encoded) == record
+    assert len(encoded) <= broker.MAX_TRANSPORT_OBSERVATION_BYTES
+    assert b"AOS_CANARY_" not in encoded
+    assert b"/home/" not in encoded
+    assert json.loads(encoded) == {
+        "accounted_bytes": 27,
+        "connection_count": 1,
+        "discarded_unsent_bytes": 3,
+        "event": "NETWORK_TRANSPORT_TERMINATED",
+        "fixture_to_worker_bytes": 13,
+        "launch_nonce": "ab" * 16,
+        "observed_at_monotonic_ns": 175,
+        "policy_digest": "c" * 64,
+        "task_generation": 3,
+        "task_id": "task-7",
+        "terminal_reason": "COMPLETED",
+        "total_bytes": 24,
+        "version": "AOSTRANSPORT/1",
+        "worker_to_fixture_bytes": 11,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.replace(b'"total_bytes":24', b'"total_bytes":25'),
+        lambda payload: payload.replace(b'"policy_digest":"' + b"c" * 64, b'"policy_digest":"' + b"g" * 64),
+        lambda payload: payload.replace(
+            b'"event":"NETWORK_TRANSPORT_TERMINATED"',
+            b'"event":"NETWORK_TRANSPORT_TERMINATED","event":"NETWORK_TRANSPORT_TERMINATED"',
+        ),
+    ],
+)
+def test_transport_observation_rejects_tamper_or_duplicate_fields(mutation):
+    broker = _network_broker()
+    payload = mutation(_transport_observation(broker).to_bytes())
+
+    with pytest.raises(broker.BrokerBoundaryError):
+        broker.NetworkTransportObservation.from_bytes(payload)
+
+
+def test_deny_transport_observation_is_immutable_zero_count():
+    broker = _network_broker()
+    models = _network_models()
+    policy = _relay_policy(mode=models.TransportMode.DENY)
+
+    record = broker.build_deny_transport_observation(
+        policy, policy_digest=models.policy_digest(policy)
+    )
+
+    assert record.connection_count == 0
+    assert record.worker_to_fixture_bytes == 0
+    assert record.fixture_to_worker_bytes == 0
+    assert record.total_bytes == 0
+    assert record.terminal_reason is broker.TransportTermination.DENY_NO_RELAY
+
+
+def test_controller_authenticates_one_transport_observation_plus_eof():
+    broker = _network_broker()
+    runner = importlib.import_module("agenticos.sandbox.m4b_runner")
+    models = _network_models()
+    policy = _valid_policy(models)
+    digest = models.policy_digest(policy)
+    record = _transport_observation(broker, policy_digest=digest)
+    receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        sender.send(record.to_bytes())
+        sender.shutdown(socket.SHUT_WR)
+        assert runner._read_authenticated_transport_observation(
+            receiver.fileno(),
+            expected_policy=policy,
+            expected_policy_digest=digest,
+            budget=0.2,
+        ) == record
+    finally:
+        receiver.close()
+        sender.close()
+
+
+@pytest.mark.parametrize(
+    "wire_mode",
+    ["missing", "duplicate", "zero-record", "mismatch", "preactivation", "no-eof"],
+)
+def test_controller_transport_observation_requires_exact_record_and_eof(wire_mode):
+    broker = _network_broker()
+    runner = importlib.import_module("agenticos.sandbox.m4b_runner")
+    models = _network_models()
+    policy = _valid_policy(models)
+    digest = models.policy_digest(policy)
+    receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    record = _transport_observation(broker, policy_digest=digest)
+    try:
+        if wire_mode == "duplicate":
+            sender.send(record.to_bytes())
+            sender.send(record.to_bytes())
+        elif wire_mode == "zero-record":
+            sender.send(record.to_bytes())
+            sender.send(b"")
+        elif wire_mode == "mismatch":
+            sender.send(
+                dataclasses.replace(record, task_generation=4).to_bytes()
+            )
+        elif wire_mode == "preactivation":
+            sender.send(
+                dataclasses.replace(record, observed_at_monotonic_ns=99).to_bytes()
+            )
+        elif wire_mode == "no-eof":
+            sender.send(record.to_bytes())
+        if wire_mode != "no-eof":
+            sender.shutdown(socket.SHUT_WR)
+
+        with pytest.raises(runner.CapabilityTransportError):
+            runner._read_authenticated_transport_observation(
+                receiver.fileno(),
+                expected_policy=policy,
+                expected_policy_digest=digest,
+                budget=0.2,
+            )
+    finally:
+        receiver.close()
+        sender.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "changes"),
+    [
+        ("DENY", {"terminal_reason": "REVOKED", "connection_count": 0,
+                  "accounted_bytes": 0, "worker_to_fixture_bytes": 0,
+                  "fixture_to_worker_bytes": 0, "total_bytes": 0,
+                  "discarded_unsent_bytes": 0}),
+        ("SYNTHETIC_FIXTURE_FD", {"terminal_reason": "DENY_NO_RELAY",
+                                  "connection_count": 0, "accounted_bytes": 0,
+                                  "worker_to_fixture_bytes": 0,
+                                  "fixture_to_worker_bytes": 0,
+                                  "total_bytes": 0,
+                                  "discarded_unsent_bytes": 0}),
+        ("SYNTHETIC_FIXTURE_FD", {"terminal_reason": "COMPLETED",
+                                  "connection_count": 0}),
+        ("SYNTHETIC_FIXTURE_FD", {"terminal_reason": "BYTE_LIMIT",
+                                  "accounted_bytes": 27}),
+    ],
+)
+def test_controller_rejects_policy_incompatible_terminal_semantics(mode, changes):
+    broker = _network_broker()
+    runner = importlib.import_module("agenticos.sandbox.m4b_runner")
+    models = _network_models()
+    policy = _valid_policy(models)
+    policy = dataclasses.replace(policy, mode=getattr(models.TransportMode, mode))
+    digest = models.policy_digest(policy)
+    typed_changes = dict(changes)
+    typed_changes["terminal_reason"] = getattr(
+        broker.TransportTermination, changes["terminal_reason"]
+    )
+    record = _transport_observation(
+        broker, policy_digest=digest, **typed_changes
+    )
+    receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        sender.send(record.to_bytes())
+        sender.shutdown(socket.SHUT_WR)
+        with pytest.raises(runner.CapabilityTransportError):
+            runner._read_authenticated_transport_observation(
+                receiver.fileno(),
+                expected_policy=policy,
+                expected_policy_digest=digest,
+                budget=0.2,
+            )
+    finally:
+        receiver.close()
+        sender.close()
+
+
 def _relay_policy(*, mode=None, lifetime_ns=5_000_000_000, byte_limit=4096):
     models = _network_models()
     now = time.monotonic_ns()
@@ -3261,7 +3460,9 @@ def test_broker_revoke_preempts_simultaneous_endpoint_io(monkeypatch):
                 _relay_policy(), listener, fixture_broker, control_broker
             )
 
-            assert outcome is broker.TransportTermination.REVOKED
+            assert outcome.terminal_reason is broker.TransportTermination.REVOKED
+            assert outcome.accounted_bytes == 0
+            assert outcome.total_bytes == 0
             assert fixture_broker.recv(len(payload)) == payload
         finally:
             client.close()
@@ -3306,7 +3507,8 @@ def test_broker_expiry_crossed_during_select_preempts_endpoint_io(monkeypatch):
                 policy, listener, fixture_broker, control_broker
             )
 
-            assert outcome is broker.TransportTermination.EXPIRED
+            assert outcome.terminal_reason is broker.TransportTermination.EXPIRED
+            assert outcome.observed_at_monotonic_ns >= policy.expires_at_monotonic_ns
             assert fixture_broker.recv(len(payload)) == payload
         finally:
             client.close()
@@ -3358,7 +3560,10 @@ def test_broker_relay_never_reads_beyond_exact_buffer_capacity(monkeypatch):
                 control_broker,
             )
 
-            assert outcome is broker.TransportTermination.REVOKED
+            assert outcome.terminal_reason is broker.TransportTermination.REVOKED
+            assert outcome.accounted_bytes == 20
+            assert outcome.total_bytes == 0
+            assert outcome.discarded_unsent_bytes == 20
             assert fixture_broker.recv(len(payload)) == payload[20:]
         finally:
             client.close()
@@ -3392,7 +3597,13 @@ def test_broker_synthetic_fixture_relays_only_inherited_socket_and_revokes_clean
             control_peer.send(b"AOSBROKERCTL/1 REVOKE\n")
             thread.join(3)
             assert not thread.is_alive()
-            assert outcomes == [broker.TransportTermination.REVOKED]
+            assert len(outcomes) == 1
+            assert outcomes[0].terminal_reason is broker.TransportTermination.REVOKED
+            assert outcomes[0].connection_count == 1
+            assert outcomes[0].worker_to_fixture_bytes == len(b"from-worker")
+            assert outcomes[0].fixture_to_worker_bytes == len(b"from-fixture")
+            assert outcomes[0].total_bytes == len(b"from-workerfrom-fixture")
+            assert outcomes[0].discarded_unsent_bytes == 0
             for fd in owned:
                 if fd is not None:
                     with pytest.raises(OSError) as closed:
@@ -3511,7 +3722,10 @@ def test_broker_byte_limit_fails_closed():
             first.sendall(b"12345")
             thread.join(2)
             assert not thread.is_alive()
-            assert outcomes == [broker.TransportTermination.BYTE_LIMIT]
+            assert len(outcomes) == 1
+            assert outcomes[0].terminal_reason is broker.TransportTermination.BYTE_LIMIT
+            assert outcomes[0].accounted_bytes == 4
+            assert outcomes[0].total_bytes <= outcomes[0].accounted_bytes
             fixture_peer.settimeout(1)
             assert len(fixture_peer.recv(64)) <= 4
         finally:
@@ -3544,7 +3758,9 @@ def test_broker_extra_connection_fails_closed():
             second.connect(("127.0.0.1", 18080))
             thread.join(2)
             assert not thread.is_alive()
-            assert outcomes == [broker.TransportTermination.CONNECTION_LIMIT]
+            assert len(outcomes) == 1
+            assert outcomes[0].terminal_reason is broker.TransportTermination.CONNECTION_LIMIT
+            assert outcomes[0].connection_count == 1
         finally:
             first.close()
             second.close()
@@ -3601,6 +3817,45 @@ def test_broker_transport_validation_failure_closes_every_owned_descriptor():
                     pass
             os.close(bad_fixture_r)
             os.close(bad_fixture_w)
+            control_broker.close()
+            control_peer.close()
+
+
+def test_serve_transport_close_does_not_shutdown_terminal_control_alias():
+    broker = _network_broker()
+    fixture_broker, fixture_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_STREAM
+    )
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    terminal_alias = _dup_cloexec(control_broker.fileno())
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    with _fixed_listener() as listener:
+        thread, outcomes, _owned = _run_relay_thread(
+            broker,
+            _relay_policy(),
+            listener,
+            fixture_broker,
+            control_broker,
+        )
+        try:
+            client.connect(("127.0.0.1", 18080))
+            client.shutdown(socket.SHUT_WR)
+            fixture_peer.shutdown(socket.SHUT_WR)
+            thread.join(2)
+            assert not thread.is_alive()
+            assert outcomes[0].terminal_reason is broker.TransportTermination.COMPLETED
+
+            record = _transport_observation(broker)
+            broker.emit_transport_observation(terminal_alias, record)
+            assert control_peer.recv(broker.MAX_TRANSPORT_OBSERVATION_BYTES) == record.to_bytes()
+            assert control_peer.recv(1) == b""
+        finally:
+            os.close(terminal_alias)
+            client.close()
+            fixture_broker.close()
+            fixture_peer.close()
             control_broker.close()
             control_peer.close()
 

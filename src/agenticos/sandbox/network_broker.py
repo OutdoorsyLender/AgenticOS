@@ -40,6 +40,7 @@ from .network_models import (
     ListenerEvidence,
     TransportMode,
     TransportPolicy,
+    policy_digest as transport_policy_digest,
 )
 
 
@@ -80,6 +81,7 @@ BROKER_ENVIRONMENT = (
 MAX_CONTRACT_ITEMS = 64
 MAX_CONTRACT_ITEM_BYTES = 256
 MAX_READY_BYTES = 8192
+MAX_TRANSPORT_OBSERVATION_BYTES = 4096
 MAX_CONTROL_BYTES = 64
 RELAY_CHUNK_BYTES = 16 * 1024
 RELAY_BUFFER_BYTES = 32 * 1024
@@ -89,6 +91,8 @@ PR_GET_NO_NEW_PRIVS = 39
 _SO_DOMAIN = getattr(socket, "SO_DOMAIN", 39)
 _MAX_UNSIGNED_64 = (1 << 64) - 1
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
+_HEX_32_RE = re.compile(r"[0-9a-f]{32}\Z")
+_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _BOOT_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
 )
@@ -108,6 +112,7 @@ class BrokerBoundaryError(RuntimeError):
 
 
 class TransportTermination(str, Enum):
+    DENY_NO_RELAY = "DENY_NO_RELAY"
     COMPLETED = "COMPLETED"
     REVOKED = "REVOKED"
     EXPIRED = "EXPIRED"
@@ -116,6 +121,214 @@ class TransportTermination(str, Enum):
     BYTE_LIMIT = "BYTE_LIMIT"
     CONNECTION_LIMIT = "CONNECTION_LIMIT"
     PEER_ERROR = "PEER_ERROR"
+
+
+@dataclass(frozen=True)
+class NetworkTransportObservation:
+    """Canonical broker-owned terminal relay accounting."""
+
+    version: str
+    event: str
+    task_id: str
+    task_generation: int
+    launch_nonce: str
+    policy_digest: str
+    observed_at_monotonic_ns: int
+    connection_count: int
+    accounted_bytes: int
+    worker_to_fixture_bytes: int
+    fixture_to_worker_bytes: int
+    total_bytes: int
+    discarded_unsent_bytes: int
+    terminal_reason: TransportTermination
+
+    def __post_init__(self) -> None:
+        if self.version != "AOSTRANSPORT/1":
+            raise BrokerBoundaryError("transport observation version is invalid")
+        if self.event != "NETWORK_TRANSPORT_TERMINATED":
+            raise BrokerBoundaryError("transport observation event is invalid")
+        if type(self.task_id) is not str or not _TASK_ID_RE.fullmatch(self.task_id):
+            raise BrokerBoundaryError("transport observation task ID is invalid")
+        _positive_u64("transport observation generation", self.task_generation)
+        if type(self.launch_nonce) is not str or not _HEX_32_RE.fullmatch(
+            self.launch_nonce
+        ):
+            raise BrokerBoundaryError("transport observation nonce is invalid")
+        if type(self.policy_digest) is not str or not _HEX_64_RE.fullmatch(
+            self.policy_digest
+        ):
+            raise BrokerBoundaryError("transport observation policy digest is invalid")
+        if type(self.terminal_reason) is not TransportTermination:
+            raise BrokerBoundaryError("transport observation reason is invalid")
+        _positive_u64(
+            "transport observation monotonic timestamp",
+            self.observed_at_monotonic_ns,
+        )
+        for name, value in (
+            ("connection count", self.connection_count),
+            ("accounted bytes", self.accounted_bytes),
+            ("worker-to-fixture bytes", self.worker_to_fixture_bytes),
+            ("fixture-to-worker bytes", self.fixture_to_worker_bytes),
+            ("total bytes", self.total_bytes),
+            ("discarded unsent bytes", self.discarded_unsent_bytes),
+        ):
+            _nonnegative_u64(f"transport observation {name}", value)
+        if self.connection_count > 1:
+            raise BrokerBoundaryError("transport observation exceeds one connection")
+        if self.total_bytes != (
+            self.worker_to_fixture_bytes + self.fixture_to_worker_bytes
+        ):
+            raise BrokerBoundaryError("transport observation byte total is inconsistent")
+        if self.accounted_bytes != self.total_bytes + self.discarded_unsent_bytes:
+            raise BrokerBoundaryError("transport observation accounting is inconsistent")
+        if self.terminal_reason is TransportTermination.DENY_NO_RELAY and any(
+            (
+                self.connection_count,
+                self.accounted_bytes,
+                self.worker_to_fixture_bytes,
+                self.fixture_to_worker_bytes,
+                self.total_bytes,
+                self.discarded_unsent_bytes,
+            )
+        ):
+            raise BrokerBoundaryError("DENY observation must contain zero relay totals")
+
+    def to_bytes(self) -> bytes:
+        payload = {
+            "accounted_bytes": self.accounted_bytes,
+            "connection_count": self.connection_count,
+            "discarded_unsent_bytes": self.discarded_unsent_bytes,
+            "event": self.event,
+            "fixture_to_worker_bytes": self.fixture_to_worker_bytes,
+            "launch_nonce": self.launch_nonce,
+            "observed_at_monotonic_ns": self.observed_at_monotonic_ns,
+            "policy_digest": self.policy_digest,
+            "task_generation": self.task_generation,
+            "task_id": self.task_id,
+            "terminal_reason": self.terminal_reason.value,
+            "total_bytes": self.total_bytes,
+            "version": self.version,
+            "worker_to_fixture_bytes": self.worker_to_fixture_bytes,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        if len(encoded) > MAX_TRANSPORT_OBSERVATION_BYTES:
+            raise BrokerBoundaryError("transport observation is oversized")
+        return encoded
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> NetworkTransportObservation:
+        decoded = _exact_dict(
+            _decode_json(
+                payload,
+                MAX_TRANSPORT_OBSERVATION_BYTES,
+                "transport observation",
+            ),
+            {
+                "connection_count",
+                "accounted_bytes",
+                "discarded_unsent_bytes",
+                "event",
+                "fixture_to_worker_bytes",
+                "launch_nonce",
+                "observed_at_monotonic_ns",
+                "policy_digest",
+                "task_generation",
+                "task_id",
+                "terminal_reason",
+                "total_bytes",
+                "version",
+                "worker_to_fixture_bytes",
+            },
+            "transport observation",
+        )
+        try:
+            record = cls(
+                version=decoded["version"],
+                event=decoded["event"],
+                task_id=decoded["task_id"],
+                task_generation=decoded["task_generation"],
+                launch_nonce=decoded["launch_nonce"],
+                policy_digest=decoded["policy_digest"],
+                observed_at_monotonic_ns=decoded["observed_at_monotonic_ns"],
+                connection_count=decoded["connection_count"],
+                accounted_bytes=decoded["accounted_bytes"],
+                worker_to_fixture_bytes=decoded["worker_to_fixture_bytes"],
+                fixture_to_worker_bytes=decoded["fixture_to_worker_bytes"],
+                total_bytes=decoded["total_bytes"],
+                discarded_unsent_bytes=decoded["discarded_unsent_bytes"],
+                terminal_reason=TransportTermination(decoded["terminal_reason"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BrokerBoundaryError("transport observation fields are invalid") from exc
+        if record.to_bytes() != payload:
+            raise BrokerBoundaryError("transport observation encoding is not canonical")
+        return record
+
+
+def _transport_observation(
+    policy: TransportPolicy,
+    *,
+    connection_count: int,
+    accounted_bytes: int,
+    worker_to_fixture_bytes: int,
+    fixture_to_worker_bytes: int,
+    terminal_reason: TransportTermination,
+    observed_at_monotonic_ns: int | None = None,
+) -> NetworkTransportObservation:
+    observed_at = (
+        time.monotonic_ns()
+        if observed_at_monotonic_ns is None
+        else observed_at_monotonic_ns
+    )
+    if observed_at < policy.activated_at_monotonic_ns:
+        raise BrokerBoundaryError("transport observation precedes policy activation")
+    if terminal_reason is TransportTermination.EXPIRED:
+        if observed_at < policy.expires_at_monotonic_ns:
+            raise BrokerBoundaryError("expiry observation precedes policy expiry")
+    elif observed_at >= policy.expires_at_monotonic_ns:
+        raise BrokerBoundaryError("non-expiry observation is not before policy expiry")
+    forwarded = worker_to_fixture_bytes + fixture_to_worker_bytes
+    if not 0 <= forwarded <= accounted_bytes <= policy.byte_limit:
+        raise BrokerBoundaryError("transport byte accounting exceeds policy authority")
+    if not 0 <= connection_count <= policy.connection_limit:
+        raise BrokerBoundaryError("transport connection accounting exceeds policy authority")
+    return NetworkTransportObservation(
+        version="AOSTRANSPORT/1",
+        event="NETWORK_TRANSPORT_TERMINATED",
+        task_id=policy.task_id,
+        task_generation=policy.task_generation,
+        launch_nonce=policy.launch_nonce,
+        policy_digest=transport_policy_digest(policy),
+        observed_at_monotonic_ns=observed_at,
+        connection_count=connection_count,
+        accounted_bytes=accounted_bytes,
+        worker_to_fixture_bytes=worker_to_fixture_bytes,
+        fixture_to_worker_bytes=fixture_to_worker_bytes,
+        total_bytes=worker_to_fixture_bytes + fixture_to_worker_bytes,
+        discarded_unsent_bytes=(
+            accounted_bytes - worker_to_fixture_bytes - fixture_to_worker_bytes
+        ),
+        terminal_reason=terminal_reason,
+    )
+
+
+def build_deny_transport_observation(
+    policy: TransportPolicy, *, policy_digest: str
+) -> NetworkTransportObservation:
+    if type(policy) is not TransportPolicy or policy.mode is not TransportMode.DENY:
+        raise BrokerBoundaryError("DENY observation requires a DENY policy")
+    if policy_digest != transport_policy_digest(policy):
+        raise BrokerBoundaryError("DENY observation policy digest is invalid")
+    return _transport_observation(
+        policy,
+        connection_count=0,
+        accounted_bytes=0,
+        worker_to_fixture_bytes=0,
+        fixture_to_worker_bytes=0,
+        terminal_reason=TransportTermination.DENY_NO_RELAY,
+    )
 
 
 def _positive_u64(name: str, value: object) -> int:
@@ -1647,6 +1860,36 @@ def emit_network_broker_ready(
             os.close(duplicate)
 
 
+def emit_transport_observation(
+    control_fd: int, record: NetworkTransportObservation
+) -> None:
+    """Send the sole terminal observation on the control capability."""
+    if type(record) is not NetworkTransportObservation:
+        raise BrokerBoundaryError("transport observation has the wrong type")
+    _validate_connected_unix_socket(
+        control_fd, socket.SOCK_SEQPACKET, "broker control"
+    )
+    payload = record.to_bytes()
+    duplicate = _duplicate_cloexec(control_fd)
+    channel: socket.socket | None = None
+    try:
+        channel = socket.socket(fileno=duplicate)
+        duplicate = -1
+        sent = channel.send(payload, socket.MSG_NOSIGNAL)
+        if sent != len(payload):
+            raise BrokerBoundaryError("transport observation send was short")
+        channel.shutdown(socket.SHUT_WR)
+    except BrokerBoundaryError:
+        raise
+    except OSError as exc:
+        raise BrokerBoundaryError("transport observation send failed") from exc
+    finally:
+        if channel is not None:
+            channel.close()
+        elif duplicate >= 0:
+            os.close(duplicate)
+
+
 def _read_control(channel: socket.socket) -> TransportTermination | None:
     try:
         payload, ancillary, flags, _address = channel.recvmsg(
@@ -1729,15 +1972,34 @@ def _relay_loop(
     listener: socket.socket,
     fixture: socket.socket,
     control: socket.socket,
-) -> TransportTermination:
+) -> NetworkTransportObservation:
     worker: socket.socket | None = None
     selector = selectors.DefaultSelector()
     total_bytes = 0
+    worker_to_fixture_bytes = 0
+    fixture_to_worker_bytes = 0
     limit_reached = False
     read_open: dict[socket.socket, bool] = {}
     write_open: dict[socket.socket, bool] = {}
     buffers: dict[socket.socket, bytearray] = {}
     connection_used = False
+
+    def finish(reason: TransportTermination) -> NetworkTransportObservation:
+        if total_bytes > policy.byte_limit:
+            raise BrokerBoundaryError("relay accounting exceeded the policy byte limit")
+        observed_at = time.monotonic_ns()
+        if observed_at >= policy.expires_at_monotonic_ns:
+            reason = TransportTermination.EXPIRED
+        return _transport_observation(
+            policy,
+            connection_count=int(connection_used),
+            accounted_bytes=total_bytes,
+            worker_to_fixture_bytes=worker_to_fixture_bytes,
+            fixture_to_worker_bytes=fixture_to_worker_bytes,
+            terminal_reason=reason,
+            observed_at_monotonic_ns=observed_at,
+        )
+
     try:
         listener.setblocking(False)
         fixture.setblocking(False)
@@ -1749,7 +2011,7 @@ def _relay_loop(
             now = time.monotonic_ns()
             if now >= policy.expires_at_monotonic_ns:
                 buffers.clear()
-                return TransportTermination.EXPIRED
+                return finish(TransportTermination.EXPIRED)
             timeout = min(
                 SELECTOR_SLICE_SECONDS,
                 (policy.expires_at_monotonic_ns - now) / 1_000_000_000,
@@ -1757,7 +2019,7 @@ def _relay_loop(
             events = selector.select(timeout)
             if time.monotonic_ns() >= policy.expires_at_monotonic_ns:
                 buffers.clear()
-                return TransportTermination.EXPIRED
+                return finish(TransportTermination.EXPIRED)
             if not events:
                 continue
             for key, _mask in events:
@@ -1766,7 +2028,7 @@ def _relay_loop(
                 outcome = _read_control(control)
                 if outcome is not None:
                     buffers.clear()
-                    return outcome
+                    return finish(outcome)
             for key, mask in events:
                 if key.data == "control":
                     continue
@@ -1776,10 +2038,10 @@ def _relay_loop(
                     except BlockingIOError:
                         continue
                     except OSError:
-                        return TransportTermination.PEER_ERROR
+                        return finish(TransportTermination.PEER_ERROR)
                     if connection_used or worker is not None or policy.connection_limit < 1:
                         _abort_socket(accepted)
-                        return TransportTermination.CONNECTION_LIMIT
+                        return finish(TransportTermination.CONNECTION_LIMIT)
                     connection_used = True
                     worker = accepted
                     worker.setblocking(False)
@@ -1792,9 +2054,9 @@ def _relay_loop(
 
                 endpoint = key.fileobj
                 if type(endpoint) is not socket.socket:
-                    return TransportTermination.PEER_ERROR
+                    return finish(TransportTermination.PEER_ERROR)
                 if worker is None:
-                    return TransportTermination.PEER_ERROR
+                    return finish(TransportTermination.PEER_ERROR)
                 other = fixture if endpoint is worker else worker
                 if mask & selectors.EVENT_READ and read_open.get(endpoint, False):
                     remaining = policy.byte_limit - total_bytes
@@ -1815,7 +2077,7 @@ def _relay_loop(
                         except BlockingIOError:
                             chunk = None
                         except OSError:
-                            return TransportTermination.PEER_ERROR
+                            return finish(TransportTermination.PEER_ERROR)
                         if chunk == b"":
                             read_open[endpoint] = False
                         elif chunk:
@@ -1829,9 +2091,13 @@ def _relay_loop(
                     except BlockingIOError:
                         sent = 0
                     except OSError:
-                        return TransportTermination.PEER_ERROR
+                        return finish(TransportTermination.PEER_ERROR)
                     if sent < 0 or sent > len(buffers[endpoint]):
-                        return TransportTermination.PEER_ERROR
+                        return finish(TransportTermination.PEER_ERROR)
+                    if endpoint is fixture:
+                        worker_to_fixture_bytes += sent
+                    else:
+                        fixture_to_worker_bytes += sent
                     del buffers[endpoint][:sent]
 
             if worker is None:
@@ -1864,7 +2130,7 @@ def _relay_loop(
                 if event_mask:
                     selector.register(endpoint, event_mask, "endpoint")
             if limit_reached and not any(buffers.values()):
-                return TransportTermination.BYTE_LIMIT
+                return finish(TransportTermination.BYTE_LIMIT)
             if not any(read_open.values()) and not any(buffers.values()):
                 for endpoint in (worker, fixture):
                     try:
@@ -1877,6 +2143,7 @@ def _relay_loop(
                 read_open.clear()
                 write_open.clear()
                 buffers.clear()
+                return finish(TransportTermination.COMPLETED)
     finally:
         selector.close()
         _abort_socket(worker)
@@ -1911,7 +2178,7 @@ def serve_transport(
     listener_fd: int,
     fixture_fd: int | None,
     control_fd: int,
-) -> TransportTermination:
+) -> TransportTermination | NetworkTransportObservation:
     """Own and close the supplied capabilities while serving one bounded relay."""
     listener: socket.socket | None = None
     fixture: socket.socket | None = None
@@ -1967,7 +2234,10 @@ def serve_transport(
     finally:
         _close_socket(listener)
         _abort_socket(fixture)
-        _abort_socket(control)
+        # A broker-held duplicate may still need to emit the immutable terminal
+        # observation.  Closing this owned alias must not shutdown the shared
+        # socket description and destroy that opposite-direction capability.
+        _close_socket(control)
         _close_owned(owned_raw)
 
 
@@ -2072,12 +2342,45 @@ def broker_main(contract: BrokerContract) -> NoReturn:
             owned.discard(fixture_fd)
         relay_listener_fd = adopted_fd
         adopted_fd = None
-        termination = serve_transport(
-            sealed.policy,
-            listener_fd=relay_listener_fd,
-            fixture_fd=fixture_fd,
-            control_fd=control_fd,
-        )
+        if sealed.policy.mode is TransportMode.DENY:
+            emit_transport_observation(
+                control_fd,
+                build_deny_transport_observation(
+                    sealed.policy, policy_digest=sealed.digest
+                ),
+            )
+            termination = serve_transport(
+                sealed.policy,
+                listener_fd=relay_listener_fd,
+                fixture_fd=fixture_fd,
+                control_fd=control_fd,
+            )
+        else:
+            terminal_control_fd = _duplicate_cloexec(control_fd)
+            try:
+                observation = serve_transport(
+                    sealed.policy,
+                    listener_fd=relay_listener_fd,
+                    fixture_fd=fixture_fd,
+                    control_fd=control_fd,
+                )
+                if type(observation) is not NetworkTransportObservation:
+                    raise BrokerBoundaryError(
+                        "synthetic transport did not return terminal accounting"
+                    )
+                emit_transport_observation(terminal_control_fd, observation)
+                if observation.terminal_reason is TransportTermination.COMPLETED:
+                    terminal_channel = socket.socket(fileno=terminal_control_fd)
+                    terminal_control_fd = -1
+                    try:
+                        termination = _deny_loop(sealed.policy, terminal_channel)
+                    finally:
+                        terminal_channel.close()
+                else:
+                    termination = observation.terminal_reason
+            finally:
+                if terminal_control_fd >= 0:
+                    os.close(terminal_control_fd)
         if termination in {
             TransportTermination.COMPLETED,
             TransportTermination.REVOKED,
@@ -2125,14 +2428,18 @@ __all__ = [
     "BrokerContract",
     "EnvironmentEvidence",
     "MAX_READY_BYTES",
+    "MAX_TRANSPORT_OBSERVATION_BYTES",
     "NetworkBrokerReadyRecord",
+    "NetworkTransportObservation",
     "ObservedFileIdentity",
     "ProcStatusEvidence",
     "SealedPolicyEvidence",
     "TransportTermination",
     "assert_minimal_process_boundary",
     "broker_main",
+    "build_deny_transport_observation",
     "emit_network_broker_ready",
+    "emit_transport_observation",
     "main",
     "parse_proc_status",
     "require_minimal_proc_status",
