@@ -1,0 +1,18 @@
+# M4B-2 broker-runtime dependency gate (Slice 5).
+#
+# Exact, hash-pinned, wheel-only dependency closure for the LONG-LIVED
+# broker runtime. Unlike the certificate-helper closure
+# (requirements/m4b2-cert-helper.txt), h11 enters the broker address space —
+# but ONLY behind the strict raw-byte prevalidator in
+# src/agenticos/sandbox/network_http.py; it is never the security envelope.
+# pyproject.toml runtime dependencies are unchanged.
+#
+# Offline reproduction (no network):
+#   pip install --no-index --find-links requirements/wheelhouse \
+#       --require-hashes --only-binary=:all: \
+#       -r requirements/m4b2-broker.txt --target <tmpdir>
+#
+# Review record: docs/phase-zero/dependency-review-m4b2.md
+
+h11==0.16.0 \
+    --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
