@@ -1,0 +1,78 @@
+Exception ignored in ssl servername callback while calling set SNI callback <function make_server_context.<locals>._sni_cb at 0x7533c21409e0>:
+Traceback (most recent call last):
+  File "/home/brand/src/AgenticOS/spikes/m4b2-ech-gate/gate_driver.py", line 118, in _sni_cb
+    raise SniPolicyError("second ClientHello (HRR/renegotiation) refused")
+gate_driver.SniPolicyError: second ClientHello (HRR/renegotiation) refused
+Exception ignored in ssl servername callback while calling set SNI callback <function make_server_context.<locals>._sni_cb at 0x7533c2140ca0>:
+Traceback (most recent call last):
+  File "/home/brand/src/AgenticOS/spikes/m4b2-ech-gate/gate_driver.py", line 120, in _sni_cb
+    raise SniPolicyError(f"SNI {server_name!r} != approved hostname")
+gate_driver.SniPolicyError: SNI 'evil.example.test' != approved hostname
+Exception ignored in ssl servername callback while calling set SNI callback <function make_server_context.<locals>._sni_cb at 0x7533c21414e0>:
+Traceback (most recent call last):
+  File "/home/brand/src/AgenticOS/spikes/m4b2-ech-gate/gate_driver.py", line 120, in _sni_cb
+    raise SniPolicyError(f"SNI {server_name!r} != approved hostname")
+gate_driver.SniPolicyError: SNI None != approved hostname
+Exception ignored in ssl servername callback while calling set SNI callback <function make_server_context.<locals>._sni_cb at 0x7533c2143320>:
+Traceback (most recent call last):
+  File "/home/brand/src/AgenticOS/spikes/m4b2-ech-gate/gate_driver.py", line 120, in _sni_cb
+    raise SniPolicyError(f"SNI {server_name!r} != approved hostname")
+gate_driver.SniPolicyError: SNI None != approved hostname
+Exception ignored in ssl servername callback while calling set SNI callback <function make_server_context.<locals>._sni_cb at 0x7533c21438a0>:
+Traceback (most recent call last):
+  File "/home/brand/src/AgenticOS/spikes/m4b2-ech-gate/gate_driver.py", line 120, in _sni_cb
+    raise SniPolicyError(f"SNI {server_name!r} != approved hostname")
+gate_driver.SniPolicyError: SNI None != approved hostname
+OK s01_tls12_no_ech gate=accept(-) ossl=ch_accepted sni_fires=1
+OK s02_tls13_no_ech gate=accept(-) ossl=ch_accepted sni_fires=1
+OK s03_record_fragmented gate=accept(-) ossl=ch_accepted sni_fires=1
+OK s04_drip_feed gate=accept(-) ossl=ch_accepted sni_fires=1
+OK s05a_coalesced_records gate=accept(-) ossl=ch_accepted sni_fires=1
+OK s05b_coalesced_ch_plus_ccs gate=accept(-) ossl=ch_accepted sni_fires=1
+OK s06_unknown_ext gate=accept(-) ossl=ch_accepted sni_fires=1
+OK s07_grease_exts gate=accept(-) ossl=ch_accepted sni_fires=1
+OK e08_ech_valid gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK e09_ech_zero_len gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK e10_ech_arbitrary gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK e11_ech_duplicate gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK e12_ech_approved_outer gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK e13_ech_unapproved_outer gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK e14_ech_ext_split_records gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK e15_ech_split_writes gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK m16_bad_record_length gate=reject(gate timeout) ossl=- sni_fires=0
+OK m17_bad_handshake_length gate=reject(declared ClientHello length 20000 exceeds bound) ossl=- sni_fires=0
+OK m18_truncated_ch gate=reject(gate timeout) ossl=- sni_fires=0
+OK m19_bad_extensions_len gate=reject(extensions block length mismatch) ossl=- sni_fires=0
+OK m20_ext_overrun gate=reject(truncated extension payload) ossl=- sni_fires=0
+OK m21_excessive_records gate=reject(record count bound exceeded) ossl=- sni_fires=0
+OK m22_excessive_bytes gate=reject(declared ClientHello length 16433 exceeds bound) ossl=- sni_fires=0
+OK m23_timeout_mid_ch gate=reject(gate timeout) ossl=- sni_fires=0
+OK m24_eof_mid_ch gate=reject(EOF before ClientHello complete) ossl=- sni_fires=0
+OK m25_wrong_content_type gate=reject(non-handshake record content type 23) ossl=- sni_fires=0
+OK m26_random_bytes gate=reject(non-handshake record content type 222) ossl=- sni_fires=0
+OK x27_second_ch_coalesced gate=accept(-) ossl=failed sni_fires=1
+OK x28_hrr_then_ch2_ech gate=accept(-) ossl=ch_accepted sni_fires=2
+OK x28c_hrr_refused gate=accept(-) ossl=failed sni_fires=2
+OK x28b_hrr_ch2_different_sni gate=accept(-) ossl=failed sni_fires=2
+OK x29_unexpected_first_msg gate=reject(first handshake message type 20 != ClientHello) ossl=- sni_fires=0
+OK x30_garbage_after_ch gate=accept(-) ossl=failed sni_fires=1
+OK g01_no_extensions_block gate=accept(-) ossl=failed sni_fires=1
+OK g02_two_msgs_one_record gate=accept(-) ossl=failed sni_fires=0
+OK g03_tls12_second_flight_ch_ech gate=accept(-) ossl=failed sni_fires=1
+OK g04a_ech_ext_256th gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK g04b_ech_ext_257th gate=reject(extension count bound exceeded) ossl=- sni_fires=0
+OK g05a_session_id_lie_ech gate=reject(truncated session_id) ossl=- sni_fires=0
+OK g05b_compression_lie_ech gate=reject(truncated compression_methods) ossl=- sni_fires=0
+OK g06_zero_len_record_mid gate=reject(malformed cipher_suites length) ossl=- sni_fires=0
+OK g07_ccs_before_ch gate=reject(non-handshake record content type 20) ossl=- sni_fires=0
+OK g08a_record_version_0304 gate=reject(unsupported record version 0x0304) ossl=- sni_fires=0
+OK g08b_mixed_record_versions gate=accept(-) ossl=ch_accepted sni_fires=1
+OK g09a_declared_16384 gate=accept(-) ossl=failed sni_fires=1
+OK g09b_declared_16385 gate=reject(oversized record payload 16389) ossl=- sni_fires=0
+OK g10_empty_ext_vector gate=accept(-) ossl=failed sni_fires=1
+OK g11_dup_unknown_ext gate=reject(duplicate extension 0xcafe) ossl=- sni_fires=0
+OK e16_ech_tls12 gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+OK e17_ech_no_sni gate=reject(ECH extension 0xfe0d present) ossl=- sni_fires=0
+
+results written to /home/brand/src/AgenticOS/spikes/m4b2-ech-gate/work/results.json
+critical/differential findings: 0

@@ -1,0 +1,7824 @@
+{
+  "s01_tls12_no_ech": {
+    "name": "s01_tls12_no_ech",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 103,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 103,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 88,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 88,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "s02_tls13_no_ech": {
+    "name": "s02_tls13_no_ech",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "s03_record_fragmented": {
+    "name": "s03_record_fragmented",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "s04_drip_feed": {
+    "name": "s04_drip_feed",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 103,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "s05a_coalesced_records": {
+    "name": "s05a_coalesced_records",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "s05b_coalesced_ch_plus_ccs": {
+    "name": "s05b_coalesced_ch_plus_ccs",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "s06_unknown_ext": {
+    "name": "s06_unknown_ext",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51,
+          51966
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "s07_grease_exts": {
+    "name": "s07_grease_exts",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          2570,
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51,
+          6682
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "e08_ech_valid": {
+    "name": "e08_ech_valid",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "e09_ech_zero_len": {
+    "name": "e09_ech_zero_len",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "e10_ech_arbitrary": {
+    "name": "e10_ech_arbitrary",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "e11_ech_duplicate": {
+    "name": "e11_ech_duplicate",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "e12_ech_approved_outer": {
+    "name": "e12_ech_approved_outer",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "e13_ech_unapproved_outer": {
+    "name": "e13_ech_unapproved_outer",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "evil.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "e14_ech_ext_split_records": {
+    "name": "e14_ech_ext_split_records",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "e15_ech_split_writes": {
+    "name": "e15_ech_split_writes",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "m16_bad_record_length": {
+    "name": "m16_bad_record_length",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "gate timeout",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "handshake timeout",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "m17_bad_handshake_length": {
+    "name": "m17_bad_handshake_length",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "declared ClientHello length 20000 exceeds bound",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "handshake timeout",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "m18_truncated_ch": {
+    "name": "m18_truncated_ch",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "gate timeout",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "handshake timeout",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "m19_bad_extensions_len": {
+    "name": "m19_bad_extensions_len",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "extensions block length mismatch",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: LENGTH_MISMATCH] length mismatch (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00009F:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00009F:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "m20_ext_overrun": {
+    "name": "m20_ext_overrun",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "truncated extension payload",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: BAD_EXTENSION] bad extension (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "m21_excessive_records": {
+    "name": "m21_excessive_records",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "record count bound exceeded",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "m22_excessive_bytes": {
+    "name": "m22_excessive_bytes",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "declared ClientHello length 16433 exceeds bound",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: NO_SHARED_CIPHER] no shared cipher (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          null
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C1:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 21,
+                "len": 2,
+                "alert": {
+                  "level": 2,
+                  "description": 40
+                }
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [],
+        "probe_exts_order": [],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "NONE"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C1:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 21,
+                "len": 2,
+                "alert": {
+                  "level": 2,
+                  "description": 40
+                }
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [],
+        "probe_exts_order": [],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "NONE"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "m23_timeout_mid_ch": {
+    "name": "m23_timeout_mid_ch",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "gate timeout",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "m24_eof_mid_ch": {
+    "name": "m24_eof_mid_ch",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "EOF before ClientHello complete",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "m25_wrong_content_type": {
+    "name": "m25_wrong_content_type",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "non-handshake record content type 23",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: UNEXPECTED_MESSAGE] unexpected message (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000F4:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 10
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000F4:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 10
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "m26_random_bytes": {
+    "name": "m26_random_bytes",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "non-handshake record content type 222",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: RECORD_LAYER_FAILURE] record layer failure (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C6:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 22
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C6:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 22
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "x27_second_ch_coalesced": {
+    "name": "x27_second_ch_coalesced",
+    "category": "state",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: RECORD_LAYER_FAILURE] record layer failure (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: RECORD_LAYER_FAILURE] record layer failure (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0001BB:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            },
+            {
+              "type": 23,
+              "len": 19
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0001BB:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            },
+            {
+              "type": 23,
+              "len": 19
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "x28_hrr_then_ch2_ech": {
+    "name": "x28_hrr_then_ch2_ech",
+    "category": "state",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test",
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 22,
+                "len": 90,
+                "handshake_type": 2,
+                "server_hello": "server_hello"
+              },
+              {
+                "type": 23,
+                "len": 64
+              },
+              {
+                "type": 23,
+                "len": 869
+              },
+              {
+                "type": 23,
+                "len": 281
+              },
+              {
+                "type": 23,
+                "len": 69
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test",
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 22,
+                "len": 90,
+                "handshake_type": 2,
+                "server_hello": "server_hello"
+              },
+              {
+                "type": 23,
+                "len": 64
+              },
+              {
+                "type": 23,
+                "len": 869
+              },
+              {
+                "type": 23,
+                "len": 281
+              },
+              {
+                "type": 23,
+                "len": 69
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 21,
+                "len": 2,
+                "alert": {
+                  "level": 2,
+                  "description": 47
+                }
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 21,
+                "len": 2,
+                "alert": {
+                  "level": 2,
+                  "description": 47
+                }
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "x28c_hrr_refused": {
+    "name": "x28c_hrr_refused",
+    "category": "state",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: CALLBACK_FAILED] callback failed (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          "approved.example.test",
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test",
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 22,
+                "len": 90,
+                "handshake_type": 2,
+                "server_hello": "server_hello"
+              },
+              {
+                "type": 23,
+                "len": 64
+              },
+              {
+                "type": 23,
+                "len": 869
+              },
+              {
+                "type": 23,
+                "len": 281
+              },
+              {
+                "type": 23,
+                "len": 69
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 21,
+                "len": 2,
+                "alert": {
+                  "level": 2,
+                  "description": 47
+                }
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 21,
+                "len": 2,
+                "alert": {
+                  "level": 2,
+                  "description": 47
+                }
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "x28b_hrr_ch2_different_sni": {
+    "name": "x28b_hrr_ch2_different_sni",
+    "category": "state",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: CALLBACK_FAILED] callback failed (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          "approved.example.test",
+          "evil.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test",
+          "evil.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 22,
+                "len": 90,
+                "handshake_type": 2,
+                "server_hello": "server_hello"
+              },
+              {
+                "type": 23,
+                "len": 64
+              },
+              {
+                "type": 23,
+                "len": 869
+              },
+              {
+                "type": 23,
+                "len": 281
+              },
+              {
+                "type": 23,
+                "len": 69
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 22,
+                "len": 90,
+                "handshake_type": 2,
+                "server_hello": "server_hello"
+              },
+              {
+                "type": 23,
+                "len": 49
+              },
+              {
+                "type": 23,
+                "len": 869
+              },
+              {
+                "type": 23,
+                "len": 281
+              },
+              {
+                "type": 23,
+                "len": 53
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 2,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test",
+          "evil.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 56,
+              "handshake_type": 2,
+              "server_hello": "hello_retry_request"
+            },
+            {
+              "type": 20,
+              "len": 1
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 22,
+                "len": 90,
+                "handshake_type": 2,
+                "server_hello": "server_hello"
+              },
+              {
+                "type": 23,
+                "len": 49
+              },
+              {
+                "type": 23,
+                "len": 869
+              },
+              {
+                "type": 23,
+                "len": 281
+              },
+              {
+                "type": 23,
+                "len": 53
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 2,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test",
+          "evil.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "x29_unexpected_first_msg": {
+    "name": "x29_unexpected_first_msg",
+    "category": "state",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "first handshake message type 20 != ClientHello",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: UNEXPECTED_MESSAGE] unexpected message (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000F4:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 10
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000F4:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 10
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "x30_garbage_after_ch": {
+    "name": "x30_garbage_after_ch",
+    "category": "state",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: RECORD_LAYER_FAILURE] record layer failure (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: RECORD_LAYER_FAILURE] record layer failure (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000119:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            },
+            {
+              "type": 23,
+              "len": 19
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000119:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            },
+            {
+              "type": 23,
+              "len": 19
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "g01_no_extensions_block": {
+    "name": "g01_no_extensions_block",
+    "category": "policy",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [],
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: CALLBACK_FAILED] callback failed (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          null
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: NO_SHARED_CIPHER] no shared cipher (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          null
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C1:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 40
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [],
+        "probe_exts_order": [],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "NONE"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C1:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 40
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [],
+        "probe_exts_order": [],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "NONE"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "g02_two_msgs_one_record": {
+    "name": "g02_two_msgs_one_record",
+    "category": "state",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: NOT_ON_RECORD_BOUNDARY] not on record boundary (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: NOT_ON_RECORD_BOUNDARY] not on record boundary (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000B6:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 10
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000B6:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 10
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "g03_tls12_second_flight_ch_ech": {
+    "name": "g03_tls12_second_flight_ch_ech",
+    "category": "state",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: RECORD_LAYER_FAILURE] record layer failure (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 103,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: RECORD_LAYER_FAILURE] record layer failure (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 103,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00010B:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 88,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 21,
+                "len": 2,
+                "alert": {
+                  "level": 2,
+                  "description": 70
+                }
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00010B:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 88,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ],
+          "after_ch2": {
+            "records": [
+              {
+                "type": 21,
+                "len": 2,
+                "alert": {
+                  "level": 2,
+                  "description": 70
+                }
+              }
+            ]
+          }
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "g04a_ech_ext_256th": {
+    "name": "g04a_ech_ext_256th",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "g04b_ech_ext_257th": {
+    "name": "g04b_ech_ext_257th",
+    "category": "ech-boundary",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "extension count bound exceeded",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "g05a_session_id_lie_ech": {
+    "name": "g05a_session_id_lie_ech",
+    "category": "ech-boundary",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "truncated session_id",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: LENGTH_MISMATCH] length mismatch (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00009F:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00009F:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "g05b_compression_lie_ech": {
+    "name": "g05b_compression_lie_ech",
+    "category": "ech-boundary",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "truncated compression_methods",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: LENGTH_MISMATCH] length mismatch (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00009F:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00009F:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "g06_zero_len_record_mid": {
+    "name": "g06_zero_len_record_mid",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "malformed cipher_suites length",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: LENGTH_MISMATCH] length mismatch (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00009F:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00009F:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 50
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "g07_ccs_before_ch": {
+    "name": "g07_ccs_before_ch",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "non-handshake record content type 20",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: UNEXPECTED_MESSAGE] unexpected message (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000F4:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 10
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000F4:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 10
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "g08a_record_version_0304": {
+    "name": "g08a_record_version_0304",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "unsupported record version 0x0304",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "g08b_mixed_record_versions": {
+    "name": "g08b_mixed_record_versions",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "gate_sni": "approved.example.test",
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "g09a_declared_16384": {
+    "name": "g09a_declared_16384",
+    "category": "success",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [
+          51966
+        ],
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: CALLBACK_FAILED] callback failed (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          null
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: NO_SHARED_CIPHER] no shared cipher (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          null
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C1:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 40
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [],
+        "probe_exts_order": [],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "NONE"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C1:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 40
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [],
+        "probe_exts_order": [],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "NONE"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "g09b_declared_16385": {
+    "name": "g09b_declared_16385",
+    "category": "malformed",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "oversized record payload 16389",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: RECORD_LAYER_FAILURE] record layer failure (_ssl.c:1081)",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000092:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 22
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000092:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 22
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "g10_empty_ext_vector": {
+    "name": "g10_empty_ext_vector",
+    "category": "policy",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "accept",
+        "gate_reason": "",
+        "gate_exts": [],
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: CALLBACK_FAILED] callback failed (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          null
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "SSLError: [SSL: NO_SHARED_CIPHER] no shared cipher (_ssl.c:1081)",
+        "openssl_sni_fires": [
+          null
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C1:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 40
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [],
+        "probe_exts_order": [],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "NONE"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A0000C1:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 40
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [],
+        "probe_exts_order": [],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "NONE"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "g11_dup_unknown_ext": {
+    "name": "g11_dup_unknown_ext",
+    "category": "policy",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "duplicate extension 0xcafe",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 64
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A000126:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 49
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 53
+            }
+          ]
+        },
+        "probe_chcb_fires": 1,
+        "probe_exts": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_exts_order": [
+          0,
+          10,
+          11,
+          13,
+          16,
+          43,
+          45,
+          51
+        ],
+        "probe_ech": 0,
+        "probe_sni_fires": [
+          "approved.example.test"
+        ],
+        "probe_isv2": 0
+      }
+    }
+  },
+  "e16_ech_tls12": {
+    "name": "e16_ech_tls12",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          "approved.example.test"
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 103,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 22,
+              "len": 849,
+              "handshake_type": 11
+            },
+            {
+              "type": 22,
+              "len": 300,
+              "handshake_type": 12
+            },
+            {
+              "type": 22,
+              "len": 4,
+              "handshake_type": 14
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  },
+  "e17_ech_no_sni": {
+    "name": "e17_ech_no_sni",
+    "category": "ech",
+    "findings": [],
+    "outcomes": {
+      "T1": {
+        "target": "T1_gate+python",
+        "gate_decision": "reject",
+        "gate_reason": "ECH extension 0xfe0d present",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": null,
+        "openssl_error": "",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": []
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T2": {
+        "target": "T2_direct_python",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "ch_accepted",
+        "openssl_error": "awaiting client flight (timeout)",
+        "openssl_sni_fires": [
+          null
+        ],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 22,
+              "len": 90,
+              "handshake_type": 2,
+              "server_hello": "server_hello"
+            },
+            {
+              "type": 20,
+              "len": 1
+            },
+            {
+              "type": 23,
+              "len": 60
+            },
+            {
+              "type": 23,
+              "len": 869
+            },
+            {
+              "type": 23,
+              "len": 281
+            },
+            {
+              "type": 23,
+              "len": 69
+            }
+          ]
+        },
+        "probe_chcb_fires": null,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": null,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T3": {
+        "target": "T3_probe_log",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      },
+      "T4": {
+        "target": "T4_probe_deny_ech",
+        "gate_decision": null,
+        "gate_reason": "",
+        "gate_exts": null,
+        "gate_sni": null,
+        "openssl_outcome": "failed",
+        "openssl_error": "error:0A00006E:SSL",
+        "openssl_sni_fires": [],
+        "openssl_alpn": null,
+        "openssl_tls": null,
+        "flight_obs": {
+          "records": [
+            {
+              "type": 21,
+              "len": 2,
+              "alert": {
+                "level": 2,
+                "description": 47
+              }
+            }
+          ]
+        },
+        "probe_chcb_fires": 0,
+        "probe_exts": null,
+        "probe_exts_order": null,
+        "probe_ech": 0,
+        "probe_sni_fires": [],
+        "probe_isv2": null
+      }
+    }
+  }
+}

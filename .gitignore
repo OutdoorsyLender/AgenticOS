@@ -77,6 +77,9 @@ id_ed25519*
 # --- Research/input artifacts (local-only unless explicitly authorized) ---
 deep-research-report*.md
 
+# --- Spike/research ephemeral run artifacts (generated keys, binaries, logs) ---
+spikes/*/work/
+
 # --- Editors and operating systems ---
 .idea/
 .vscode/
