@@ -1,0 +1,19 @@
+# M4B-2 certificate-helper dependency gate (Slice 2).
+#
+# Exact, hash-pinned, wheel-only dependency closure for the SHORT-LIVED
+# certificate helper only. The long-lived broker runtime remains
+# standard-library-only; pyproject.toml runtime dependencies are unchanged.
+#
+# Offline reproduction (no network):
+#   pip install --no-index --find-links requirements/wheelhouse \
+#       --require-hashes --only-binary=:all: \
+#       -r requirements/m4b2-cert-helper.txt --target <tmpdir>
+#
+# Review record: docs/phase-zero/dependency-review-m4b2.md
+
+cryptography==46.0.2 \
+    --hash=sha256:be939b99d4e091eec9a2bcf41aaf8f351f312cd19ff74b5c83480f08a8a43e0b
+cffi==2.1.1 \
+    --hash=sha256:b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
