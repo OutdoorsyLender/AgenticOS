@@ -292,6 +292,16 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
 
     name = "bubblewrap-landlock-capability-transport"
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_transport_policy" and hasattr(self, "_transport_policy"):
+            raise AttributeError("transport_policy is write-once")
+        super().__setattr__(name, value)
+
+    @property
+    def transport_policy(self) -> TransportPolicy:
+        """The immutable launch authority captured when this runner is built."""
+        return self._transport_policy
+
     def __init__(
         self,
         worker_path,
@@ -318,11 +328,13 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             setup_timeout=setup_timeout,
             **kwargs,
         )
-        self.transport_policy = transport_policy
+        self._transport_policy = transport_policy
         self.supervisor_path = Path(supervisor_path)
         self.last_transport_observation: NetworkTransportObservation | None = None
 
-    def _claim_transport_authority(self) -> None:
+    def _claim_transport_authority(
+        self, transport_policy: TransportPolicy | None = None
+    ) -> None:
         """Consume exact policy authority once per controller-process lifetime.
 
         This registry deliberately never evicts: when its fixed bound is full,
@@ -330,7 +342,11 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         lifetime, so the outer AgenticOS task authority must continue issuing
         globally fresh task generations/nonces across controller processes.
         """
-        policy = self.transport_policy
+        policy = (
+            self.transport_policy
+            if transport_policy is None
+            else transport_policy
+        )
         if type(policy) is not TransportPolicy:
             raise CapabilityTransportError(
                 "transport launch authority has the wrong exact type"
@@ -355,14 +371,28 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 )
             _CONSUMED_TRANSPORT_AUTHORITIES.add(key)
 
-    def _pin_synthetic_fixture(self, fd: int | None) -> int | None:
-        if self.transport_policy.mode is TransportMode.DENY:
+    def _pin_synthetic_fixture(
+        self,
+        fd: int | None,
+        *,
+        transport_policy: TransportPolicy | None = None,
+    ) -> int | None:
+        policy = (
+            self.transport_policy
+            if transport_policy is None
+            else transport_policy
+        )
+        if type(policy) is not TransportPolicy:
+            raise CapabilityTransportError(
+                "transport launch authority has the wrong exact type"
+            )
+        if policy.mode is TransportMode.DENY:
             if fd is not None:
                 raise CapabilityTransportError(
                     "deny transport cannot receive a synthetic fixture"
                 )
             return None
-        if self.transport_policy.mode is not TransportMode.SYNTHETIC_FIXTURE_FD:
+        if policy.mode is not TransportMode.SYNTHETIC_FIXTURE_FD:
             raise CapabilityTransportError("transport policy mode is unsupported")
         if type(fd) is not int or fd < 0 or fcntl is None:
             raise CapabilityTransportError(
@@ -419,13 +449,23 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         worker_argv: list[str],
         *,
         synthetic_fixture_fd: int | None = None,
+        transport_policy: TransportPolicy | None = None,
     ) -> _PreparedLiveLaunch:
-        if self.transport_policy.mode is TransportMode.DENY:
+        policy = (
+            self.transport_policy
+            if transport_policy is None
+            else transport_policy
+        )
+        if type(policy) is not TransportPolicy:
+            raise CapabilityTransportError(
+                "transport launch authority has the wrong exact type"
+            )
+        if policy.mode is TransportMode.DENY:
             if synthetic_fixture_fd is not None:
                 raise CapabilityTransportError(
                     "deny transport cannot receive a synthetic fixture"
                 )
-        elif self.transport_policy.mode is TransportMode.SYNTHETIC_FIXTURE_FD:
+        elif policy.mode is TransportMode.SYNTHETIC_FIXTURE_FD:
             if type(synthetic_fixture_fd) is not int or synthetic_fixture_fd < 0:
                 raise CapabilityTransportError(
                     "synthetic transport requires one test-only fixture descriptor"
@@ -439,53 +479,24 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         sources: list[AuthorizedSource] = []
 
         def exact_pipe(*, child_reads: bool, target: int) -> tuple[int, int]:
-            read_fd, write_fd = os.pipe()
-            try:
-                if child_reads:
-                    controller = self._move_fd(write_fd, _CONTROLLER_FD_MINIMUM)
-                    os.set_inheritable(controller, False)
-                    child = _move_exact_fd(read_fd, target)
-                    owned.add(controller, child)
-                    return child, controller
-                controller = self._move_fd(read_fd, _CONTROLLER_FD_MINIMUM)
-                os.set_inheritable(controller, False)
-                child = _move_exact_fd(write_fd, target)
-                owned.add(controller, child)
-                return controller, child
-            except BaseException:
-                for fd in (read_fd, write_fd):
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                raise
+            return _relocate_exact_pipe(
+                owned,
+                controller_mover=self._move_fd,
+                child_reads=child_reads,
+                target=target,
+                controller_minimum=_CONTROLLER_FD_MINIMUM,
+            )
 
         def exact_socketpair(
             first_target: int, second_target: Optional[int]
         ) -> tuple[int, int]:
-            first_socket, second_socket = socket.socketpair(
-                socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+            return _relocate_exact_socketpair(
+                owned,
+                controller_mover=self._move_fd,
+                first_target=first_target,
+                second_target=second_target,
+                controller_minimum=_CONTROLLER_FD_MINIMUM,
             )
-            first_raw = first_socket.detach()
-            second_raw = second_socket.detach()
-            try:
-                first = _move_exact_fd(first_raw, first_target)
-                if second_target is None:
-                    second = self._move_fd(
-                        second_raw, _CONTROLLER_FD_MINIMUM
-                    )
-                    os.set_inheritable(second, False)
-                else:
-                    second = _move_exact_fd(second_raw, second_target)
-                owned.add(first, second)
-                return first, second
-            except BaseException:
-                for fd in (first_raw, second_raw):
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                raise
 
         try:
             bwrap_fd = _move_exact_fd(
@@ -495,39 +506,39 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             owned.add(bwrap_fd)
             expected_bwrap_identity = FileIdentity.from_stat(os.fstat(bwrap_fd))
 
-            supervisor = _open_exact_source(
+            supervisor = _open_owned_exact_source(
+                owned,
+                sources,
                 self.supervisor_path,
                 stat.S_IFREG,
                 SUPERVISOR_EXECUTABLE_FD,
             )
-            broker_runtime = _open_exact_source(
+            broker_runtime = _open_owned_exact_source(
+                owned,
+                sources,
                 Path("/usr"), stat.S_IFDIR, BROKER_RUNTIME_USR_FD
             )
-            broker_code = _open_exact_source(
+            broker_code = _open_owned_exact_source(
+                owned,
+                sources,
                 Path(__file__).with_name("network_broker.py"),
                 stat.S_IFREG,
                 BROKER_CODE_FD,
             )
-            identity_code = _open_exact_source(
+            identity_code = _open_owned_exact_source(
+                owned,
+                sources,
                 Path(__file__).with_name("network_identity.py"),
                 stat.S_IFREG,
                 BROKER_IDENTITY_CODE_FD,
             )
-            models_code = _open_exact_source(
+            models_code = _open_owned_exact_source(
+                owned,
+                sources,
                 Path(__file__).with_name("network_models.py"),
                 stat.S_IFREG,
                 BROKER_MODELS_CODE_FD,
             )
-            network_sources = (
-                supervisor,
-                broker_runtime,
-                broker_code,
-                identity_code,
-                models_code,
-            )
-            sources.extend(network_sources)
-            owned.add(*(source.fd for source in network_sources))
-
             interpreter = secure_open_source(
                 Path(INTERPRETER_PATH), expected_type=stat.S_IFREG
             )
@@ -556,7 +567,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             )
 
             policy_fd = _move_exact_fd(
-                create_sealed_policy_fd(self.transport_policy), BROKER_POLICY_FD
+                create_sealed_policy_fd(policy), BROKER_POLICY_FD
             )
             owned.add(policy_fd)
             if synthetic_fixture_fd is not None:
@@ -574,8 +585,8 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 owned.add(fixture_capability)
             verified_policy = read_sealed_policy_fd(policy_fd)
             if (
-                verified_policy.policy != self.transport_policy
-                or verified_policy.digest != policy_digest(self.transport_policy)
+                verified_policy.policy != policy
+                or verified_policy.digest != policy_digest(policy)
             ):
                 _reject("sealed transport policy does not match controller authority")
             _broker_handoff, worker_handoff = exact_socketpair(
@@ -604,7 +615,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             )
 
             network_plan = build_network_boundary_plan(
-                transport_policy=self.transport_policy,
+                transport_policy=policy,
                 runtime_usr=broker_runtime,
                 broker_code=broker_code,
                 identity_code=identity_code,
@@ -673,13 +684,13 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 for mount in runtime_plan.mounts
             ]
             network_record = NetworkLaunchRecord(
-                task_id=self.transport_policy.task_id,
-                task_generation=self.transport_policy.task_generation,
-                launch_nonce=self.transport_policy.launch_nonce,
+                task_id=policy.task_id,
+                task_generation=policy.task_generation,
+                launch_nonce=policy.launch_nonce,
                 network_policy_digest=network_plan.transport_policy_digest,
                 handoff_fd=_WORKER_HANDOFF_FD,
-                proxy_host=self.transport_policy.proxy_host,
-                proxy_port=self.transport_policy.proxy_port,
+                proxy_host=policy.proxy_host,
+                proxy_port=policy.proxy_port,
             )
             prepared_request = prepare_launch_request(
                 worker_argv,
@@ -763,8 +774,15 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             raise ValueError("M4B worker cwd must be the stable /workspace ABI")
         if _leak_fds:
             raise ValueError("M4B does not permit additional inherited descriptors")
-        self._claim_transport_authority()
-        pinned_fixture = self._pin_synthetic_fixture(_synthetic_fixture_fd)
+        transport_policy = self.transport_policy
+        if type(transport_policy) is not TransportPolicy:
+            raise CapabilityTransportError(
+                "transport launch authority has the wrong exact type"
+            )
+        self._claim_transport_authority(transport_policy)
+        pinned_fixture = self._pin_synthetic_fixture(
+            _synthetic_fixture_fd, transport_policy=transport_policy
+        )
         try:
             support = self.check_support()
             if not support.supported:
@@ -779,7 +797,9 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             worker_argv = [str(item) for item in argv]
             timeout = self.default_timeout if timeout is None else float(timeout)
             prepared = self._prepare_live_launch(
-                worker_argv, synthetic_fixture_fd=pinned_fixture
+                worker_argv,
+                synthetic_fixture_fd=pinned_fixture,
+                transport_policy=transport_policy,
             )
         finally:
             if pinned_fixture is not None:
@@ -878,13 +898,13 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             )
 
             network_record = NetworkLaunchRecord(
-                task_id=self.transport_policy.task_id,
-                task_generation=self.transport_policy.task_generation,
-                launch_nonce=self.transport_policy.launch_nonce,
+                task_id=transport_policy.task_id,
+                task_generation=transport_policy.task_generation,
+                launch_nonce=transport_policy.launch_nonce,
                 network_policy_digest=prepared.network_plan.transport_policy_digest,
                 handoff_fd=_WORKER_HANDOFF_FD,
-                proxy_host=self.transport_policy.proxy_host,
-                proxy_port=self.transport_policy.proxy_port,
+                proxy_host=transport_policy.proxy_host,
+                proxy_port=transport_policy.proxy_port,
             )
             authority.expected_cgroup = expected_cgroup
             authority.host_netns = controller_snapshot.identities["net"]
@@ -908,7 +928,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 and prepared.supervisor_argv[0] == "task_supervisor"
             )
             authority.supervisor_process_identity = identity
-            authority.transport_policy = self.transport_policy
+            authority.transport_policy = transport_policy
             authority.worker_outer = worker_outer
             authority.supervisor_status_stream = supervisor_status
             authority.broker_outer = broker_outer
@@ -1126,10 +1146,8 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                     self.last_transport_observation = (
                         _read_authenticated_transport_observation(
                             prepared.broker_control_w,
-                            expected_policy=self.transport_policy,
-                            expected_policy_digest=policy_digest(
-                                self.transport_policy
-                            ),
+                            expected_policy=transport_policy,
+                            expected_policy_digest=policy_digest(transport_policy),
                             budget=remaining_terminal_budget(),
                         )
                     )
@@ -1180,8 +1198,8 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 self.last_transport_observation = (
                     _read_authenticated_transport_observation(
                         prepared.broker_control_w,
-                        expected_policy=self.transport_policy,
-                        expected_policy_digest=policy_digest(self.transport_policy),
+                        expected_policy=transport_policy,
+                        expected_policy_digest=policy_digest(transport_policy),
                         budget=self.setup_timeout,
                     )
                 )
@@ -1222,7 +1240,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                     broker_resolved=authority.broker_recheck,
                     ready=coordinated.ready,
                     listener_evidence=self.last_listener_evidence,
-                    transport_policy=self.transport_policy,
+                    transport_policy=transport_policy,
                     transport_observation=self.last_transport_observation,
                     filesystem_policy_digest=(
                         prepared.runtime_plan.combined_policy_digest
@@ -1796,6 +1814,87 @@ def _open_exact_source(path: Path, expected_type: int, target: int) -> Authorize
     source = secure_open_source(path, expected_type=expected_type)
     moved = _move_exact_fd(source.fd, target)
     return AuthorizedSource(source.locator, moved, source.identity)
+
+
+def _open_owned_exact_source(
+    owned: _OwnedDescriptors,
+    sources: list[AuthorizedSource],
+    path: Path,
+    expected_type: int,
+    target: int,
+) -> AuthorizedSource:
+    """Open one fixed source and register it before any later open can fail."""
+    source = _open_exact_source(path, expected_type, target)
+    sources.append(source)
+    owned.add(source.fd)
+    return source
+
+
+def _relocate_exact_pipe(
+    owned: _OwnedDescriptors,
+    *,
+    controller_mover: Callable[[int, int], int],
+    child_reads: bool,
+    target: int,
+    controller_minimum: int,
+) -> tuple[int, int]:
+    """Relocate a pipe while registering each completed ownership transfer."""
+    read_fd, write_fd = os.pipe()
+    try:
+        if child_reads:
+            controller = controller_mover(write_fd, controller_minimum)
+            owned.add(controller)
+            os.set_inheritable(controller, False)
+            child = _move_exact_fd(read_fd, target)
+            owned.add(child)
+            return child, controller
+        controller = controller_mover(read_fd, controller_minimum)
+        owned.add(controller)
+        os.set_inheritable(controller, False)
+        child = _move_exact_fd(write_fd, target)
+        owned.add(child)
+        return controller, child
+    except BaseException:
+        for fd in (read_fd, write_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+
+
+def _relocate_exact_socketpair(
+    owned: _OwnedDescriptors,
+    *,
+    controller_mover: Callable[[int, int], int],
+    first_target: int,
+    second_target: Optional[int],
+    controller_minimum: int,
+) -> tuple[int, int]:
+    """Relocate a socket pair while owning the first move immediately."""
+    first_socket, second_socket = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+    )
+    first_raw = first_socket.detach()
+    second_raw = second_socket.detach()
+    try:
+        first = _move_exact_fd(first_raw, first_target)
+        owned.add(first)
+        if second_target is None:
+            second = controller_mover(second_raw, controller_minimum)
+            owned.add(second)
+            os.set_inheritable(second, False)
+        else:
+            second = _move_exact_fd(second_raw, second_target)
+            owned.add(second)
+        return first, second
+    except BaseException:
+        for fd in (first_raw, second_raw):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
 
 
 def _read_line(fd: int, *, budget: float, maximum: int) -> bytes:

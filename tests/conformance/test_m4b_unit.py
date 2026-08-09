@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import sys
+
+import pytest
+
+if not sys.platform.startswith("linux"):
+    pytest.skip("M4B-1 capability transport requires Linux", allow_module_level=True)
+
 import array
 import contextlib
 import dataclasses
@@ -17,13 +24,10 @@ import select
 import socket
 import stat
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
-
-import pytest
 
 
 MODULE = "agenticos.sandbox.network_models"
@@ -943,6 +947,33 @@ def test_sandbox_package_exports_m4b_transport_contract():
         "policy_digest",
     ):
         assert getattr(sandbox, name) is getattr(models, name)
+
+
+def test_sandbox_package_import_does_not_eagerly_require_linux_only_fcntl():
+    repository_root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(repository_root / "src")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.modules['fcntl'] = None; "
+                "import agenticos.sandbox as sandbox; "
+                "assert sandbox.NamespaceLandlockRunner; "
+                "assert sandbox.TransportPolicy; "
+                "assert 'agenticos.sandbox.m4b_runner' not in sys.modules"
+            ),
+        ],
+        cwd=repository_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_policy_memfd_is_fully_sealed_round_trips_and_rejects_writes():
@@ -5503,6 +5534,214 @@ def test_m4b_runner_owned_descriptors_close_once_and_can_transfer():
     os.close(second_r)
 
 
+def test_m4b_partial_pipe_relocation_registers_first_moved_fd(monkeypatch):
+    runner = _m4b_runner()
+    owned = runner._OwnedDescriptors()
+    baseline = _open_fd_numbers()
+    target = max(baseline) + 32
+
+    def fail_second(fd, _target):
+        os.close(fd)
+        raise RuntimeError("injected second pipe relocation failure")
+
+    monkeypatch.setattr(runner, "_move_exact_fd", fail_second)
+    try:
+        with pytest.raises(RuntimeError, match="second pipe"):
+            runner._relocate_exact_pipe(
+                owned,
+                controller_mover=runner.NamespaceLandlockRunner._move_fd,
+                child_reads=False,
+                target=target,
+                controller_minimum=target + 32,
+            )
+    finally:
+        owned.close()
+
+    assert _open_fd_numbers() == baseline
+
+
+def test_m4b_partial_socketpair_relocation_registers_first_moved_fd(monkeypatch):
+    runner = _m4b_runner()
+    owned = runner._OwnedDescriptors()
+    baseline = _open_fd_numbers()
+    first_target = max(baseline) + 32
+    calls = 0
+    original_move = runner._move_exact_fd
+
+    def fail_second(fd, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            os.close(fd)
+            raise RuntimeError("injected second socket relocation failure")
+        return original_move(fd, target)
+
+    monkeypatch.setattr(runner, "_move_exact_fd", fail_second)
+    try:
+        with pytest.raises(RuntimeError, match="second socket"):
+            runner._relocate_exact_socketpair(
+                owned,
+                controller_mover=runner.NamespaceLandlockRunner._move_fd,
+                first_target=first_target,
+                second_target=first_target + 1,
+                controller_minimum=first_target + 64,
+            )
+    finally:
+        owned.close()
+
+    assert calls == 2
+    assert _open_fd_numbers() == baseline
+
+
+@pytest.mark.parametrize("failure", ["partial-open", "fixed-move"])
+def test_m4b_partial_network_source_open_is_owned_immediately(
+    tmp_path, monkeypatch, failure
+):
+    runner = _m4b_runner()
+    owned = runner._OwnedDescriptors()
+    sources = []
+    baseline = _open_fd_numbers()
+    targets = [max(baseline) + 32, max(baseline) + 33]
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    original_open = runner._open_exact_source
+    original_move = runner._move_exact_fd
+
+    if failure == "partial-open":
+        calls = 0
+
+        def fail_open(path, expected_type, target):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected partial source open failure")
+            return original_open(path, expected_type, target)
+
+        monkeypatch.setattr(runner, "_open_exact_source", fail_open)
+    else:
+        def fail_move(fd, target):
+            if target == targets[1]:
+                os.close(fd)
+                raise RuntimeError("injected fixed source move failure")
+            return original_move(fd, target)
+
+        monkeypatch.setattr(runner, "_move_exact_fd", fail_move)
+
+    try:
+        with pytest.raises(RuntimeError, match="source (open|move)"):
+            runner._open_owned_exact_source(
+                owned, sources, first, stat.S_IFREG, targets[0]
+            )
+            runner._open_owned_exact_source(
+                owned, sources, second, stat.S_IFREG, targets[1]
+            )
+    finally:
+        owned.close()
+
+    assert _open_fd_numbers() == baseline
+
+
+def test_m4b_transport_policy_is_read_only_and_one_object_threads_through_run(
+    tmp_path, monkeypatch
+):
+    runner_module = _m4b_runner()
+    models = _network_models()
+    runtime = importlib.import_module("agenticos.sandbox.runtime_boundary")
+    now = time.monotonic_ns()
+
+    def policy(task_id, nonce):
+        return models.TransportPolicy(
+            version="AOSNET/1",
+            task_id=task_id,
+            task_generation=1,
+            launch_nonce=nonce,
+            mode=models.TransportMode.DENY,
+            proxy_host="127.0.0.1",
+            proxy_port=18080,
+            activated_at_monotonic_ns=now - 1_000_000,
+            expires_at_monotonic_ns=now + 10_000_000_000,
+            connection_limit=1,
+            byte_limit=4096,
+        )
+
+    original = policy(
+        f"policy-original-{os.getpid()}-{time.monotonic_ns()}", "ab" * 16
+    )
+    substitute = policy(
+        f"policy-substitute-{os.getpid()}-{time.monotonic_ns()}", "cd" * 16
+    )
+    worker = tmp_path / "worker"
+    launcher = tmp_path / "launcher"
+    supervisor = tmp_path / "supervisor"
+    for executable in (worker, launcher, supervisor):
+        executable.write_bytes(b"fixture")
+    instance = runner_module.CapabilityTransportRunner(
+        worker,
+        workspace=tmp_path,
+        profile=runtime.M4AProfile.INSPECT,
+        launcher_path=launcher,
+        task_tmp=tmp_path,
+        synthetic_home=tmp_path,
+        transport_policy=original,
+        supervisor_path=supervisor,
+    )
+    instance._bwrap_capability = object()
+    claim_entered = threading.Event()
+    substitution_finished = threading.Event()
+    substitution_errors = []
+    claimed = []
+    prepared = []
+    original_claim = instance._claim_transport_authority
+
+    def substitute_during_claim():
+        claim_entered.wait(2)
+        for attribute in ("transport_policy", "_transport_policy"):
+            try:
+                setattr(instance, attribute, substitute)
+            except BaseException as exc:
+                substitution_errors.append(exc)
+        substitution_finished.set()
+
+    def claim(snapshot):
+        claimed.append(snapshot)
+        claim_entered.set()
+        assert substitution_finished.wait(2)
+        return original_claim(snapshot)
+
+    def prepare(_worker_argv, *, synthetic_fixture_fd, transport_policy):
+        assert synthetic_fixture_fd is None
+        prepared.append(transport_policy)
+        raise RuntimeError("stop after policy preparation observation")
+
+    class Supported:
+        supported = True
+        reasons = []
+
+    monkeypatch.setattr(instance, "_claim_transport_authority", claim)
+    monkeypatch.setattr(instance, "_prepare_live_launch", prepare)
+    monkeypatch.setattr(instance, "check_support", lambda: Supported())
+    attacker = threading.Thread(target=substitute_during_claim)
+    attacker.start()
+    try:
+        with pytest.raises(RuntimeError, match="policy preparation"):
+            instance.run(["/usr/bin/true"], cwd="/workspace", env={})
+    finally:
+        attacker.join(2)
+
+    assert not attacker.is_alive()
+    assert len(substitution_errors) == 2
+    assert all(isinstance(exc, AttributeError) for exc in substitution_errors)
+    assert instance.transport_policy is original
+    assert claimed == [original]
+    assert prepared == [original]
+    with pytest.raises(
+        runner_module.CapabilityTransportError, match="already consumed"
+    ):
+        original_claim(original)
+
+
 def test_m4b_runner_full_live_failure_closes_fds_before_scope_cleanup():
     runner_module = _m4b_runner()
     runner = object.__new__(runner_module.CapabilityTransportRunner)
@@ -5703,7 +5942,7 @@ instance.task_tmp = root / "task-tmp"
 instance.synthetic_home = root / "home"
 instance.supervisor_path = root / "supervisor"
 now = time.monotonic_ns()
-instance.transport_policy = TransportPolicy(
+instance._transport_policy = TransportPolicy(
     version="AOSNET/1", task_id="task-live", task_generation=1,
     launch_nonce="ab" * 16, mode=TransportMode.DENY,
     proxy_host="127.0.0.1", proxy_port=18080,

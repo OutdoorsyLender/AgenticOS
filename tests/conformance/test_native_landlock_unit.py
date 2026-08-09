@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import sys
+
+import pytest
+
+if not sys.platform.startswith("linux"):
+    pytest.skip("native launcher contracts require Linux", allow_module_level=True)
+
 import fcntl
 import os
 import re
 import select
 import socket
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 import agenticos.sandbox.launcher as launcher_module
-import pytest
 from agenticos.sandbox.launcher import (
     DEFAULT_LAUNCHER_PATH,
     NetworkLaunchRecord,

@@ -6,7 +6,6 @@ boundaries and fail closed when their required host capabilities are absent.
 """
 
 from .m4a_runner import NamespaceLandlockRunner
-from .m4b_runner import CapabilityTransportRunner
 from .network_models import (
     BrokerProcessEvidence,
     BrokerReadyEvidence,
@@ -16,6 +15,18 @@ from .network_models import (
     canonical_policy_bytes,
     policy_digest,
 )
+
+
+def __getattr__(name: str) -> object:
+    """Load the Linux-only M4B runner only when callers request it."""
+
+    if name != "CapabilityTransportRunner":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from .m4b_runner import CapabilityTransportRunner
+
+    globals()[name] = CapabilityTransportRunner
+    return CapabilityTransportRunner
 
 __all__ = [
     "BrokerProcessEvidence",

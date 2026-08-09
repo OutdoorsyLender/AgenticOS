@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import sys
+
+import pytest
+
+if not sys.platform.startswith("linux"):
+    pytest.skip("M4B-1 real-host proof requires Linux", allow_module_level=True)
+
 import dataclasses
 import contextlib
 import fcntl
@@ -12,12 +19,9 @@ import signal
 import socket
 import struct
 import subprocess
-import sys
 import threading
 import time
 import uuid
-
-import pytest
 
 from agenticos.sandbox.network_identity import (
     recv_listener_fd,

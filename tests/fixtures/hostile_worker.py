@@ -23,7 +23,6 @@ import argparse
 import json
 import os
 import re
-import resource
 import signal
 import socket
 import subprocess
@@ -31,6 +30,11 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
+
+try:
+    import resource
+except ImportError:  # Native Windows runs the portable fixture scenarios.
+    resource = None  # type: ignore[assignment]
 
 CANARY_RE = re.compile(r"AOS_CANARY_\S+")
 
@@ -1240,6 +1244,8 @@ def _bounded_live_fd_census() -> list[int]:
         # Landlock intentionally hides /proc/self/fd. Scan the complete numeric
         # process limit instead, with a fixed maximum, so high inherited FDs
         # cannot escape the proof.
+        if resource is None:
+            raise RuntimeError("descriptor-limit census requires resource support")
         soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
         if not 0 < soft_limit <= 1 << 20:
             raise RuntimeError("descriptor limit exceeds the census bound")
