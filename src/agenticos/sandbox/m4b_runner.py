@@ -20,6 +20,7 @@ import select
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -77,6 +78,7 @@ from .network_broker import (
     ProcStatusEvidence,
     SealedPolicyEvidence,
     validate_broker_environment,
+    validate_fixture_fd,
 )
 from .network_identity import (
     VerifiedSealedPolicy,
@@ -135,6 +137,9 @@ _WORKER_SOURCE_MINIMUM = 50
 _CONTROLLER_FD_MINIMUM = 100
 _MAX_CAPTURE_BYTES = 64 * 1024 * 1024
 _POLL_READ_CLOSED = getattr(select, "POLLRDHUP", 0x2000)
+_MAX_CONSUMED_TRANSPORT_AUTHORITIES = 1 << 16
+_CONSUMED_TRANSPORT_AUTHORITIES: set[tuple[str, int, str, str]] = set()
+_TRANSPORT_AUTHORITY_REGISTRY_LOCK = threading.Lock()
 
 
 class CapabilityTransportError(RuntimeError):
@@ -293,6 +298,65 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         self.transport_policy = transport_policy
         self.supervisor_path = Path(supervisor_path)
 
+    def _claim_transport_authority(self) -> None:
+        """Consume exact policy authority once per controller-process lifetime.
+
+        This registry deliberately never evicts: when its fixed bound is full,
+        the controller fails closed. A controller restart is a new trust-domain
+        lifetime, so the outer AgenticOS task authority must continue issuing
+        globally fresh task generations/nonces across controller processes.
+        """
+        policy = self.transport_policy
+        if type(policy) is not TransportPolicy:
+            raise CapabilityTransportError(
+                "transport launch authority has the wrong exact type"
+            )
+        key = (
+            policy.task_id,
+            policy.task_generation,
+            policy.launch_nonce,
+            policy_digest(policy),
+        )
+        with _TRANSPORT_AUTHORITY_REGISTRY_LOCK:
+            if key in _CONSUMED_TRANSPORT_AUTHORITIES:
+                raise CapabilityTransportError(
+                    "transport launch authority is already consumed"
+                )
+            if (
+                len(_CONSUMED_TRANSPORT_AUTHORITIES)
+                >= _MAX_CONSUMED_TRANSPORT_AUTHORITIES
+            ):
+                raise CapabilityTransportError(
+                    "transport authority registry reached its fail-closed bound"
+                )
+            _CONSUMED_TRANSPORT_AUTHORITIES.add(key)
+
+    def _pin_synthetic_fixture(self, fd: int | None) -> int | None:
+        if self.transport_policy.mode is TransportMode.DENY:
+            if fd is not None:
+                raise CapabilityTransportError(
+                    "deny transport cannot receive a synthetic fixture"
+                )
+            return None
+        if self.transport_policy.mode is not TransportMode.SYNTHETIC_FIXTURE_FD:
+            raise CapabilityTransportError("transport policy mode is unsupported")
+        if type(fd) is not int or fd < 0 or fcntl is None:
+            raise CapabilityTransportError(
+                "synthetic transport requires one test-only fixture descriptor"
+            )
+        try:
+            pinned = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 400)
+        except OSError as exc:
+            raise CapabilityTransportError(
+                "synthetic fixture capability cannot be pinned"
+            ) from exc
+        try:
+            validate_fixture_fd(pinned)
+        except BaseException:
+            os.close(pinned)
+            raise
+        return pinned
+
     def check_support(self, refresh: bool = False):
         support = super().check_support(refresh=refresh)
         if not self.supervisor_path.is_file():
@@ -327,11 +391,25 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             raise
 
     def _prepare_live_launch(
-        self, worker_argv: list[str]
+        self,
+        worker_argv: list[str],
+        *,
+        synthetic_fixture_fd: int | None = None,
     ) -> _PreparedLiveLaunch:
-        if self.transport_policy.mode is not TransportMode.DENY:
+        if self.transport_policy.mode is TransportMode.DENY:
+            if synthetic_fixture_fd is not None:
+                raise CapabilityTransportError(
+                    "deny transport cannot receive a synthetic fixture"
+                )
+        elif self.transport_policy.mode is TransportMode.SYNTHETIC_FIXTURE_FD:
+            if type(synthetic_fixture_fd) is not int or synthetic_fixture_fd < 0:
+                raise CapabilityTransportError(
+                    "synthetic transport requires one test-only fixture descriptor"
+                )
+            validate_fixture_fd(synthetic_fixture_fd)
+        else:
             raise CapabilityTransportError(
-                "production Task 5 runner accepts only the deny transport mode"
+                "transport policy mode is unsupported"
             )
         owned = _OwnedDescriptors()
         sources: list[AuthorizedSource] = []
@@ -457,6 +535,19 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 create_sealed_policy_fd(self.transport_policy), BROKER_POLICY_FD
             )
             owned.add(policy_fd)
+            if synthetic_fixture_fd is not None:
+                fixture_duplicate = os.dup(synthetic_fixture_fd)
+                try:
+                    fixture_capability = _move_exact_fd(
+                        fixture_duplicate, BROKER_FIXTURE_FD
+                    )
+                except BaseException:
+                    try:
+                        os.close(fixture_duplicate)
+                    except OSError:
+                        pass
+                    raise
+                owned.add(fixture_capability)
             verified_policy = read_sealed_policy_fd(policy_fd)
             if (
                 verified_policy.policy != self.transport_policy
@@ -641,23 +732,34 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         timeout: Optional[float] = None,
         _leak_fds: Sequence[int] = (),
         _marker_path: Optional[Path] = None,
+        _synthetic_fixture_fd: int | None = None,
     ) -> ProcessResult:
         """Launch one protocol-v3 worker only after authenticated readiness."""
         if str(cwd) != "/workspace":
             raise ValueError("M4B worker cwd must be the stable /workspace ABI")
         if _leak_fds:
             raise ValueError("M4B does not permit additional inherited descriptors")
-        support = self.check_support()
-        if not support.supported:
-            raise ContainmentUnavailableError(
-                "M4B capability transport unavailable: "
-                + "; ".join(support.reasons)
+        self._claim_transport_authority()
+        pinned_fixture = self._pin_synthetic_fixture(_synthetic_fixture_fd)
+        try:
+            support = self.check_support()
+            if not support.supported:
+                raise ContainmentUnavailableError(
+                    "M4B capability transport unavailable: "
+                    + "; ".join(support.reasons)
+                )
+            if self._bwrap_capability is None:
+                raise ContainmentUnavailableError(
+                    "Bubblewrap capability evidence is missing"
+                )
+            worker_argv = [str(item) for item in argv]
+            timeout = self.default_timeout if timeout is None else float(timeout)
+            prepared = self._prepare_live_launch(
+                worker_argv, synthetic_fixture_fd=pinned_fixture
             )
-        if self._bwrap_capability is None:
-            raise ContainmentUnavailableError("Bubblewrap capability evidence is missing")
-        worker_argv = [str(item) for item in argv]
-        timeout = self.default_timeout if timeout is None else float(timeout)
-        prepared = self._prepare_live_launch(worker_argv)
+        finally:
+            if pinned_fixture is not None:
+                os.close(pinned_fixture)
         owned = prepared.owned
         unit = f"aos-task-{uuid.uuid4().hex[:12]}"
         scope = f"{unit}.scope"
@@ -676,6 +778,9 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         authority = _LiveAuthority()
         self.last_ordering_observations = {}
         self.last_namespace_evidence = None
+        self.last_broker_process = None
+        self.last_listener_evidence = None
+        self.last_broker_identity_mapping = None
         self.last_launch_outcome = outcome
 
         try:
@@ -742,6 +847,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             )
             worker_outer = _read_observed_process(proc.pid)
             broker_outer = _read_observed_process(broker_outer_pid)
+            self.last_broker_process = broker_outer
             ready_early, _, _ = select.select(
                 [prepared.broker_ready_r], [], [], 0
             )
@@ -793,6 +899,10 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             control_fd = proc.stdin.fileno()
 
             def controller_write(gate: str, payload: bytes) -> None:
+                if gate in {"network_close_gate", "final_exec_gate"}:
+                    authority.observed_at_monotonic_ns = time.monotonic_ns()
+                    _require_active_transport_policy(authority)
+                    _require_live_broker_identity(authority, gate)
                 if gate == "namespace_gate":
                     self._write_all(
                         prepared.namespace_gate_w,
@@ -849,10 +959,27 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                         "broker readiness record is invalid"
                     ) from exc
                 authority.broker_ready_payloads = (payload,)
+                self.last_listener_evidence = ready_record.listener
                 authority.observed_at_monotonic_ns = time.monotonic_ns()
-                authority.broker_recheck = _read_observed_process(
-                    ready_record.process.pid
+                authority.broker_recheck = _resolve_ready_broker_process(
+                    cgroup_path,
+                    ready_record,
+                    expected_cgroup=expected_cgroup,
+                    host_netns=authority.host_netns,
+                    expected_interpreter=prepared.expected_interpreter_identity,
+                    setup_pid=authority.broker_setup.child_pid,
+                    expected_bwrap=prepared.expected_bwrap_identity,
                 )
+                self.last_broker_process = authority.broker_recheck
+                self.last_broker_identity_mapping = {
+                    "supervisor_broker_outer_pid": authority.broker_outer.pid,
+                    "bwrap_setup_child_pid": authority.broker_setup.child_pid,
+                    "readiness_namespace_pid": ready_record.process.pid,
+                    "resolved_host_broker_pid": authority.broker_recheck.pid,
+                    "resolved_parent_pid": authority.broker_setup.child_pid,
+                    "start_time_ticks": authority.broker_recheck.start_time_ticks,
+                    "boot_id": authority.broker_recheck.boot_id,
+                }
                 authority.readiness_preserved = True
                 _require_active_transport_policy(authority)
                 return _require_ready(authority, listener_outcome)
@@ -945,7 +1072,11 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             containment_state = ContainmentState.RUNNING.value
             try:
                 first_out, first_err = _pump_process_output_until_exit(
-                    proc, timeout=timeout
+                    proc,
+                    timeout=timeout,
+                    verify_broker=lambda: _require_live_broker_identity(
+                        authority, "hostile execution"
+                    ),
                 )
             except subprocess.TimeoutExpired as timeout_error:
                 timed_out = True
@@ -965,9 +1096,21 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                     trailing_err,
                 )
             else:
-                _revoke_broker_control(
-                    prepared.broker_control_w, budget=self.setup_timeout
-                )
+                broker_live = True
+                try:
+                    _require_live_broker_identity(authority, "worker exit cleanup")
+                except CapabilityTransportError:
+                    # The authenticated hostile worker has exited. The scope
+                    # supervisor may synchronously reap its broker sibling;
+                    # recursive-empty proof below remains mandatory.
+                    broker_live = False
+                if broker_live:
+                    try:
+                        _revoke_broker_control(
+                            prepared.broker_control_w, budget=self.setup_timeout
+                        )
+                    except (BrokenPipeError, ConnectionResetError):
+                        _require_broker_gone(authority)
                 owned.release(prepared.broker_control_w)
                 os.close(prepared.broker_control_w)
                 trailing_out, trailing_err = self._communicate_process(
@@ -1175,6 +1318,85 @@ def _read_observed_process(
         cgroup=cgroup,
         netns=int(netns_match.group(1)),
     )
+
+
+def _resolve_ready_broker_process(
+    cgroup_path: Path,
+    ready: NetworkBrokerReadyRecord,
+    *,
+    expected_cgroup: str,
+    host_netns: int,
+    expected_interpreter: FileIdentity,
+    setup_pid: int,
+    expected_bwrap: FileIdentity,
+) -> _ObservedProcess:
+    """Map namespace-local readiness to one exact host-visible cgroup member."""
+    try:
+        payload = (cgroup_path / "cgroup.procs").read_bytes()
+    except OSError as exc:
+        raise CapabilityTransportError(
+            "broker cgroup membership is unavailable"
+        ) from exc
+    if not payload or len(payload) > 64 * 1024 or not payload.endswith(b"\n"):
+        _reject("broker cgroup membership is empty, oversized, or truncated")
+    lines = payload.splitlines()
+    if len(lines) > 1024 or any(
+        re.fullmatch(rb"[1-9][0-9]*", line) is None for line in lines
+    ):
+        _reject("broker cgroup membership is noncanonical or unbounded")
+    setup = _read_observed_process(setup_pid)
+    if (
+        setup.executable_identity != expected_bwrap
+        or setup.cgroup != expected_cgroup
+        or setup.netns != host_netns
+    ):
+        _reject("broker Bubblewrap setup child boundary changed")
+    candidates = []
+    for line in lines:
+        candidate_pid = int(line)
+        try:
+            stat_path = Path("/proc") / str(candidate_pid) / "stat"
+            status_path = Path("/proc") / str(candidate_pid) / "status"
+            stat_before = _read_bounded_proc_file(stat_path, 8192)
+            status_before = _read_bounded_proc_file(status_path, 64 * 1024)
+            after_comm = stat_before.decode("ascii").rsplit(")", 1)[1].split()
+            parent_pid = int(after_comm[1])
+            nspid_lines = [
+                line for line in status_before.splitlines()
+                if line.startswith(b"NSpid:")
+            ]
+            if len(nspid_lines) != 1:
+                continue
+            nspids = nspid_lines[0].split()[1:]
+            if not nspids or any(
+                re.fullmatch(rb"[1-9][0-9]*", value) is None
+                for value in nspids
+            ):
+                continue
+            observed = _read_observed_process(candidate_pid)
+            stat_after = _read_bounded_proc_file(stat_path, 8192)
+            status_after = _read_bounded_proc_file(status_path, 64 * 1024)
+        except CapabilityTransportError:
+            continue
+        except (UnicodeDecodeError, IndexError, ValueError):
+            continue
+        if (
+            stat_before == stat_after
+            and status_before == status_after
+            and parent_pid == setup.pid
+            and int(nspids[-1]) == ready.process.pid
+            and observed.start_time_ticks == ready.process.start_time_ticks
+            and observed.boot_id == ready.process.boot_id
+            and observed.executable_identity == expected_interpreter
+            and observed.cgroup == expected_cgroup
+            and observed.netns == host_netns
+        ):
+            candidates.append(observed)
+    if len(candidates) != 1:
+        _reject("readiness did not resolve to one exact host broker identity")
+    if _read_observed_process(setup_pid) != setup:
+        _reject("broker Bubblewrap setup child changed during resolution")
+    return candidates[0]
 
 
 def _move_exact_fd(fd: int, target: int) -> int:
@@ -1397,7 +1619,10 @@ def _revoke_broker_control(fd: int, *, budget: float) -> None:
 
 
 def _pump_process_output_until_exit(
-    proc: subprocess.Popen, *, timeout: float
+    proc: subprocess.Popen,
+    *,
+    timeout: float,
+    verify_broker: Callable[[], None] | None = None,
 ) -> tuple[bytes, bytes]:
     """Drain bounded output while waiting only for the worker outer process."""
     if proc.stdout is None or proc.stderr is None:
@@ -1414,6 +1639,8 @@ def _pump_process_output_until_exit(
         os.set_blocking(fd, False)
     try:
         while proc.poll() is None:
+            if verify_broker is not None:
+                verify_broker()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(
@@ -1479,6 +1706,33 @@ def _require_process_shape(observed: _ObservedProcess, label: str) -> None:
         or observed.netns <= 0
     ):
         _reject(f"{label} process observation is invalid")
+
+
+def _require_live_broker_identity(authority: _LiveAuthority, stage: str) -> None:
+    """Re-observe the exact authenticated host broker at a release boundary."""
+    expected = getattr(authority, "broker_recheck", None)
+    if type(expected) is not _ObservedProcess:
+        expected = getattr(authority, "broker_outer", None)
+    _require_process_shape(expected, "authorized broker")
+    try:
+        observed = _read_observed_process(expected.pid)
+    except CapabilityTransportError as exc:
+        raise CapabilityTransportError(
+            f"authenticated broker is not live at {stage}"
+        ) from exc
+    if observed != expected:
+        _reject(f"authenticated broker identity changed at {stage}")
+
+
+def _require_broker_gone(authority: _LiveAuthority) -> None:
+    expected = getattr(authority, "broker_recheck", None)
+    _require_process_shape(expected, "authorized broker")
+    try:
+        observed = _read_observed_process(expected.pid)
+    except CapabilityTransportError:
+        return
+    if observed == expected:
+        _reject("authenticated broker remained live after revoke channel failure")
 
 
 def _require_live_containment(authority: _LiveAuthority) -> None:
@@ -1624,7 +1878,9 @@ def _require_active_transport_policy(inputs: _CoordinatorInputs) -> None:
         <= inputs.observed_at_monotonic_ns
         < policy.expires_at_monotonic_ns
     ):
-        _reject("transport policy is not active at readiness authorization")
+        if inputs.observed_at_monotonic_ns >= policy.expires_at_monotonic_ns:
+            _reject("transport policy expired before authorization release")
+        _reject("transport policy is not active at authorization release")
 
 
 def _require_expected_broker_boundary(
@@ -1769,8 +2025,6 @@ def _require_ready(
     expected_interpreter = inputs.expected_broker_interpreter_identity
     if type(inputs.broker_setup) is not BrokerBwrapSetupStatus:
         _reject("broker Bubblewrap setup evidence has the wrong type")
-    if inputs.broker_setup.child_pid != record.process.pid:
-        _reject("broker readiness PID does not match Bubblewrap setup")
     ready_namespaces = dict(record.boundary.namespaces)
     if (
         record.boundary.cgroup != inputs.expected_cgroup
@@ -1786,8 +2040,7 @@ def _require_ready(
     recheck = inputs.broker_recheck
     _require_process_shape(recheck, "broker readiness recheck")
     if (
-        recheck.pid != record.process.pid
-        or recheck.start_time_ticks != record.process.start_time_ticks
+        recheck.start_time_ticks != record.process.start_time_ticks
         or recheck.boot_id != record.process.boot_id
         or recheck.cgroup != inputs.expected_cgroup
         or recheck.netns != inputs.host_netns

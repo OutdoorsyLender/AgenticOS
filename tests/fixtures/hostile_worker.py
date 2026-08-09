@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import resource
 import signal
 import socket
 import subprocess
@@ -1191,6 +1192,227 @@ def scenario_connected_fd_send(
             error_type=type(exc).__name__, error_message=str(exc),
             details={"errno": getattr(exc, "errno", None)},
         )
+
+
+def scenario_m4b_transport(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Use only the fixed worker-facing proxy ABI and record inherited FDs."""
+    started = utc_now_iso()
+    before = _bounded_live_fd_census()
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", 18080), timeout=args.timeout
+        ) as stream:
+            stream.sendall(args.canary.encode("ascii"))
+            reply = stream.recv(256).decode("ascii")
+        return make_result(
+            scenario_id,
+            "127.0.0.1:18080",
+            started,
+            succeeded=True,
+            details={"reply": reply, "fds_before": before},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id,
+            "127.0.0.1:18080",
+            started,
+            succeeded=False,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            details={"fds_before": before, "errno": getattr(exc, "errno", None)},
+        )
+
+
+def _fd_is_open(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    return True
+
+
+def _bounded_live_fd_census() -> list[int]:
+    try:
+        names = os.listdir("/proc/self/fd")
+    except PermissionError:
+        # Landlock intentionally hides /proc/self/fd. Scan the complete numeric
+        # process limit instead, with a fixed maximum, so high inherited FDs
+        # cannot escape the proof.
+        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if not 0 < soft_limit <= 1 << 20:
+            raise RuntimeError("descriptor limit exceeds the census bound")
+        return [fd for fd in range(soft_limit) if _fd_is_open(fd)]
+    if len(names) > 64:
+        raise RuntimeError("live descriptor census exceeded its fixed bound")
+    # Directory enumeration itself transiently occupies one descriptor. Retain
+    # only numeric descriptors that are still live after the scan.
+    return sorted(
+        fd
+        for name in names
+        if name.isdigit()
+        for fd in (int(name),)
+        if _fd_is_open(fd)
+    )
+
+
+def scenario_m4b_network_view(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Inspect only bounded sandbox route, resolver, and FD state."""
+    started = utc_now_iso()
+
+    def bounded_read(path: str) -> dict[str, Any]:
+        try:
+            with open(path, "rb") as handle:
+                payload = handle.read(16 * 1024 + 1)
+            return {
+                "visible": True,
+                "bounded": len(payload) <= 16 * 1024,
+                "text": payload[: 16 * 1024].decode("utf-8", errors="replace"),
+            }
+        except OSError as exc:
+            return {
+                "visible": False,
+                "bounded": True,
+                "error_type": type(exc).__name__,
+                "errno": exc.errno,
+            }
+
+    fds = _bounded_live_fd_census()
+    return make_result(
+        scenario_id,
+        "sandbox-network-view",
+        started,
+        succeeded=True,
+        details={
+            "fds": fds,
+            "ipv4_route": bounded_read("/proc/net/route"),
+            "ipv6_route": bounded_read("/proc/net/ipv6_route"),
+            "resolv_conf": bounded_read("/etc/resolv.conf"),
+        },
+    )
+
+
+def scenario_m4b_descendant_authority(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Prove representative hostile descendants inherit only the fixed proxy."""
+    started = utc_now_iso()
+    shape = args.base
+    allowed_shapes = {
+        "child", "grandchild", "setsid", "new-pgroup", "parent-exit",
+        "double-fork", "rapid-spawn", "signal-ignore",
+    }
+    if shape not in allowed_shapes:
+        raise ValueError("M4B descendant shape is unsupported")
+    host, separator, port_text = args.target.rpartition(":")
+    if not separator or not host or not port_text.isdigit():
+        raise ValueError("M4B direct fixture target must be host:port")
+    result_path = f"/tmp/m4b-descendant-authority-{os.getpid()}.json"
+
+    def probe_and_exit() -> None:
+        details: dict[str, Any] = {"shape": shape}
+        try:
+            with socket.create_connection(("127.0.0.1", 18080), timeout=3.0) as stream:
+                stream.sendall(f"DESCENDANT_{shape}".encode("ascii"))
+                details["proxy_reply"] = stream.recv(256).decode("ascii")
+        except Exception as exc:  # noqa: BLE001
+            details["proxy_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            with socket.create_connection((host, int(port_text)), timeout=0.5):
+                details["direct_succeeded"] = True
+        except OSError:
+            details["direct_succeeded"] = False
+        temporary = result_path + f".{os.getpid()}"
+        with open(temporary, "w", encoding="ascii") as handle:
+            json.dump(details, handle, sort_keys=True)
+        os.replace(temporary, result_path)
+        os._exit(0)
+
+    def fork_probe(*, setsid=False, setpgrp=False) -> int:
+        pid = os.fork()
+        if pid == 0:
+            if setsid:
+                os.setsid()
+            if setpgrp:
+                os.setpgrp()
+            probe_and_exit()
+        return pid
+
+    direct_children: list[int] = []
+    if shape == "child":
+        direct_children.append(fork_probe())
+    elif shape == "grandchild":
+        first = os.fork()
+        if first == 0:
+            grandchild = fork_probe()
+            os.waitpid(grandchild, 0)
+            os._exit(0)
+        direct_children.append(first)
+    elif shape == "setsid":
+        direct_children.append(fork_probe(setsid=True))
+    elif shape == "new-pgroup":
+        direct_children.append(fork_probe(setpgrp=True))
+    elif shape == "parent-exit":
+        first = os.fork()
+        if first == 0:
+            fork_probe()
+            os._exit(0)
+        direct_children.append(first)
+    elif shape == "double-fork":
+        first = os.fork()
+        if first == 0:
+            os.setsid()
+            fork_probe()
+            os._exit(0)
+        direct_children.append(first)
+    elif shape == "rapid-spawn":
+        for index in range(8):
+            pid = os.fork()
+            if pid == 0:
+                if index == 0:
+                    probe_and_exit()
+                os._exit(0)
+            direct_children.append(pid)
+    elif shape == "signal-ignore":
+        pid = os.fork()
+        if pid == 0:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            probe_and_exit()
+        direct_children.append(pid)
+
+    for child in direct_children:
+        try:
+            os.waitpid(child, 0)
+        except ChildProcessError:
+            pass
+    deadline = time.monotonic() + 5.0
+    while not os.path.exists(result_path) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    try:
+        with open(result_path, encoding="ascii") as handle:
+            details = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id, args.target, started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+            details={"shape": shape},
+        )
+    finally:
+        try:
+            os.unlink(result_path)
+        except FileNotFoundError:
+            pass
+    succeeded = (
+        details.get("proxy_reply") == "DESCENDANT_PROXY_REPLY"
+        and details.get("direct_succeeded") is False
+    )
+    return make_result(
+        scenario_id, args.target, started, succeeded=succeeded, details=details,
+    )
 # --------------------------------------------------------------------------
 # Scenario registry — keep in sync with agenticos.sandbox.policy.SCENARIO_CATALOG
 # --------------------------------------------------------------------------
@@ -1198,6 +1420,13 @@ def scenario_connected_fd_send(
 Handler = Callable[[str, argparse.Namespace], dict[str, Any]]
 
 SCENARIOS: dict[str, dict[str, Any]] = {
+    "M4B-01": {"handler": scenario_m4b_transport, "needs": (),
+                "description": "Relay a canary through fixed 127.0.0.1:18080."},
+    "M4B-02": {"handler": scenario_m4b_network_view, "needs": (),
+                "description": "Inspect bounded isolated route, resolver, and FD state."},
+    "M4B-03": {"handler": scenario_m4b_descendant_authority,
+                "needs": ("target", "base"),
+                "description": "Probe fixed proxy/direct denial from a descendant shape."},
     "FS-16": {"handler": scenario_m4a_runtime_view, "needs": (),
                 "description": "Inspect the fixed M4A /workspace and runtime ABI."},
     "PROC-09": {"handler": scenario_m4a_security_state, "needs": (),
@@ -1282,6 +1511,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="Environment variable name for ENV-* scenarios.")
     parser.add_argument("--base", default=None,
                         help="Start directory for traversal scenarios (default: cwd).")
+    parser.add_argument("--canary", default="AOS_CANARY_m4b_transport",
+                        help="Synthetic ASCII canary for the fixed M4B fixture.")
+    parser.add_argument("--timeout", type=float, default=5.0,
+                        help="Bounded timeout for a synthetic network operation.")
     parser.add_argument("--list", action="store_true",
                         help="List known scenarios as JSON and exit.")
     args = parser.parse_args(argv)

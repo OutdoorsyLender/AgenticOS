@@ -1735,7 +1735,9 @@ def _relay_loop(
     total_bytes = 0
     limit_reached = False
     read_open: dict[socket.socket, bool] = {}
+    write_open: dict[socket.socket, bool] = {}
     buffers: dict[socket.socket, bytearray] = {}
+    connection_used = False
     try:
         listener.setblocking(False)
         fixture.setblocking(False)
@@ -1775,12 +1777,14 @@ def _relay_loop(
                         continue
                     except OSError:
                         return TransportTermination.PEER_ERROR
-                    if worker is not None or policy.connection_limit < 1:
+                    if connection_used or worker is not None or policy.connection_limit < 1:
                         _abort_socket(accepted)
                         return TransportTermination.CONNECTION_LIMIT
+                    connection_used = True
                     worker = accepted
                     worker.setblocking(False)
                     read_open = {worker: True, fixture: True}
+                    write_open = {worker: True, fixture: True}
                     buffers = {worker: bytearray(), fixture: bytearray()}
                     selector.register(worker, selectors.EVENT_READ, "endpoint")
                     selector.register(fixture, selectors.EVENT_READ, "endpoint")
@@ -1838,6 +1842,16 @@ def _relay_loop(
                 except (KeyError, ValueError):
                     pass
                 other = fixture if endpoint is worker else worker
+                if (
+                    not read_open.get(other, False)
+                    and not buffers[endpoint]
+                    and write_open.get(endpoint, False)
+                ):
+                    try:
+                        endpoint.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    write_open[endpoint] = False
                 event_mask = 0
                 if (
                     read_open.get(endpoint, False)
@@ -1845,19 +1859,24 @@ def _relay_loop(
                     and len(buffers[other]) < RELAY_BUFFER_BYTES
                 ):
                     event_mask |= selectors.EVENT_READ
-                if buffers[endpoint]:
+                if buffers[endpoint] and write_open.get(endpoint, False):
                     event_mask |= selectors.EVENT_WRITE
                 if event_mask:
                     selector.register(endpoint, event_mask, "endpoint")
-                elif not read_open.get(other, False) and not buffers[endpoint]:
-                    try:
-                        endpoint.shutdown(socket.SHUT_WR)
-                    except OSError:
-                        pass
             if limit_reached and not any(buffers.values()):
                 return TransportTermination.BYTE_LIMIT
             if not any(read_open.values()) and not any(buffers.values()):
-                return TransportTermination.COMPLETED
+                for endpoint in (worker, fixture):
+                    try:
+                        selector.unregister(endpoint)
+                    except (KeyError, ValueError):
+                        pass
+                _abort_socket(worker)
+                worker = None
+                _abort_socket(fixture)
+                read_open.clear()
+                write_open.clear()
+                buffers.clear()
     finally:
         selector.close()
         _abort_socket(worker)
