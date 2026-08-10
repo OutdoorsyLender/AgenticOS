@@ -93,8 +93,9 @@ def _same_uid_opaque_fd_baseline():
 
 _FIXED_NATIVE_FDS = (
     5, 6, 7, 8,
-    *range(20, 36),
-    40, 41, 42,
+    *range(9, 20),
+    *range(20, 37),
+    40, 41, 42, 43, 44,
     *range(50, 56),
 )
 

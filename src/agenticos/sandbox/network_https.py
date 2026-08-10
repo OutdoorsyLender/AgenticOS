@@ -607,6 +607,283 @@ def verify_identity_chain(
     )
 
 
+# -- sealed NetworkPolicy memfd transport -----------------------------------------
+#
+# Mirrors the network_identity.py sealed TransportPolicy flow: the controller
+# seals the canonical AOSHTTPS/1 policy bytes into a fully sealed memfd BEFORE
+# process creation; the broker re-verifies kernel identity, seals, size, and
+# canonical re-encoding equality on every load.  fcntl/os/stat are imported
+# lazily so this module stays importable on non-Linux hosts.
+
+_MAX_SEALED_NETWORK_POLICY_BYTES = 16384
+
+
+class NetworkPolicySealError(RuntimeError):
+    """A sealed NetworkPolicy object failed closed verification."""
+
+
+@dataclass(frozen=True)
+class VerifiedSealedNetworkPolicy:
+    """A NetworkPolicy reconstructed from an immutable kernel object."""
+
+    policy: NetworkPolicy
+    digest: str
+    device: int
+    inode: int
+    size: int
+    seals: int
+
+
+def _required_seals() -> int:
+    import fcntl
+
+    return (
+        fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    )
+
+
+def _network_policy_from_bytes(payload: bytes) -> NetworkPolicy:
+    if (
+        type(payload) is not bytes
+        or not 0 < len(payload) <= _MAX_SEALED_NETWORK_POLICY_BYTES
+    ):
+        raise NetworkPolicySealError("sealed network policy is empty or oversized")
+    try:
+        text = payload.decode("ascii")
+        decoded = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise NetworkPolicySealError(
+            "sealed network policy is not strict ASCII JSON"
+        ) from exc
+    if type(decoded) is not dict or set(decoded) != {
+        "version",
+        "task_id",
+        "task_generation",
+        "launch_nonce",
+        "task_ca_certificate_digest",
+        "grants",
+    }:
+        raise NetworkPolicySealError(
+            "sealed network policy has missing or unknown fields"
+        )
+    grants_raw = decoded["grants"]
+    if type(grants_raw) is not list:
+        raise NetworkPolicySealError("sealed network policy grants are invalid")
+    grant_fields = {
+        "grant_id",
+        "hostname",
+        "port",
+        "scheme",
+        "transport",
+        "application",
+        "allowed_methods",
+        "purpose",
+        "approval_source",
+        "approval_reference",
+        "granted_at_wall_ns",
+        "expires_at_wall_ns",
+        "activated_at_monotonic_ns",
+        "expires_at_monotonic_ns",
+        "connection_limit",
+        "byte_limit",
+    }
+    grants = []
+    try:
+        for item in grants_raw:
+            if type(item) is not dict or set(item) != grant_fields:
+                raise NetworkPolicySealError(
+                    "sealed network policy grant has missing or unknown fields"
+                )
+            if (
+                item["scheme"] != "https"
+                or item["transport"] != "tcp"
+                or item["application"] != "http/1.1"
+            ):
+                raise NetworkPolicySealError(
+                    "sealed network policy grant locator fields are invalid"
+                )
+            purpose = GrantPurpose(item["purpose"])
+            if sorted(purpose.http_policy().allowed_methods) != sorted(
+                item["allowed_methods"]
+            ):
+                raise NetworkPolicySealError(
+                    "sealed network policy grant methods diverge from its purpose"
+                )
+            grants.append(
+                NetworkGrant(
+                    grant_id=item["grant_id"],
+                    hostname=item["hostname"],
+                    purpose=purpose,
+                    approval_source=item["approval_source"],
+                    approval_reference=item["approval_reference"],
+                    granted_at_wall_ns=item["granted_at_wall_ns"],
+                    expires_at_wall_ns=item["expires_at_wall_ns"],
+                    activated_at_monotonic_ns=item["activated_at_monotonic_ns"],
+                    expires_at_monotonic_ns=item["expires_at_monotonic_ns"],
+                    connection_limit=item["connection_limit"],
+                    byte_limit=item["byte_limit"],
+                    port=item["port"],
+                )
+            )
+        policy = NetworkPolicy(
+            version=decoded["version"],
+            task_id=decoded["task_id"],
+            task_generation=decoded["task_generation"],
+            launch_nonce=decoded["launch_nonce"],
+            task_ca_certificate_digest=decoded["task_ca_certificate_digest"],
+            grants=tuple(grants),
+        )
+    except NetworkPolicySealError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise NetworkPolicySealError(
+            "sealed network policy fields are invalid"
+        ) from exc
+    if canonical_network_policy_bytes(policy) != payload:
+        raise NetworkPolicySealError(
+            "sealed network policy encoding is not canonical"
+        )
+    return policy
+
+
+def create_sealed_network_policy_fd(policy: NetworkPolicy) -> int:
+    """Create an owned CLOEXEC memfd containing one fully sealed NetworkPolicy."""
+    import fcntl
+    import os
+
+    fd: int | None = None
+    completed = False
+    try:
+        payload = canonical_network_policy_bytes(policy)
+        if not 0 < len(payload) <= _MAX_SEALED_NETWORK_POLICY_BYTES:
+            raise NetworkPolicySealError(
+                "canonical network policy payload is empty or oversized"
+            )
+        fd = os.memfd_create(
+            "aos-network-https-policy", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        )
+        offset = 0
+        while offset < len(payload):
+            written = os.write(fd, payload[offset:])
+            if written <= 0:
+                raise NetworkPolicySealError(
+                    "short write to sealed network policy object"
+                )
+            offset += written
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, _required_seals())
+        seals = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+        if seals & _required_seals() != _required_seals():
+            raise NetworkPolicySealError(
+                "network policy object did not acquire every required seal"
+            )
+        os.lseek(fd, 0, os.SEEK_SET)
+        completed = True
+        return fd
+    except NetworkPolicySealError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise NetworkPolicySealError(
+            "could not create sealed network policy object"
+        ) from exc
+    finally:
+        if fd is not None and not completed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def read_sealed_network_policy_fd(fd: int) -> VerifiedSealedNetworkPolicy:
+    """Securely duplicate, re-verify, and reconstruct a sealed NetworkPolicy."""
+    import fcntl
+    import os
+    import stat
+
+    duplicate: int | None = None
+    try:
+        if type(fd) is not int or fd < 0:
+            raise NetworkPolicySealError(
+                "network policy descriptor must be a non-negative integer"
+            )
+        duplicate = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
+        if not fcntl.fcntl(duplicate, fcntl.F_GETFD) & fcntl.FD_CLOEXEC:
+            raise NetworkPolicySealError(
+                "duplicated network policy descriptor is not close-on-exec"
+            )
+        before = os.fstat(duplicate)
+        if not stat.S_ISREG(before.st_mode):
+            raise NetworkPolicySealError(
+                "network policy descriptor is not a regular memfd-like object"
+            )
+        if before.st_dev <= 0 or before.st_ino <= 0:
+            raise NetworkPolicySealError(
+                "network policy object lacks positive kernel identity"
+            )
+        if not 0 < before.st_size <= _MAX_SEALED_NETWORK_POLICY_BYTES:
+            raise NetworkPolicySealError(
+                "sealed network policy size is empty or oversized"
+            )
+        seals_before = fcntl.fcntl(duplicate, fcntl.F_GET_SEALS)
+        if seals_before & _required_seals() != _required_seals():
+            raise NetworkPolicySealError("network policy object is not fully sealed")
+
+        chunks: list[bytes] = []
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(duplicate, before.st_size - offset, offset)
+            if not chunk:
+                raise NetworkPolicySealError("sealed network policy read ended early")
+            chunks.append(chunk)
+            offset += len(chunk)
+        if os.pread(duplicate, 1, before.st_size):
+            raise NetworkPolicySealError(
+                "sealed network policy exceeded its verified size"
+            )
+        payload = b"".join(chunks)
+        if len(payload) != before.st_size:
+            raise NetworkPolicySealError("sealed network policy read length changed")
+
+        after = os.fstat(duplicate)
+        seals_after = fcntl.fcntl(duplicate, fcntl.F_GET_SEALS)
+        if seals_after & _required_seals() != _required_seals():
+            raise NetworkPolicySealError(
+                "network policy seals changed during verification"
+            )
+        if (
+            after.st_dev,
+            after.st_ino,
+            stat.S_IFMT(after.st_mode),
+            after.st_size,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            stat.S_IFMT(before.st_mode),
+            before.st_size,
+        ):
+            raise NetworkPolicySealError(
+                "network policy kernel identity changed during verification"
+            )
+
+        policy = _network_policy_from_bytes(payload)
+        return VerifiedSealedNetworkPolicy(
+            policy=policy,
+            digest=hashlib.sha256(payload).hexdigest(),
+            device=after.st_dev,
+            inode=after.st_ino,
+            size=after.st_size,
+            seals=seals_after,
+        )
+    except NetworkPolicySealError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise NetworkPolicySealError(
+            "sealed network policy verification failed"
+        ) from exc
+    finally:
+        if duplicate is not None:
+            os.close(duplicate)
+
+
 __all__ = [
     "AuthorityRejectionCode",
     "AuthorizationCode",
@@ -618,11 +895,15 @@ __all__ = [
     "IdentityStage",
     "NetworkGrant",
     "NetworkPolicy",
+    "NetworkPolicySealError",
     "NormalizationError",
+    "VerifiedSealedNetworkPolicy",
     "authorize_grant",
     "canonical_network_policy_bytes",
     "canonicalize_hostname",
+    "create_sealed_network_policy_fd",
     "network_policy_digest",
     "normalize_https_authority",
+    "read_sealed_network_policy_fd",
     "verify_identity_chain",
 ]

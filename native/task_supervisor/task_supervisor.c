@@ -58,7 +58,7 @@
 #define SUPERVISOR_VERSION "AOSSUP/1"
 #define BWRAP_FD 5
 #define STATUS_FD 6
-#define MAX_VECTOR_ITEMS 128U
+#define MAX_VECTOR_ITEMS 384U
 #define MAX_ITEM_LENGTH 4096U
 #define MAX_STATUS_RECORD 128U
 #define MIN_PASS_FD 8
@@ -67,8 +67,16 @@ static const int required_broker_pass_fds[] = {
     8, 20, 21, 22, 23, 30, 31, 32, 33, 34
 };
 
+/* M4B-2 HTTPS flavor: broker code mounts (9-19, 24) and sealed task
+ * material descriptors (36-39, 43) extend the authenticated boundary. */
+static const int required_broker_pass_fds_https[] = {
+    8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    30, 31, 32, 33, 36, 37, 38, 39, 43
+};
+
 #define REQUIRED_BROKER_PASS_BASE_COUNT 9U
 #define REQUIRED_BROKER_PASS_FIXTURE_COUNT 10U
+#define REQUIRED_BROKER_PASS_HTTPS_COUNT 26U
 
 struct contract {
     int broker_pass_fds[MAX_VECTOR_ITEMS];
@@ -295,14 +303,18 @@ static bool pass_roles_are_exact(const struct contract *parsed)
 {
     size_t index;
     size_t worker_index;
+    const int *expected;
 
     if (parsed->broker_passc != REQUIRED_BROKER_PASS_BASE_COUNT
-        && parsed->broker_passc != REQUIRED_BROKER_PASS_FIXTURE_COUNT) {
+        && parsed->broker_passc != REQUIRED_BROKER_PASS_FIXTURE_COUNT
+        && parsed->broker_passc != REQUIRED_BROKER_PASS_HTTPS_COUNT) {
         return false;
     }
+    expected = parsed->broker_passc == REQUIRED_BROKER_PASS_HTTPS_COUNT
+        ? required_broker_pass_fds_https
+        : required_broker_pass_fds;
     for (index = 0U; index < parsed->broker_passc; ++index) {
-        if (parsed->broker_pass_fds[index]
-            != required_broker_pass_fds[index]) {
+        if (parsed->broker_pass_fds[index] != expected[index]) {
             return false;
         }
     }

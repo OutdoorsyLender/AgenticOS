@@ -21,13 +21,21 @@ from .network_broker import (
     BROKER_ENVIRONMENT,
     BROKER_FIXTURE_FD,
     BROKER_HANDOFF_FD,
+    BROKER_HTTPS_BINDING_FD,
+    BROKER_HTTPS_CA_CERT_FD,
+    BROKER_HTTPS_LEAF_CERT_FD,
+    BROKER_HTTPS_LEAF_KEY_FD,
+    BROKER_HTTPS_MODULE_ROLES,
+    BROKER_HTTPS_POLICY_FD,
     BROKER_POLICY_FD,
     BROKER_ROOT,
     BROKER_STATUS_FD,
+    HttpsMaterialContract,
     IDENTITY_CODE_PATH,
     INTERPRETER_PATH,
     MODELS_CODE_PATH,
     RUNTIME_PATH,
+    VENDOR_PATH,
     BrokerContract,
     ObservedFileIdentity,
 )
@@ -40,12 +48,40 @@ SUPERVISOR_BWRAP_FD = 5
 SUPERVISOR_STATUS_FD = 6
 SUPERVISOR_EXECUTABLE_FD = 7
 BROKER_JSON_STATUS_FD = 8
+# M4B-2 HTTPS flavor: additional broker code mount source descriptors.
+BROKER_M4A_MODELS_CODE_FD = 9
+BROKER_CAPABILITIES_CODE_FD = 10
+BROKER_SPECIAL_ADDRESSES_CODE_FD = 11
+BROKER_RESOLUTION_CODE_FD = 12
+BROKER_HTTP_CODE_FD = 13
+BROKER_HTTPS_CODE_FD = 14
+BROKER_CLIENTHELLO_CODE_FD = 15
+BROKER_HOSTQUAL_CODE_FD = 16
+BROKER_TLS_CODE_FD = 17
+BROKER_ORIGIN_CODE_FD = 18
+BROKER_CERT_HELPER_CODE_FD = 19
 BROKER_RUNTIME_USR_FD = 20
 BROKER_CODE_FD = 21
 BROKER_IDENTITY_CODE_FD = 22
 BROKER_MODELS_CODE_FD = 23
+BROKER_VENDOR_FD = 24
 
-MAX_SUPERVISOR_ARGV_ITEMS = 128
+BROKER_HTTPS_MOUNT_FDS = (
+    BROKER_M4A_MODELS_CODE_FD,
+    BROKER_CAPABILITIES_CODE_FD,
+    BROKER_SPECIAL_ADDRESSES_CODE_FD,
+    BROKER_RESOLUTION_CODE_FD,
+    BROKER_HTTP_CODE_FD,
+    BROKER_HTTPS_CODE_FD,
+    BROKER_CLIENTHELLO_CODE_FD,
+    BROKER_HOSTQUAL_CODE_FD,
+    BROKER_TLS_CODE_FD,
+    BROKER_ORIGIN_CODE_FD,
+    BROKER_CERT_HELPER_CODE_FD,
+    BROKER_VENDOR_FD,
+)
+
+MAX_SUPERVISOR_ARGV_ITEMS = 384
 MAX_SUPERVISOR_ITEM_BYTES = 4096
 MAX_SUPERVISOR_PASS_FDS = 128
 MAX_SUPERVISOR_FD = (1 << 31) - 1
@@ -60,6 +96,29 @@ BROKER_REQUIRED_PASS_FDS = (
     BROKER_HANDOFF_FD,
     BROKER_STATUS_FD,
     BROKER_CONTROL_FD,
+)
+
+# M4B-2 HTTPS flavor: mount sources, sealed NetworkPolicy, and sealed task
+# certificate material ride the same authenticated boundary.  The tuple is
+# the exact sorted fixed role set (BROKER_HTTPS_MOUNT_FDS is role-ordered;
+# the vendor descriptor sorts between the models code and policy roles).
+BROKER_HTTPS_PASS_FDS = (
+    BROKER_JSON_STATUS_FD,
+    *BROKER_HTTPS_MOUNT_FDS[:-1],
+    BROKER_RUNTIME_USR_FD,
+    BROKER_CODE_FD,
+    BROKER_IDENTITY_CODE_FD,
+    BROKER_MODELS_CODE_FD,
+    BROKER_VENDOR_FD,
+    BROKER_POLICY_FD,
+    BROKER_HANDOFF_FD,
+    BROKER_STATUS_FD,
+    BROKER_CONTROL_FD,
+    BROKER_HTTPS_POLICY_FD,
+    BROKER_HTTPS_CA_CERT_FD,
+    BROKER_HTTPS_LEAF_CERT_FD,
+    BROKER_HTTPS_LEAF_KEY_FD,
+    BROKER_HTTPS_BINDING_FD,
 )
 
 BROKER_STDLIB_PATHS = (
@@ -103,6 +162,77 @@ BROKER_BOOTSTRAP = (
     "raise SystemExit(_b.main())"
 )
 
+# M4B-2 HTTPS flavor bootstrap modules in exact dependency load order.  The
+# M4B-1 BROKER_BOOTSTRAP literal above stays byte-identical for the existing
+# flavors; the HTTPS flavor hand-loads the full module set and extends
+# sys.path with the gated h11 vendor directory (never cryptography).
+BROKER_HTTPS_BOOTSTRAP_MODULES = (
+    "models",
+    "network_models",
+    "capabilities",
+    "special_addresses",
+    "network_resolution",
+    "network_http",
+    "network_https",
+    "network_clienthello",
+    "host_qualification",
+    "network_tls",
+    "network_origin",
+    "network_identity",
+    "cert_helper",
+    "network_broker",
+)
+
+
+def _broker_https_bootstrap() -> str:
+    """Render the fixed HTTPS-flavor broker bootstrap source.
+
+    The package skeleton is installed by hand (no ``__init__.py`` exists
+    inside the boundary) with ``__path__`` pinned to the exact mounted
+    directories; each module is then imported by its canonical name from
+    that pinned path.  The broker independently re-verifies every loaded
+    module's ``__file__``/``__spec__.origin`` and device/inode against the
+    contract before readiness, so import mechanics add no authority.
+    """
+    modules = ",".join(f"'{name}'" for name in BROKER_HTTPS_BOOTSTRAP_MODULES[:-1])
+    return (
+        "import sys,types,importlib.machinery,importlib;"
+        "sys.dont_write_bytecode=True;"
+        "sys.path[:]=["
+        "'/usr/lib/python3.14',"
+        "'/usr/lib/python3.14/lib-dynload',"
+        f"'{VENDOR_PATH}'"
+        "];"
+        "_a=types.ModuleType('agenticos');"
+        "_a.__path__=['/opt/agenticos/python/agenticos'];"
+        "_a.__package__='agenticos';"
+        "_a.__spec__=importlib.machinery.ModuleSpec('agenticos',None,is_package=True);"
+        "_a.__spec__.submodule_search_locations=_a.__path__;"
+        "sys.modules['agenticos']=_a;"
+        "_s=types.ModuleType('agenticos.sandbox');"
+        "_s.__path__=['/opt/agenticos/python/agenticos/sandbox'];"
+        "_s.__package__='agenticos.sandbox';"
+        "_s.__spec__=importlib.machinery.ModuleSpec('agenticos.sandbox',None,is_package=True);"
+        "_s.__spec__.submodule_search_locations=_s.__path__;"
+        "sys.modules['agenticos.sandbox']=_s;"
+        f"tuple(importlib.import_module('agenticos.sandbox.'+_n) for _n in ({modules},));"
+        # Module imports (ctypes via network_tls/host_qualification) leave
+        # loader artifacts such as libffi open.  The broker contract admits
+        # EXACTLY the fixed entry descriptor set (30-33 plus the sealed
+        # material roles 36-39 and 43; the HTTPS flavor is DENY-only, never
+        # a fixture); sweep every other descriptor before main() so the
+        # runtime census proof stays exact.  os.closerange ignores gaps.
+        "import os;"
+        "os.closerange(3,29);"
+        "os.closerange(34,35);"
+        "os.closerange(40,42);"
+        "os.closerange(44,1073741823);"
+        "raise SystemExit(importlib.import_module('agenticos.sandbox.network_broker').main())"
+    )
+
+
+BROKER_BOOTSTRAP_HTTPS = _broker_https_bootstrap()
+
 BROKER_NAMESPACE_FLAGS = (
     "--unshare-user",
     "--unshare-pid",
@@ -130,6 +260,11 @@ BROKER_SYMLINKS = (
     ("usr/sbin", "/sbin"),
     ("usr/lib", "/lib"),
     ("usr/lib64", "/lib64"),
+)
+
+BROKER_HTTPS_SYNTHETIC_DIRECTORIES = (
+    *BROKER_SYNTHETIC_DIRECTORIES,
+    VENDOR_PATH,
 )
 
 BROKER_REPORTED_NAMESPACE_KEYS = {
@@ -172,6 +307,18 @@ class BrokerMountRole(str, Enum):
     BROKER_CODE = "broker_code"
     IDENTITY_CODE = "identity_code"
     MODELS_CODE = "models_code"
+    M4A_MODELS_CODE = "m4a_models_code"
+    CAPABILITIES_CODE = "capabilities_code"
+    SPECIAL_ADDRESSES_CODE = "special_addresses_code"
+    RESOLUTION_CODE = "resolution_code"
+    HTTP_CODE = "http_code"
+    HTTPS_CODE = "https_code"
+    CLIENTHELLO_CODE = "clienthello_code"
+    HOSTQUAL_CODE = "hostqual_code"
+    TLS_CODE = "tls_code"
+    ORIGIN_CODE = "origin_code"
+    CERT_HELPER_CODE = "cert_helper_code"
+    VENDOR = "vendor"
 
 
 @dataclass(frozen=True)
@@ -279,6 +426,7 @@ class SupervisorContract:
         if broker_pass not in (
             BROKER_REQUIRED_PASS_FDS,
             (*BROKER_REQUIRED_PASS_FDS, BROKER_FIXTURE_FD),
+            BROKER_HTTPS_PASS_FDS,
         ):
             raise ValueError("broker pass FDs are not the exact fixed role set")
         object.__setattr__(self, "broker_pass_fds", broker_pass)
@@ -434,10 +582,13 @@ def _observed(identity: FileIdentity) -> ObservedFileIdentity:
 def _build_bwrap_argv(
     mounts: tuple[BrokerMount, ...],
     contract: BrokerContract,
+    *,
+    bootstrap: str = BROKER_BOOTSTRAP,
+    synthetic_directories: tuple[str, ...] = BROKER_SYNTHETIC_DIRECTORIES,
 ) -> tuple[str, ...]:
     argv: list[str] = ["bwrap", *BROKER_NAMESPACE_FLAGS, "--clearenv"]
     argv.extend(("--cap-drop", "ALL", "--tmpfs", "/"))
-    for directory in BROKER_SYNTHETIC_DIRECTORIES:
+    for directory in synthetic_directories:
         argv.extend(("--dir", directory))
     argv.extend(("--dir", "/usr", "--dev", "/dev"))
     for mount in mounts:
@@ -470,7 +621,7 @@ def _build_bwrap_argv(
             "-S",
             "-B",
             "-c",
-            BROKER_BOOTSTRAP,
+            bootstrap,
             *contract.to_argv(),
         )
     )
@@ -485,6 +636,7 @@ def _canonical_boundary_bytes(
     supervisor_contract: SupervisorContract,
     contract: BrokerContract,
     bwrap_argv: tuple[str, ...],
+    synthetic_directories: tuple[str, ...] = BROKER_SYNTHETIC_DIRECTORIES,
 ) -> bytes:
     payload = {
         "broker": {
@@ -507,7 +659,7 @@ def _canonical_boundary_bytes(
                 for mount in mounts
             ],
             "namespace_flags": list(BROKER_NAMESPACE_FLAGS),
-            "synthetic_directories": list(BROKER_SYNTHETIC_DIRECTORIES),
+            "synthetic_directories": list(synthetic_directories),
             "symlinks": [
                 {"destination": destination, "target": target}
                 for target, destination in BROKER_SYMLINKS
@@ -689,6 +841,92 @@ def read_broker_bwrap_setup_status(
     )
 
 
+@dataclass(frozen=True)
+class HttpsBrokerSources:
+    """The exact M4B-2 broker code/vendor sources for the HTTPS flavor.
+
+    Every source rides a fixed descriptor and is bound read-only; the
+    broker re-verifies each device/inode against the contract before
+    readiness.  ``cryptography`` is never mounted: the broker runtime is
+    stdlib + ssl + the gated h11 vendor directory only.
+    """
+
+    m4a_models_code: AuthorizedSource
+    capabilities_code: AuthorizedSource
+    special_addresses_code: AuthorizedSource
+    resolution_code: AuthorizedSource
+    http_code: AuthorizedSource
+    https_code: AuthorizedSource
+    clienthello_code: AuthorizedSource
+    hostqual_code: AuthorizedSource
+    tls_code: AuthorizedSource
+    origin_code: AuthorizedSource
+    cert_helper_code: AuthorizedSource
+    vendor: AuthorizedSource
+
+    def __post_init__(self) -> None:
+        specs = (
+            ("m4a_models_code", self.m4a_models_code, BROKER_M4A_MODELS_CODE_FD),
+            ("capabilities_code", self.capabilities_code, BROKER_CAPABILITIES_CODE_FD),
+            (
+                "special_addresses_code",
+                self.special_addresses_code,
+                BROKER_SPECIAL_ADDRESSES_CODE_FD,
+            ),
+            ("resolution_code", self.resolution_code, BROKER_RESOLUTION_CODE_FD),
+            ("http_code", self.http_code, BROKER_HTTP_CODE_FD),
+            ("https_code", self.https_code, BROKER_HTTPS_CODE_FD),
+            ("clienthello_code", self.clienthello_code, BROKER_CLIENTHELLO_CODE_FD),
+            ("hostqual_code", self.hostqual_code, BROKER_HOSTQUAL_CODE_FD),
+            ("tls_code", self.tls_code, BROKER_TLS_CODE_FD),
+            ("origin_code", self.origin_code, BROKER_ORIGIN_CODE_FD),
+            ("cert_helper_code", self.cert_helper_code, BROKER_CERT_HELPER_CODE_FD),
+        )
+        for name, source, fixed_fd in specs:
+            _require_source(
+                name, source, fixed_fd=fixed_fd, expected_type=stat.S_IFREG
+            )
+        _require_source(
+            "vendor", self.vendor, fixed_fd=BROKER_VENDOR_FD,
+            expected_type=stat.S_IFDIR,
+        )
+        sources = (*tuple(source for _name, source, _fd in specs), self.vendor)
+        if len({source.fd for source in sources}) != len(sources):
+            raise ValueError("https broker source descriptor collision")
+        if (
+            len(
+                {
+                    (
+                        source.identity.device,
+                        source.identity.inode,
+                        source.identity.file_type,
+                    )
+                    for source in sources
+                }
+            )
+            != len(sources)
+        ):
+            raise ValueError("https broker source identity collision")
+        if len({source.locator for source in sources}) != len(sources):
+            raise ValueError("https broker source locator collision")
+
+    def code_sources(self) -> tuple[AuthorizedSource, ...]:
+        """Return the code sources in canonical module role order."""
+        return (
+            self.m4a_models_code,
+            self.capabilities_code,
+            self.special_addresses_code,
+            self.resolution_code,
+            self.http_code,
+            self.https_code,
+            self.clienthello_code,
+            self.hostqual_code,
+            self.tls_code,
+            self.origin_code,
+            self.cert_helper_code,
+        )
+
+
 def build_network_boundary_plan(
     *,
     transport_policy: TransportPolicy,
@@ -697,10 +935,15 @@ def build_network_boundary_plan(
     identity_code: AuthorizedSource,
     models_code: AuthorizedSource,
     supervisor: AuthorizedSource,
+    https: HttpsBrokerSources | None = None,
 ) -> NetworkBoundaryPlan:
-    """Build the only supported M4B-1 broker mount/argv/FD policy."""
+    """Build the only supported M4B broker mount/argv/FD policy."""
     if type(transport_policy) is not TransportPolicy:
         raise TypeError("transport_policy must be exact TransportPolicy")
+    if https is not None and type(https) is not HttpsBrokerSources:
+        raise TypeError("https must be exact HttpsBrokerSources")
+    if https is not None and transport_policy.mode is not TransportMode.DENY:
+        raise ValueError("https broker flavor requires a DENY transport policy")
     _require_source(
         "runtime_usr",
         runtime_usr,
@@ -751,6 +994,7 @@ def build_network_boundary_plan(
         SUPERVISOR_STATUS_FD,
         SUPERVISOR_EXECUTABLE_FD,
         BROKER_JSON_STATUS_FD,
+        *BROKER_HTTPS_MOUNT_FDS,
         BROKER_RUNTIME_USR_FD,
         BROKER_CODE_FD,
         BROKER_IDENTITY_CODE_FD,
@@ -760,6 +1004,11 @@ def build_network_boundary_plan(
         BROKER_STATUS_FD,
         BROKER_CONTROL_FD,
         BROKER_FIXTURE_FD,
+        BROKER_HTTPS_POLICY_FD,
+        BROKER_HTTPS_CA_CERT_FD,
+        BROKER_HTTPS_LEAF_CERT_FD,
+        BROKER_HTTPS_LEAF_KEY_FD,
+        BROKER_HTTPS_BINDING_FD,
     )
     if len(every_fixed_fd) != len(set(every_fixed_fd)):
         raise ValueError("fixed broker and supervisor descriptor roles collide")
@@ -769,6 +1018,30 @@ def build_network_boundary_plan(
         if transport_policy.mode is TransportMode.SYNTHETIC_FIXTURE_FD
         else None
     )
+    https_contract: HttpsMaterialContract | None = None
+    if https is not None:
+        https_identities = tuple(
+            _observed(source.identity) for source in https.code_sources()
+        )
+        https_contract = HttpsMaterialContract(
+            network_policy_fd=BROKER_HTTPS_POLICY_FD,
+            ca_cert_fd=BROKER_HTTPS_CA_CERT_FD,
+            leaf_cert_fd=BROKER_HTTPS_LEAF_CERT_FD,
+            leaf_key_fd=BROKER_HTTPS_LEAF_KEY_FD,
+            binding_fd=BROKER_HTTPS_BINDING_FD,
+            m4a_models_code_identity=https_identities[0],
+            capabilities_code_identity=https_identities[1],
+            special_addresses_code_identity=https_identities[2],
+            resolution_code_identity=https_identities[3],
+            http_code_identity=https_identities[4],
+            https_code_identity=https_identities[5],
+            clienthello_code_identity=https_identities[6],
+            hostqual_code_identity=https_identities[7],
+            tls_code_identity=https_identities[8],
+            origin_code_identity=https_identities[9],
+            cert_helper_code_identity=https_identities[10],
+            vendor_identity=_observed(https.vendor.identity),
+        )
     contract = BrokerContract(
         version=BROKER_CONTRACT_VERSION,
         policy_fd=BROKER_POLICY_FD,
@@ -780,6 +1053,7 @@ def build_network_boundary_plan(
         broker_code_identity=_observed(broker_code.identity),
         identity_code_identity=_observed(identity_code.identity),
         models_code_identity=_observed(models_code.identity),
+        https=https_contract,
     )
     mounts = (
         BrokerMount(runtime_usr, RUNTIME_PATH, BrokerMountRole.RUNTIME),
@@ -789,18 +1063,43 @@ def build_network_boundary_plan(
         ),
         BrokerMount(models_code, MODELS_CODE_PATH, BrokerMountRole.MODELS_CODE),
     )
+    if https is not None:
+        mounts = (
+            *mounts,
+            *(
+                BrokerMount(source, path, BrokerMountRole(role))
+                for source, (role, _module, path) in zip(
+                    https.code_sources(), BROKER_HTTPS_MODULE_ROLES
+                )
+            ),
+            BrokerMount(https.vendor, VENDOR_PATH, BrokerMountRole.VENDOR),
+        )
     destinations = tuple(mount.destination for mount in mounts)
     if len(destinations) != len(set(destinations)):
         raise ValueError("broker mount destination collision")
-    bwrap_argv = _build_bwrap_argv(mounts, contract)
+    synthetic_directories = (
+        BROKER_SYNTHETIC_DIRECTORIES
+        if https is None
+        else BROKER_HTTPS_SYNTHETIC_DIRECTORIES
+    )
+    bwrap_argv = _build_bwrap_argv(
+        mounts,
+        contract,
+        bootstrap=BROKER_BOOTSTRAP if https is None else BROKER_BOOTSTRAP_HTTPS,
+        synthetic_directories=synthetic_directories,
+    )
     supervisor_contract = SupervisorContract(
         version=SUPERVISOR_CONTRACT_VERSION,
         bwrap_fd=SUPERVISOR_BWRAP_FD,
         status_fd=SUPERVISOR_STATUS_FD,
         broker_pass_fds=(
-            BROKER_REQUIRED_PASS_FDS
-            if fixture_fd is None
-            else (*BROKER_REQUIRED_PASS_FDS, BROKER_FIXTURE_FD)
+            BROKER_HTTPS_PASS_FDS
+            if https is not None
+            else (
+                BROKER_REQUIRED_PASS_FDS
+                if fixture_fd is None
+                else (*BROKER_REQUIRED_PASS_FDS, BROKER_FIXTURE_FD)
+            )
         ),
         broker_argv=bwrap_argv,
     )
@@ -811,11 +1110,12 @@ def build_network_boundary_plan(
         supervisor_contract=supervisor_contract,
         contract=contract,
         bwrap_argv=bwrap_argv,
+        synthetic_directories=synthetic_directories,
     )
     return NetworkBoundaryPlan(
         transport_policy=transport_policy,
         mounts=mounts,
-        synthetic_directories=BROKER_SYNTHETIC_DIRECTORIES,
+        synthetic_directories=synthetic_directories,
         symlinks=BROKER_SYMLINKS,
         broker_environment=BROKER_ENVIRONMENT,
         broker_contract=contract,
@@ -832,16 +1132,34 @@ def build_network_boundary_plan(
 __all__ = [
     "AuthorizedSource",
     "BROKER_BOOTSTRAP",
+    "BROKER_BOOTSTRAP_HTTPS",
+    "BROKER_CERT_HELPER_CODE_FD",
+    "BROKER_CLIENTHELLO_CODE_FD",
     "BROKER_CODE_FD",
+    "BROKER_CAPABILITIES_CODE_FD",
     "BROKER_ENVIRONMENT",
+    "BROKER_HOSTQUAL_CODE_FD",
+    "BROKER_HTTPS_BOOTSTRAP_MODULES",
+    "BROKER_HTTPS_CODE_FD",
+    "BROKER_HTTPS_MOUNT_FDS",
+    "BROKER_HTTPS_PASS_FDS",
+    "BROKER_HTTPS_SYNTHETIC_DIRECTORIES",
+    "BROKER_HTTP_CODE_FD",
     "BROKER_IDENTITY_CODE_FD",
     "BROKER_JSON_STATUS_FD",
+    "BROKER_M4A_MODELS_CODE_FD",
     "BROKER_MODELS_CODE_FD",
+    "BROKER_ORIGIN_CODE_FD",
+    "BROKER_RESOLUTION_CODE_FD",
     "BROKER_RUNTIME_USR_FD",
+    "BROKER_SPECIAL_ADDRESSES_CODE_FD",
+    "BROKER_TLS_CODE_FD",
+    "BROKER_VENDOR_FD",
     "BrokerBwrapSetupStatus",
     "BrokerMount",
     "BrokerMountRole",
     "FileIdentity",
+    "HttpsBrokerSources",
     "NetworkBoundaryPlan",
     "NetworkBoundaryError",
     "SUPERVISOR_BWRAP_FD",

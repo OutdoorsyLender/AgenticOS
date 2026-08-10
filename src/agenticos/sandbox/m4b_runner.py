@@ -17,9 +17,11 @@ import re
 import stat
 import os
 import select
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -48,25 +50,44 @@ from .m4a_runner import NamespaceLandlockRunner
 from .capabilities import parse_proc_cgroup
 from .models import ProcessIdentity, ProcessResult, utc_now_iso
 from .network_boundary import (
+    BROKER_CERT_HELPER_CODE_FD,
+    BROKER_CLIENTHELLO_CODE_FD,
     BROKER_CODE_FD,
+    BROKER_CAPABILITIES_CODE_FD,
+    BROKER_HOSTQUAL_CODE_FD,
+    BROKER_HTTPS_CODE_FD,
+    BROKER_HTTP_CODE_FD,
     BROKER_IDENTITY_CODE_FD,
     BROKER_JSON_STATUS_FD,
+    BROKER_M4A_MODELS_CODE_FD,
     BROKER_MODELS_CODE_FD,
+    BROKER_ORIGIN_CODE_FD,
+    BROKER_RESOLUTION_CODE_FD,
     BROKER_RUNTIME_USR_FD,
+    BROKER_SPECIAL_ADDRESSES_CODE_FD,
+    BROKER_TLS_CODE_FD,
+    BROKER_VENDOR_FD,
     SUPERVISOR_BWRAP_FD,
     SUPERVISOR_EXECUTABLE_FD,
     SUPERVISOR_STATUS_FD,
     BrokerBwrapSetupStatus,
+    HttpsBrokerSources,
     NetworkBoundaryPlan,
     build_network_boundary_plan,
     read_broker_bwrap_setup_status,
 )
 from .network_broker import (
     BROKER_ENVIRONMENT,
+    BROKER_HTTPS_MODULE_ROLES,
     BROKER_ROOT,
     BROKER_CONTROL_FD,
     BROKER_FIXTURE_FD,
     BROKER_HANDOFF_FD,
+    BROKER_HTTPS_BINDING_FD,
+    BROKER_HTTPS_CA_CERT_FD,
+    BROKER_HTTPS_LEAF_CERT_FD,
+    BROKER_HTTPS_LEAF_KEY_FD,
+    BROKER_HTTPS_POLICY_FD,
     BROKER_POLICY_FD,
     BROKER_STATUS_FD,
     CONTROL_REVOKE,
@@ -80,6 +101,7 @@ from .network_broker import (
     ProcStatusEvidence,
     SealedPolicyEvidence,
     TransportTermination,
+    VENDOR_ENTRIES,
     validate_broker_environment,
     validate_fixture_fd,
 )
@@ -87,6 +109,21 @@ from .network_identity import (
     VerifiedSealedPolicy,
     create_sealed_policy_fd,
     read_sealed_policy_fd,
+)
+from .cert_helper import SealedTaskMaterial, generate_task_material
+from .host_qualification import (
+    HostQualificationError,
+    canonical_manifest_bytes,
+    compute_host_manifest,
+    manifest_digest,
+    verify_current_host,
+)
+from .network_https import (
+    GrantPurpose,
+    NetworkGrant,
+    NetworkPolicy,
+    canonicalize_hostname,
+    create_sealed_network_policy_fd,
 )
 from .network_models import (
     TransportMode,
@@ -156,6 +193,7 @@ _WORKER_HANDOFF_FD = 35
 _WORKER_NAMESPACE_GATE_FD = 40
 _WORKER_JSON_STATUS_FD = 41
 _WORKER_LAUNCHER_STATUS_FD = 42
+_WORKER_NETWORK_CA_FD = 44
 _WORKER_SOURCE_MINIMUM = 50
 _CONTROLLER_FD_MINIMUM = 100
 _MAX_CAPTURE_BYTES = 64 * 1024 * 1024
@@ -163,6 +201,135 @@ _POLL_READ_CLOSED = getattr(select, "POLLRDHUP", 0x2000)
 _MAX_CONSUMED_TRANSPORT_AUTHORITIES = 1 << 16
 _CONSUMED_TRANSPORT_AUTHORITIES: set[tuple[str, int, str, str]] = set()
 _TRANSPORT_AUTHORITY_REGISTRY_LOCK = threading.Lock()
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_BROKER_VENDOR_DIRNAME = ".m4b2-broker-vendor"
+_BROKER_VENDOR_REQUIREMENTS = "m4b2-broker.txt"
+_MAX_VENDOR_OUTPUT_BYTES = 4096
+
+HOST_MANIFEST_RECORD_VERSION = "AOSHOSTQUALRECORD/1"
+HOST_MANIFEST_FILENAME = "m4b2-host-manifest.json"
+_MAX_HOST_MANIFEST_BYTES = 1 << 20
+
+
+class BrokerVendorError(RuntimeError):
+    """The offline h11 broker vendor directory could not be established."""
+
+
+def default_broker_vendor_dir() -> Path:
+    """The gitignored, offline-installed h11 vendor directory location."""
+    return _REPO_ROOT / _BROKER_VENDOR_DIRNAME
+
+
+def ensure_broker_vendor(vendor_dir: Optional[Path] = None) -> Path:
+    """Install the hash-pinned h11 wheel offline into the vendor directory.
+
+    The long-lived broker runtime mounts ONLY this directory for its gated
+    dependency (stdlib + ssl + h11; ``cryptography`` never enters the
+    broker).  Installation is fully offline from the committed wheelhouse
+    and reproducible from requirements/m4b2-broker.txt.
+    """
+    target = Path(vendor_dir) if vendor_dir is not None else default_broker_vendor_dir()
+    expected = tuple(sorted(VENDOR_ENTRIES))
+    if target.is_dir() and tuple(sorted(p.name for p in target.iterdir())) == expected:
+        return target
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    wheelhouse = _REPO_ROOT / "requirements" / "wheelhouse"
+    requirements = _REPO_ROOT / "requirements" / _BROKER_VENDOR_REQUIREMENTS
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--find-links",
+                str(wheelhouse),
+                "--require-hashes",
+                "--only-binary=:all:",
+                "-r",
+                str(requirements),
+                "--target",
+                str(target),
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BrokerVendorError("broker vendor install could not run") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr[-_MAX_VENDOR_OUTPUT_BYTES:].decode(
+            "ascii", errors="replace"
+        )
+        raise BrokerVendorError(f"broker vendor install failed: {detail.strip()}")
+    if not target.is_dir() or tuple(
+        sorted(p.name for p in target.iterdir())
+    ) != expected:
+        raise BrokerVendorError("broker vendor directory contents are not exact")
+    return target
+
+
+def qualify_host_for_https(state_dir: Path) -> Path:
+    """Record the current host qualification manifest under ``state_dir``.
+
+    This is the explicit requalification workflow: run it once per host
+    change (OS/Python/OpenSSL/bwrap update), review the diff against the
+    previous record, and keep the record under the controller's state dir.
+    Every HTTPS-flavor launch re-verifies the live host against the record
+    and fails closed when it is absent or diverged.
+    """
+    manifest = compute_host_manifest()
+    document = {
+        "version": HOST_MANIFEST_RECORD_VERSION,
+        "manifest_digest": manifest_digest(manifest),
+        "manifest": manifest,
+    }
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    state = Path(state_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    record = state / HOST_MANIFEST_FILENAME
+    temporary = state / f".{HOST_MANIFEST_FILENAME}.tmp"
+    temporary.write_bytes(payload)
+    os.replace(temporary, record)
+    return record
+
+
+def _load_recorded_host_manifest(state_dir: Path) -> Mapping[str, object]:
+    record = Path(state_dir) / HOST_MANIFEST_FILENAME
+    try:
+        payload = record.read_bytes()
+    except OSError as exc:
+        raise HostQualificationError(
+            "recorded host manifest is absent; run qualify_host_for_https"
+        ) from exc
+    if not 0 < len(payload) <= _MAX_HOST_MANIFEST_BYTES:
+        raise HostQualificationError("recorded host manifest is empty or oversized")
+    try:
+        document = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HostQualificationError(
+            "recorded host manifest is not strict ASCII JSON"
+        ) from exc
+    if (
+        type(document) is not dict
+        or set(document) != {"version", "manifest_digest", "manifest"}
+        or document["version"] != HOST_MANIFEST_RECORD_VERSION
+        or type(document["manifest"]) is not dict
+        or document["manifest_digest"] != manifest_digest(document["manifest"])
+    ):
+        raise HostQualificationError("recorded host manifest is not authentic")
+    canonical_manifest_bytes(document["manifest"])
+    return document["manifest"]
+
+
+def verify_https_host(state_dir: Path) -> None:
+    """Fail closed unless the live host matches the recorded manifest."""
+    verify_current_host(_load_recorded_host_manifest(state_dir))
 
 
 class CapabilityTransportError(RuntimeError):
@@ -208,6 +375,7 @@ class _ExpectedBrokerBoundary:
     fd_numbers: tuple[int, ...]
     environment: EnvironmentEvidence
     filesystem_digest: str
+    https_code_identities: tuple[tuple[str, ObservedFileIdentity], ...] | None = None
 
 
 def _filesystem_identity(identity: ObservedFileIdentity) -> dict[str, int]:
@@ -224,16 +392,21 @@ def _expected_broker_filesystem_digest(
     broker_code_identity: ObservedFileIdentity,
     identity_code_identity: ObservedFileIdentity,
     models_code_identity: ObservedFileIdentity,
+    https_code_identities: tuple[tuple[str, ObservedFileIdentity], ...] | None = None,
 ) -> str:
+    identities = {
+        "broker_code": _filesystem_identity(broker_code_identity),
+        "identity_code": _filesystem_identity(identity_code_identity),
+        "models_code": _filesystem_identity(models_code_identity),
+        "runtime": _filesystem_identity(runtime_identity),
+    }
+    if https_code_identities is not None:
+        for name, identity in https_code_identities:
+            identities[name] = _filesystem_identity(identity)
     payload = {
         "cwd": BROKER_ROOT,
         "empty": ["/home/broker", "/run", "/tmp"],
-        "identities": {
-            "broker_code": _filesystem_identity(broker_code_identity),
-            "identity_code": _filesystem_identity(identity_code_identity),
-            "models_code": _filesystem_identity(models_code_identity),
-            "runtime": _filesystem_identity(runtime_identity),
-        },
+        "identities": identities,
         "root_entries": [
             "bin",
             "dev",
@@ -254,10 +427,80 @@ def _expected_broker_filesystem_digest(
             "/sbin": "usr/sbin",
         },
     }
+    if https_code_identities is not None:
+        payload["vendor_entries"] = list(VENDOR_ENTRIES)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
         "ascii"
     )
     return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass
+class _PreparedHttpsMaterial:
+    """Controller-owned sealed HTTPS launch material for one live launch."""
+
+    network_policy: NetworkPolicy
+    sealed_network_policy_fd: int
+    material: SealedTaskMaterial
+    worker_ca_path: Path
+    worker_ca_dir: Path | None
+
+
+def _stage_worker_ca_pem(material: SealedTaskMaterial) -> tuple[Path, Path]:
+    """Stage the sealed CA certificate as a transient controller-owned file.
+
+    bwrap cannot bind-mount a memfd (it has no on-disk source path), and
+    the worker's trust root is public material — the CA CERTIFICATE only,
+    never any key.  The payload is read from the sealed memfd, written to
+    a fresh 0700 directory, and re-verified against the sealed binding
+    digest before the path is handed to the launch plan.
+    """
+    if type(material) is not SealedTaskMaterial:
+        raise CapabilityTransportError("task material has the wrong exact type")
+    status = os.fstat(material.ca_cert_fd)
+    if not 0 < status.st_size <= 16384:
+        raise CapabilityTransportError("sealed CA certificate size is invalid")
+    payload = b""
+    offset = 0
+    while offset < status.st_size:
+        chunk = os.pread(material.ca_cert_fd, status.st_size - offset, offset)
+        if not chunk:
+            raise CapabilityTransportError("sealed CA certificate read ended early")
+        payload += chunk
+        offset += len(chunk)
+    if hashlib.sha256(payload).hexdigest() != material.binding.ca_cert_sha256:
+        raise CapabilityTransportError(
+            "sealed CA certificate does not match the cert binding"
+        )
+    directory = Path(tempfile.mkdtemp(prefix="aos-m4b2-ca-"))
+    os.chmod(directory, 0o700)
+    candidate = directory / "network-ca.pem"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    fd = os.open(candidate, flags, 0o400)
+    try:
+        view = memoryview(payload)
+        written = 0
+        while written < len(payload):
+            count = os.write(fd, view[written:])
+            if count <= 0:
+                raise CapabilityTransportError("worker CA staging write was short")
+            written += count
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    reopened = os.open(candidate, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        reread = b""
+        while True:
+            chunk = os.read(reopened, 16384)
+            if not chunk:
+                break
+            reread += chunk
+        if reread != payload:
+            raise CapabilityTransportError("worker CA staging changed on disk")
+    finally:
+        os.close(reopened)
+    return directory, candidate
 
 
 @dataclass(frozen=True)
@@ -314,6 +557,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         transport_policy: TransportPolicy,
         supervisor_path,
         setup_timeout: float = 10.0,
+        broker_vendor_dir=None,
         **kwargs,
     ) -> None:
         if type(transport_policy) is not TransportPolicy:
@@ -330,6 +574,11 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         )
         self._transport_policy = transport_policy
         self.supervisor_path = Path(supervisor_path)
+        self._broker_vendor_dir = (
+            default_broker_vendor_dir()
+            if broker_vendor_dir is None
+            else Path(broker_vendor_dir)
+        )
         self.last_transport_observation: NetworkTransportObservation | None = None
 
     def _claim_transport_authority(
@@ -450,6 +699,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         *,
         synthetic_fixture_fd: int | None = None,
         transport_policy: TransportPolicy | None = None,
+        https_material: _PreparedHttpsMaterial | None = None,
     ) -> _PreparedLiveLaunch:
         policy = (
             self.transport_policy
@@ -460,6 +710,67 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             raise CapabilityTransportError(
                 "transport launch authority has the wrong exact type"
             )
+        if https_material is not None:
+            if type(https_material) is not _PreparedHttpsMaterial:
+                raise CapabilityTransportError(
+                    "https launch material has the wrong exact type"
+                )
+            if policy.mode is not TransportMode.DENY:
+                raise CapabilityTransportError(
+                    "https flavor requires a DENY transport policy"
+                )
+            network_policy = https_material.network_policy
+            task_material = https_material.material
+            if (
+                type(network_policy) is not NetworkPolicy
+                or type(task_material) is not SealedTaskMaterial
+                or type(https_material.sealed_network_policy_fd) is not int
+                or https_material.sealed_network_policy_fd < 0
+                or not isinstance(https_material.worker_ca_path, Path)
+                or not https_material.worker_ca_path.is_absolute()
+            ):
+                raise CapabilityTransportError(
+                    "https launch material is malformed"
+                )
+            binding = task_material.binding
+            if (
+                network_policy.task_id != policy.task_id
+                or network_policy.task_generation != policy.task_generation
+                or network_policy.launch_nonce != policy.launch_nonce
+                or binding.task_id != policy.task_id
+                or binding.task_generation != policy.task_generation
+                or binding.launch_nonce != policy.launch_nonce
+                or binding.policy_digest != policy_digest(policy)
+                or network_policy.task_ca_certificate_digest
+                != binding.ca_cert_sha256
+                or len(network_policy.grants) != 1
+                or network_policy.grants[0].hostname != binding.hostname
+            ):
+                raise CapabilityTransportError(
+                    "https launch material does not match controller authority"
+                )
+            # Pin every material descriptor into the controller-high range so
+            # the fixed low roles stay vacant until their exact moves below.
+            sealed_network_policy_fd = https_material.sealed_network_policy_fd
+            pinned_policy = fcntl.fcntl(
+                sealed_network_policy_fd,
+                fcntl.F_DUPFD_CLOEXEC,
+                _CONTROLLER_FD_MINIMUM,
+            )
+            os.close(sealed_network_policy_fd)
+            https_material.sealed_network_policy_fd = pinned_policy
+            for name in (
+                "ca_cert_fd",
+                "leaf_cert_fd",
+                "leaf_key_fd",
+                "binding_fd",
+            ):
+                source_fd = getattr(task_material, name)
+                pinned = fcntl.fcntl(
+                    source_fd, fcntl.F_DUPFD_CLOEXEC, _CONTROLLER_FD_MINIMUM
+                )
+                os.close(source_fd)
+                setattr(task_material, name, pinned)
         if policy.mode is TransportMode.DENY:
             if synthetic_fixture_fd is not None:
                 raise CapabilityTransportError(
@@ -539,6 +850,146 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 stat.S_IFREG,
                 BROKER_MODELS_CODE_FD,
             )
+            https_sources: HttpsBrokerSources | None = None
+            if https_material is not None:
+                sandbox_dir = Path(__file__).resolve().parent
+
+                def https_code(
+                    filename: str, target: int
+                ) -> AuthorizedSource:
+                    return _open_owned_exact_source(
+                        owned,
+                        sources,
+                        sandbox_dir / filename,
+                        stat.S_IFREG,
+                        target,
+                    )
+
+                https_sources = HttpsBrokerSources(
+                    m4a_models_code=https_code(
+                        "models.py", BROKER_M4A_MODELS_CODE_FD
+                    ),
+                    capabilities_code=https_code(
+                        "capabilities.py", BROKER_CAPABILITIES_CODE_FD
+                    ),
+                    special_addresses_code=https_code(
+                        "special_addresses.py",
+                        BROKER_SPECIAL_ADDRESSES_CODE_FD,
+                    ),
+                    resolution_code=https_code(
+                        "network_resolution.py", BROKER_RESOLUTION_CODE_FD
+                    ),
+                    http_code=https_code(
+                        "network_http.py", BROKER_HTTP_CODE_FD
+                    ),
+                    https_code=https_code(
+                        "network_https.py", BROKER_HTTPS_CODE_FD
+                    ),
+                    clienthello_code=https_code(
+                        "network_clienthello.py", BROKER_CLIENTHELLO_CODE_FD
+                    ),
+                    hostqual_code=https_code(
+                        "host_qualification.py", BROKER_HOSTQUAL_CODE_FD
+                    ),
+                    tls_code=https_code(
+                        "network_tls.py", BROKER_TLS_CODE_FD
+                    ),
+                    origin_code=https_code(
+                        "network_origin.py", BROKER_ORIGIN_CODE_FD
+                    ),
+                    cert_helper_code=https_code(
+                        "cert_helper.py", BROKER_CERT_HELPER_CODE_FD
+                    ),
+                    vendor=_open_owned_exact_source(
+                        owned,
+                        sources,
+                        self._broker_vendor_dir,
+                        stat.S_IFDIR,
+                        BROKER_VENDOR_FD,
+                    ),
+                )
+
+            def _dup_move_owned(source_fd: int, target: int) -> int:
+                duplicate = os.dup(source_fd)
+                try:
+                    moved = _move_exact_fd(duplicate, target)
+                except BaseException:
+                    try:
+                        os.close(duplicate)
+                    except OSError:
+                        pass
+                    raise
+                owned.add(moved)
+                return moved
+
+            worker_network_ca: AuthorizedSource | None = None
+            if https_material is not None:
+                _dup_move_owned(
+                    https_material.sealed_network_policy_fd, BROKER_HTTPS_POLICY_FD
+                )
+                task_material = https_material.material
+                _dup_move_owned(
+                    task_material.ca_cert_fd, BROKER_HTTPS_CA_CERT_FD
+                )
+                _dup_move_owned(
+                    task_material.leaf_cert_fd, BROKER_HTTPS_LEAF_CERT_FD
+                )
+                _dup_move_owned(
+                    task_material.leaf_key_fd, BROKER_HTTPS_LEAF_KEY_FD
+                )
+                _dup_move_owned(
+                    task_material.binding_fd, BROKER_HTTPS_BINDING_FD
+                )
+                # The worker trust-root mount is the staged CA certificate
+                # file (public material; bwrap cannot bind-mount a memfd).
+                # Its bytes are re-verified against the sealed binding digest
+                # before entering the plan.
+                worker_ca_source = _open_owned_exact_source(
+                    owned,
+                    sources,
+                    https_material.worker_ca_path,
+                    stat.S_IFREG,
+                    _WORKER_NETWORK_CA_FD,
+                )
+                observed = os.fstat(worker_ca_source.fd)
+                if not 0 < observed.st_size <= 16384:
+                    _reject("worker network CA file size is invalid")
+                readable = os.open(
+                    f"/proc/self/fd/{worker_ca_source.fd}",
+                    os.O_RDONLY | os.O_CLOEXEC,
+                )
+                try:
+                    identity = os.fstat(readable)
+                    if (
+                        identity.st_dev,
+                        identity.st_ino,
+                        stat.S_IFMT(identity.st_mode),
+                    ) != (
+                        worker_ca_source.identity.device,
+                        worker_ca_source.identity.inode,
+                        worker_ca_source.identity.file_type,
+                    ):
+                        _reject("worker network CA file identity changed")
+                    payload = b""
+                    offset = 0
+                    while offset < observed.st_size:
+                        chunk = os.pread(
+                            readable, observed.st_size - offset, offset
+                        )
+                        if not chunk:
+                            _reject("worker network CA file read ended early")
+                        payload += chunk
+                        offset += len(chunk)
+                finally:
+                    os.close(readable)
+                if (
+                    hashlib.sha256(payload).hexdigest()
+                    != task_material.binding.ca_cert_sha256
+                ):
+                    _reject(
+                        "worker network CA file does not match the cert binding"
+                    )
+                worker_network_ca = worker_ca_source
             interpreter = secure_open_source(
                 Path(INTERPRETER_PATH), expected_type=stat.S_IFREG
             )
@@ -564,6 +1015,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 worker=worker,
                 task_tmp=task_tmp,
                 synthetic_home=synthetic_home,
+                network_ca=worker_network_ca,
             )
 
             policy_fd = _move_exact_fd(
@@ -621,8 +1073,23 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 identity_code=identity_code,
                 models_code=models_code,
                 supervisor=supervisor,
+                https=https_sources,
             )
             contract = network_plan.broker_contract
+            https_code_identities: (
+                tuple[tuple[str, ObservedFileIdentity], ...] | None
+            ) = None
+            if contract.https is not None:
+                https_code_identities = (
+                    *(
+                        (f"{role}_identity", identity)
+                        for (role, _module, _path), identity in zip(
+                            BROKER_HTTPS_MODULE_ROLES,
+                            contract.https.code_identities,
+                        )
+                    ),
+                    ("vendor_identity", contract.https.vendor_identity),
+                )
             interpreter_observed = ObservedFileIdentity(
                 expected_interpreter_identity.device,
                 expected_interpreter_identity.inode,
@@ -650,7 +1117,9 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                     broker_code_identity=contract.broker_code_identity,
                     identity_code_identity=contract.identity_code_identity,
                     models_code_identity=contract.models_code_identity,
+                    https_code_identities=https_code_identities,
                 ),
+                https_code_identities=https_code_identities,
             )
             worker_bwrap = build_bwrap_argv(
                 runtime_plan,
@@ -667,6 +1136,11 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                         _WORKER_NAMESPACE_GATE_FD,
                         _WORKER_JSON_STATUS_FD,
                         _WORKER_LAUNCHER_STATUS_FD,
+                        *(
+                            (_WORKER_NETWORK_CA_FD,)
+                            if worker_network_ca is not None
+                            else ()
+                        ),
                     )
                 )
             )
@@ -768,6 +1242,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         _leak_fds: Sequence[int] = (),
         _marker_path: Optional[Path] = None,
         _synthetic_fixture_fd: int | None = None,
+        _https_material: _PreparedHttpsMaterial | None = None,
     ) -> ProcessResult:
         """Launch one protocol-v3 worker only after authenticated readiness."""
         if str(cwd) != "/workspace":
@@ -796,10 +1271,16 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 )
             worker_argv = [str(item) for item in argv]
             timeout = self.default_timeout if timeout is None else float(timeout)
+            prepare_kwargs = (
+                {"https_material": _https_material}
+                if _https_material is not None
+                else {}
+            )
             prepared = self._prepare_live_launch(
                 worker_argv,
                 synthetic_fixture_fd=pinned_fixture,
                 transport_policy=transport_policy,
+                **prepare_kwargs,
             )
         finally:
             if pinned_fixture is not None:
@@ -2598,6 +3079,7 @@ def _require_expected_broker_boundary(
         broker_code_identity=expected.broker_code_identity,
         identity_code_identity=expected.identity_code_identity,
         models_code_identity=expected.models_code_identity,
+        https_code_identities=expected.https_code_identities,
     )
     if expected.filesystem_digest != filesystem_digest:
         _reject("expected broker filesystem digest is inconsistent")
@@ -2796,4 +3278,170 @@ def _coordinate_operations(
     return _CoordinatorResult(ready=ready, launcher_outcome=outcome)
 
 
-__all__ = ["CapabilityTransportError", "CapabilityTransportRunner"]
+class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
+    """M4B-2 HTTPS flavor: sealed task TLS material through the broker boundary.
+
+    Slice 9a wires material + policy only: the controller qualifies the
+    host against its recorded manifest, runs the SHORT-LIVED certificate
+    helper to completion (it exits before any launch step and therefore
+    before any hostile exec), seals the AOSHTTPS/1 NetworkPolicy, and
+    launches the DENY transport with the material riding the authenticated
+    broker boundary.  The broker verifies and loads it, closes every
+    source descriptor, and reaches readiness only when the whole chain
+    authenticates.  HTTPS dispatch arrives in slice 9b.
+    """
+
+    name = "bubblewrap-landlock-capability-transport-https"
+
+    def __init__(
+        self,
+        worker_path,
+        *,
+        approved_hostname: str,
+        grant_purpose: GrantPurpose,
+        approval_source: str,
+        approval_reference: str,
+        host_state_dir,
+        helper_timeout: float = 15.0,
+        grant_wall_lifetime_ns: int = 12 * 3600 * 1_000_000_000,
+        **kwargs,
+    ) -> None:
+        super().__init__(worker_path, **kwargs)
+        policy = self.transport_policy
+        if policy.mode is not TransportMode.DENY:
+            raise CapabilityTransportError(
+                "https flavor requires a DENY transport policy"
+            )
+        if type(grant_purpose) is not GrantPurpose:
+            raise CapabilityTransportError("grant_purpose must be a GrantPurpose")
+        self._approved_hostname = canonicalize_hostname(approved_hostname)
+        self._grant_purpose = grant_purpose
+        self._approval_source = approval_source
+        self._approval_reference = approval_reference
+        self._host_state_dir = Path(host_state_dir)
+        if (
+            type(helper_timeout) not in (int, float)
+            or not 0 < helper_timeout <= 120
+        ):
+            raise CapabilityTransportError("helper timeout must be bounded")
+        self._helper_timeout = float(helper_timeout)
+        if (
+            type(grant_wall_lifetime_ns) is not int
+            or grant_wall_lifetime_ns <= 0
+        ):
+            raise CapabilityTransportError("grant wall lifetime must be positive")
+        self._grant_wall_lifetime_ns = grant_wall_lifetime_ns
+        self.last_https_helper_pid: int | None = None
+        self.last_https_network_policy: NetworkPolicy | None = None
+        self.last_https_ca_cert_size: int | None = None
+
+    def _assemble_https_material(self) -> _PreparedHttpsMaterial:
+        """Host-gate, run the helper to EXIT, and seal the NetworkPolicy."""
+        verify_https_host(self._host_state_dir)
+        policy = self.transport_policy
+        material = generate_task_material(
+            task_id=policy.task_id,
+            task_generation=policy.task_generation,
+            launch_nonce=policy.launch_nonce,
+            hostname=self._approved_hostname,
+            policy_digest=policy_digest(policy),
+            timeout_seconds=self._helper_timeout,
+        )
+        # generate_task_material returns only after the helper process has
+        # EXITED (bounded communicate()); record the proof for evidence.
+        self.last_https_helper_pid = material.helper_pid
+        self.last_https_ca_cert_size = os.fstat(material.ca_cert_fd).st_size
+        sealed_fd: int | None = None
+        worker_ca_dir: Path | None = None
+        try:
+            worker_ca_dir, worker_ca_path = _stage_worker_ca_pem(material)
+            granted_at = time.time_ns()
+            grant = NetworkGrant(
+                grant_id=f"g{policy.launch_nonce[:16]}",
+                hostname=self._approved_hostname,
+                purpose=self._grant_purpose,
+                approval_source=self._approval_source,
+                approval_reference=self._approval_reference,
+                granted_at_wall_ns=granted_at,
+                expires_at_wall_ns=granted_at + self._grant_wall_lifetime_ns,
+                activated_at_monotonic_ns=policy.activated_at_monotonic_ns,
+                expires_at_monotonic_ns=policy.expires_at_monotonic_ns,
+                connection_limit=policy.connection_limit,
+                byte_limit=policy.byte_limit,
+            )
+            network_policy = NetworkPolicy(
+                version="AOSHTTPS/1",
+                task_id=policy.task_id,
+                task_generation=policy.task_generation,
+                launch_nonce=policy.launch_nonce,
+                task_ca_certificate_digest=material.binding.ca_cert_sha256,
+                grants=(grant,),
+            )
+            sealed_fd = create_sealed_network_policy_fd(network_policy)
+            self.last_https_network_policy = network_policy
+            return _PreparedHttpsMaterial(
+                network_policy=network_policy,
+                sealed_network_policy_fd=sealed_fd,
+                material=material,
+                worker_ca_path=worker_ca_path,
+                worker_ca_dir=worker_ca_dir,
+            )
+        except BaseException:
+            material.close()
+            if sealed_fd is not None:
+                try:
+                    os.close(sealed_fd)
+                except OSError:
+                    pass
+            if worker_ca_dir is not None:
+                shutil.rmtree(worker_ca_dir, ignore_errors=True)
+            raise
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str | os.PathLike[str],
+        env: Mapping[str, str],
+        timeout: Optional[float] = None,
+        _marker_path: Optional[Path] = None,
+        _prepared_material: _PreparedHttpsMaterial | None = None,
+    ) -> ProcessResult:
+        """Assemble material (helper exits here), then launch via the M4B-1 chain."""
+        material = (
+            self._assemble_https_material()
+            if _prepared_material is None
+            else _prepared_material
+        )
+        try:
+            return super().run(
+                argv,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                _marker_path=_marker_path,
+                _https_material=material,
+            )
+        finally:
+            if _prepared_material is None:
+                try:
+                    os.close(material.sealed_network_policy_fd)
+                except OSError:
+                    pass
+                material.material.close()
+                if material.worker_ca_dir is not None:
+                    shutil.rmtree(material.worker_ca_dir, ignore_errors=True)
+
+
+__all__ = [
+    "BrokerVendorError",
+    "CapabilityTransportError",
+    "CapabilityTransportRunner",
+    "HOST_MANIFEST_FILENAME",
+    "HOST_MANIFEST_RECORD_VERSION",
+    "HttpsCapabilityTransportRunner",
+    "default_broker_vendor_dir",
+    "ensure_broker_vendor",
+    "qualify_host_for_https",
+    "verify_https_host",
+]

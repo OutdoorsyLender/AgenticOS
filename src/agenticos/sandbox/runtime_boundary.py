@@ -101,6 +101,7 @@ class MountRole(str, Enum):
     WORKER = "worker"
     TASK_TMP = "task_tmp"
     SYNTHETIC_HOME = "synthetic_home"
+    NETWORK_CA = "network_ca"
 
 
 @dataclass(frozen=True)
@@ -603,10 +604,18 @@ def build_runtime_plan(
     worker: AuthorizedSource,
     task_tmp: AuthorizedSource,
     synthetic_home: AuthorizedSource,
+    network_ca: AuthorizedSource | None = None,
 ) -> RuntimeBoundaryPlan:
-    """Build the fixed M4A source-to-synthetic-destination policy."""
+    """Build the fixed M4A source-to-synthetic-destination policy.
+
+    ``network_ca`` is the M4B-2 HTTPS flavor's read-only task CA
+    certificate (the sealed memfd, never the key); it is the ONLY
+    additive mount and existing flavors pass none.
+    """
     if not isinstance(profile, M4AProfile):
         raise ValueError(f"invalid M4A profile: {profile!r}")
+    if network_ca is not None and not isinstance(network_ca, AuthorizedSource):
+        raise TypeError("network_ca must be an AuthorizedSource")
     workspace_bind = "--ro-bind-fd" if profile is M4AProfile.INSPECT else "--bind-fd"
     workspace_mode = "r" if profile is M4AProfile.INSPECT else "w"
     mounts = (
@@ -654,6 +663,17 @@ def build_runtime_plan(
             "w",
         ),
     )
+    if network_ca is not None:
+        mounts = (
+            *mounts,
+            AuthorizedMount(
+                network_ca,
+                "/opt/agenticos/network-ca.pem",
+                MountRole.NETWORK_CA,
+                "--ro-bind-fd",
+                "r",
+            ),
+        )
     destinations = [mount.destination for mount in mounts]
     if len(destinations) != len(set(destinations)):
         raise RuntimeBoundaryUnavailable("duplicate fixed runtime destination")

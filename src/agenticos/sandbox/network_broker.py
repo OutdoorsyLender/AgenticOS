@@ -55,6 +55,13 @@ BROKER_STATUS_FD = 32
 BROKER_CONTROL_FD = 33
 BROKER_FIXTURE_FD = 34
 
+# M4B-2 HTTPS flavor: sealed task material descriptors (broker contract roles).
+BROKER_HTTPS_POLICY_FD = 36
+BROKER_HTTPS_CA_CERT_FD = 37
+BROKER_HTTPS_LEAF_CERT_FD = 38
+BROKER_HTTPS_LEAF_KEY_FD = 39
+BROKER_HTTPS_BINDING_FD = 43
+
 BROKER_ROOT = "/opt/agenticos/python"
 RUNTIME_PATH = "/usr"
 BROKER_CODE_PATH = (
@@ -68,6 +75,74 @@ MODELS_CODE_PATH = (
 )
 INTERPRETER_PATH = "/usr/bin/python3"
 
+# M4B-2 HTTPS flavor: additional broker-mounted code objects and the gated
+# h11 vendor directory.  The fixed order below is the canonical module role
+# order used by the contract, the bootstrap, and the boundary proof.
+M4A_MODELS_CODE_PATH = "/opt/agenticos/python/agenticos/sandbox/models.py"
+CAPABILITIES_CODE_PATH = (
+    "/opt/agenticos/python/agenticos/sandbox/capabilities.py"
+)
+SPECIAL_ADDRESSES_CODE_PATH = (
+    "/opt/agenticos/python/agenticos/sandbox/special_addresses.py"
+)
+RESOLUTION_CODE_PATH = (
+    "/opt/agenticos/python/agenticos/sandbox/network_resolution.py"
+)
+HTTP_CODE_PATH = "/opt/agenticos/python/agenticos/sandbox/network_http.py"
+HTTPS_CODE_PATH = "/opt/agenticos/python/agenticos/sandbox/network_https.py"
+CLIENTHELLO_CODE_PATH = (
+    "/opt/agenticos/python/agenticos/sandbox/network_clienthello.py"
+)
+HOSTQUAL_CODE_PATH = (
+    "/opt/agenticos/python/agenticos/sandbox/host_qualification.py"
+)
+TLS_CODE_PATH = "/opt/agenticos/python/agenticos/sandbox/network_tls.py"
+ORIGIN_CODE_PATH = "/opt/agenticos/python/agenticos/sandbox/network_origin.py"
+CERT_HELPER_CODE_PATH = (
+    "/opt/agenticos/python/agenticos/sandbox/cert_helper.py"
+)
+VENDOR_PATH = "/opt/agenticos/vendor"
+VENDOR_ENTRIES = ("h11", "h11-0.16.0.dist-info")
+
+BROKER_HTTPS_MODULE_ROLES = (
+    ("m4a_models_code", "agenticos.sandbox.models", M4A_MODELS_CODE_PATH),
+    ("capabilities_code", "agenticos.sandbox.capabilities", CAPABILITIES_CODE_PATH),
+    (
+        "special_addresses_code",
+        "agenticos.sandbox.special_addresses",
+        SPECIAL_ADDRESSES_CODE_PATH,
+    ),
+    ("resolution_code", "agenticos.sandbox.network_resolution", RESOLUTION_CODE_PATH),
+    ("http_code", "agenticos.sandbox.network_http", HTTP_CODE_PATH),
+    ("https_code", "agenticos.sandbox.network_https", HTTPS_CODE_PATH),
+    ("clienthello_code", "agenticos.sandbox.network_clienthello", CLIENTHELLO_CODE_PATH),
+    ("hostqual_code", "agenticos.sandbox.host_qualification", HOSTQUAL_CODE_PATH),
+    ("tls_code", "agenticos.sandbox.network_tls", TLS_CODE_PATH),
+    ("origin_code", "agenticos.sandbox.network_origin", ORIGIN_CODE_PATH),
+    ("cert_helper_code", "agenticos.sandbox.cert_helper", CERT_HELPER_CODE_PATH),
+)
+
+BROKER_HTTPS_SANDBOX_ENTRIES = tuple(
+    sorted(
+        (
+            "capabilities.py",
+            "cert_helper.py",
+            "host_qualification.py",
+            "models.py",
+            "network_broker.py",
+            "network_clienthello.py",
+            "network_http.py",
+            "network_https.py",
+            "network_identity.py",
+            "network_models.py",
+            "network_origin.py",
+            "network_resolution.py",
+            "network_tls.py",
+            "special_addresses.py",
+        )
+    )
+)
+
 BROKER_ENVIRONMENT = (
     ("HOME", "/home/broker"),
     ("PATH", "/usr/bin:/bin"),
@@ -78,7 +153,7 @@ BROKER_ENVIRONMENT = (
     ("PYTHONDONTWRITEBYTECODE", "1"),
 )
 
-MAX_CONTRACT_ITEMS = 64
+MAX_CONTRACT_ITEMS = 128
 MAX_CONTRACT_ITEM_BYTES = 256
 MAX_READY_BYTES = 8192
 MAX_TRANSPORT_OBSERVATION_BYTES = 4096
@@ -494,6 +569,122 @@ class BrokerBoundaryEvidence:
 
 
 @dataclass(frozen=True)
+class HttpsMaterialContract:
+    """Fixed M4B-2 sealed-material descriptor roles and code identities.
+
+    Additive broker-contract section for the HTTPS flavor.  The five
+    material descriptors are verified and CLOSED before readiness; they are
+    never part of the broker's post-readiness descriptor census.
+    """
+
+    network_policy_fd: int
+    ca_cert_fd: int
+    leaf_cert_fd: int
+    leaf_key_fd: int
+    binding_fd: int
+    m4a_models_code_identity: ObservedFileIdentity
+    capabilities_code_identity: ObservedFileIdentity
+    special_addresses_code_identity: ObservedFileIdentity
+    resolution_code_identity: ObservedFileIdentity
+    http_code_identity: ObservedFileIdentity
+    https_code_identity: ObservedFileIdentity
+    clienthello_code_identity: ObservedFileIdentity
+    hostqual_code_identity: ObservedFileIdentity
+    tls_code_identity: ObservedFileIdentity
+    origin_code_identity: ObservedFileIdentity
+    cert_helper_code_identity: ObservedFileIdentity
+    vendor_identity: ObservedFileIdentity
+
+    def __post_init__(self) -> None:
+        expected = (
+            ("network_policy_fd", self.network_policy_fd, BROKER_HTTPS_POLICY_FD),
+            ("ca_cert_fd", self.ca_cert_fd, BROKER_HTTPS_CA_CERT_FD),
+            ("leaf_cert_fd", self.leaf_cert_fd, BROKER_HTTPS_LEAF_CERT_FD),
+            ("leaf_key_fd", self.leaf_key_fd, BROKER_HTTPS_LEAF_KEY_FD),
+            ("binding_fd", self.binding_fd, BROKER_HTTPS_BINDING_FD),
+        )
+        for name, value, fixed in expected:
+            if type(value) is not int or value != fixed:
+                raise BrokerBoundaryError(f"{name} must be fixed descriptor {fixed}")
+        if len(set(self.material_fds)) != len(self.material_fds):
+            raise BrokerBoundaryError("https material descriptor roles collide")
+        identities = self.code_identities
+        if any(type(identity) is not ObservedFileIdentity for identity in identities):
+            raise BrokerBoundaryError("https code identity has the wrong type")
+        if self.vendor_identity.file_type != stat.S_IFDIR:
+            raise BrokerBoundaryError("https vendor identity must be a directory")
+        if any(
+            identity.file_type != stat.S_IFREG for identity in identities[:-1]
+        ):
+            raise BrokerBoundaryError("https code identities must be regular files")
+        if (
+            len(
+                {
+                    (identity.device, identity.inode, identity.file_type)
+                    for identity in identities
+                }
+            )
+            != len(identities)
+        ):
+            raise BrokerBoundaryError("https code identities collide")
+
+    @property
+    def material_fds(self) -> tuple[int, ...]:
+        return (
+            self.network_policy_fd,
+            self.ca_cert_fd,
+            self.leaf_cert_fd,
+            self.leaf_key_fd,
+            self.binding_fd,
+        )
+
+    @property
+    def code_identities(self) -> tuple[ObservedFileIdentity, ...]:
+        return (
+            self.m4a_models_code_identity,
+            self.capabilities_code_identity,
+            self.special_addresses_code_identity,
+            self.resolution_code_identity,
+            self.http_code_identity,
+            self.https_code_identity,
+            self.clienthello_code_identity,
+            self.hostqual_code_identity,
+            self.tls_code_identity,
+            self.origin_code_identity,
+            self.cert_helper_code_identity,
+            self.vendor_identity,
+        )
+
+    def to_argv(self) -> tuple[str, ...]:
+        result = [
+            "https_material",
+            "network_policy_fd",
+            str(self.network_policy_fd),
+            "ca_cert_fd",
+            str(self.ca_cert_fd),
+            "leaf_cert_fd",
+            str(self.leaf_cert_fd),
+            "leaf_key_fd",
+            str(self.leaf_key_fd),
+            "binding_fd",
+            str(self.binding_fd),
+        ]
+        for role, identity in zip(
+            (*(role for role, _module, _path in BROKER_HTTPS_MODULE_ROLES), "vendor"),
+            self.code_identities,
+        ):
+            result.extend(
+                (
+                    f"{role}_identity",
+                    str(identity.device),
+                    str(identity.inode),
+                    str(identity.file_type),
+                )
+            )
+        return tuple(result)
+
+
+@dataclass(frozen=True)
 class BrokerContract:
     version: str
     policy_fd: int
@@ -505,6 +696,7 @@ class BrokerContract:
     broker_code_identity: ObservedFileIdentity
     identity_code_identity: ObservedFileIdentity
     models_code_identity: ObservedFileIdentity
+    https: HttpsMaterialContract | None = None
 
     def __post_init__(self) -> None:
         if type(self.version) is not str or self.version != BROKER_CONTRACT_VERSION:
@@ -526,7 +718,9 @@ class BrokerContract:
             raise BrokerBoundaryError(
                 f"fixture_fd must be absent or fixed descriptor {BROKER_FIXTURE_FD}"
             )
-        if len(set(self.capability_fds)) != len(self.capability_fds):
+        if self.https is not None and type(self.https) is not HttpsMaterialContract:
+            raise BrokerBoundaryError("https material contract has the wrong type")
+        if len(set(self.entry_fds)) != len(self.entry_fds):
             raise BrokerBoundaryError("broker capability descriptor roles collide")
         identities = (
             self.runtime_identity,
@@ -536,12 +730,17 @@ class BrokerContract:
         )
         if any(type(identity) is not ObservedFileIdentity for identity in identities):
             raise BrokerBoundaryError("broker source identity has the wrong type")
+        all_identities = (
+            (*identities, *self.https.code_identities)
+            if self.https is not None
+            else identities
+        )
         if len(
             {
                 (identity.device, identity.inode, identity.file_type)
-                for identity in identities
+                for identity in all_identities
             }
-        ) != len(identities):
+        ) != len(all_identities):
             raise BrokerBoundaryError("broker source identities collide")
 
     @property
@@ -553,6 +752,16 @@ class BrokerContract:
             self.control_fd,
         )
         return values if self.fixture_fd is None else (*values, self.fixture_fd)
+
+    @property
+    def material_fds(self) -> tuple[int, ...]:
+        """Sealed HTTPS material descriptors, closed before readiness."""
+        return () if self.https is None else self.https.material_fds
+
+    @property
+    def entry_fds(self) -> tuple[int, ...]:
+        """Every fixed descriptor the broker inherits at process entry."""
+        return (*self.capability_fds, *self.material_fds)
 
     def to_argv(self) -> tuple[str, ...]:
         result = [
@@ -582,6 +791,8 @@ class BrokerContract:
                     str(identity.file_type),
                 )
             )
+        if self.https is not None:
+            result.extend(self.https.to_argv())
         result.append("END")
         return tuple(result)
 
@@ -651,6 +862,43 @@ class BrokerContract:
         broker_code_identity = identity("broker_code_identity")
         identity_code_identity = identity("identity_code_identity")
         models_code_identity = identity("models_code_identity")
+        https: HttpsMaterialContract | None = None
+        if cursor < len(values) and values[cursor] == "https_material":
+            cursor += 1
+
+            def material_fd(name: str) -> int:
+                take(name)
+                return decimal(name)
+
+            network_policy_fd = material_fd("network_policy_fd")
+            ca_cert_fd = material_fd("ca_cert_fd")
+            leaf_cert_fd = material_fd("leaf_cert_fd")
+            leaf_key_fd = material_fd("leaf_key_fd")
+            binding_fd = material_fd("binding_fd")
+            https_identities = tuple(
+                identity(f"{role}_identity")
+                for role, _module, _path in BROKER_HTTPS_MODULE_ROLES
+            )
+            vendor_identity = identity("vendor_identity")
+            https = HttpsMaterialContract(
+                network_policy_fd=network_policy_fd,
+                ca_cert_fd=ca_cert_fd,
+                leaf_cert_fd=leaf_cert_fd,
+                leaf_key_fd=leaf_key_fd,
+                binding_fd=binding_fd,
+                m4a_models_code_identity=https_identities[0],
+                capabilities_code_identity=https_identities[1],
+                special_addresses_code_identity=https_identities[2],
+                resolution_code_identity=https_identities[3],
+                http_code_identity=https_identities[4],
+                https_code_identity=https_identities[5],
+                clienthello_code_identity=https_identities[6],
+                hostqual_code_identity=https_identities[7],
+                tls_code_identity=https_identities[8],
+                origin_code_identity=https_identities[9],
+                cert_helper_code_identity=https_identities[10],
+                vendor_identity=vendor_identity,
+            )
         take("END")
         if cursor != len(values):
             raise BrokerBoundaryError("broker contract has trailing arguments")
@@ -665,6 +913,7 @@ class BrokerContract:
             broker_code_identity=broker_code_identity,
             identity_code_identity=identity_code_identity,
             models_code_identity=models_code_identity,
+            https=https,
         )
 
 
@@ -1374,7 +1623,7 @@ def restore_contract_cloexec(contract: BrokerContract) -> None:
     """Immediately restore CLOEXEC after the launcher intentionally passed FDs."""
     if type(contract) is not BrokerContract:
         raise BrokerBoundaryError("broker contract has the wrong type")
-    for fd in contract.capability_fds:
+    for fd in contract.entry_fds:
         try:
             flags = fcntl.fcntl(fd, fcntl.F_GETFD)
             fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
@@ -1532,7 +1781,7 @@ def _observe_identity(path: str, expected_type: int) -> ObservedFileIdentity:
 
 
 def _verify_loaded_module_origins(contract: BrokerContract) -> None:
-    expected_modules = (
+    expected_modules = [
         (
             "agenticos.sandbox.network_models",
             MODELS_CODE_PATH,
@@ -1548,7 +1797,14 @@ def _verify_loaded_module_origins(contract: BrokerContract) -> None:
             BROKER_CODE_PATH,
             contract.broker_code_identity,
         ),
-    )
+    ]
+    if contract.https is not None:
+        expected_modules.extend(
+            (module, path, identity)
+            for (_role, module, path), identity in zip(
+                BROKER_HTTPS_MODULE_ROLES, contract.https.code_identities[:-1]
+            )
+        )
     for name, path, authorized in expected_modules:
         module = sys.modules.get(name)
         specification = getattr(module, "__spec__", None)
@@ -1624,13 +1880,23 @@ def _observe_filesystem(contract: BrokerContract) -> _FilesystemObservation:
     _listdir_exact("/run", ())
     _listdir_exact("/tmp", ())
     _listdir_exact("/opt", ("agenticos",))
-    _listdir_exact("/opt/agenticos", ("python",))
-    _listdir_exact(BROKER_ROOT, ("agenticos",))
-    _listdir_exact(f"{BROKER_ROOT}/agenticos", ("sandbox",))
-    _listdir_exact(
-        f"{BROKER_ROOT}/agenticos/sandbox",
-        ("network_broker.py", "network_identity.py", "network_models.py"),
-    )
+    if contract.https is None:
+        _listdir_exact("/opt/agenticos", ("python",))
+        _listdir_exact(BROKER_ROOT, ("agenticos",))
+        _listdir_exact(f"{BROKER_ROOT}/agenticos", ("sandbox",))
+        _listdir_exact(
+            f"{BROKER_ROOT}/agenticos/sandbox",
+            ("network_broker.py", "network_identity.py", "network_models.py"),
+        )
+    else:
+        _listdir_exact("/opt/agenticos", ("python", "vendor"))
+        _listdir_exact(VENDOR_PATH, VENDOR_ENTRIES)
+        _listdir_exact(BROKER_ROOT, ("agenticos",))
+        _listdir_exact(f"{BROKER_ROOT}/agenticos", ("sandbox",))
+        _listdir_exact(
+            f"{BROKER_ROOT}/agenticos/sandbox",
+            BROKER_HTTPS_SANDBOX_ENTRIES,
+        )
     for forbidden in (
         "/workspace",
         "/etc",
@@ -1667,15 +1933,35 @@ def _observe_filesystem(contract: BrokerContract) -> _FilesystemObservation:
     for observed, authorized, label in expected:
         if observed != authorized:
             raise BrokerBoundaryError(f"{label} identity does not match authority")
+    https_identities: tuple[tuple[str, ObservedFileIdentity], ...] = ()
+    if contract.https is not None:
+        observed_https = []
+        for (role, _module, path), authorized in zip(
+            BROKER_HTTPS_MODULE_ROLES, contract.https.code_identities[:-1]
+        ):
+            observed = _observe_identity(path, stat.S_IFREG)
+            if observed != authorized:
+                raise BrokerBoundaryError(
+                    f"{role} identity does not match authority"
+                )
+            observed_https.append((f"{role}_identity", observed))
+        vendor_identity = _observe_identity(VENDOR_PATH, stat.S_IFDIR)
+        if vendor_identity != contract.https.vendor_identity:
+            raise BrokerBoundaryError("vendor identity does not match authority")
+        observed_https.append(("vendor_identity", vendor_identity))
+        https_identities = tuple(observed_https)
+    identity_payload = {
+        "broker_code": _identity_dict(broker_code_identity),
+        "identity_code": _identity_dict(identity_code_identity),
+        "models_code": _identity_dict(models_code_identity),
+        "runtime": _identity_dict(runtime_identity),
+    }
+    for name, observed in https_identities:
+        identity_payload[name] = _identity_dict(observed)
     payload = {
         "cwd": cwd,
         "empty": ["/home/broker", "/run", "/tmp"],
-        "identities": {
-            "broker_code": _identity_dict(broker_code_identity),
-            "identity_code": _identity_dict(identity_code_identity),
-            "models_code": _identity_dict(models_code_identity),
-            "runtime": _identity_dict(runtime_identity),
-        },
+        "identities": identity_payload,
         "root_entries": [
             "bin",
             "dev",
@@ -1696,6 +1982,8 @@ def _observe_filesystem(contract: BrokerContract) -> _FilesystemObservation:
             "/sbin": "usr/sbin",
         },
     }
+    if contract.https is not None:
+        payload["vendor_entries"] = list(VENDOR_ENTRIES)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
         "ascii"
     )
@@ -2291,18 +2579,136 @@ def _close_owned(fds: set[int]) -> None:
             fds.discard(fd)
 
 
+@dataclass(frozen=True)
+class _HttpsMaterialState:
+    """Verified M4B-2 material held by the broker after source-fd closure."""
+
+    network_policy: Any
+    network_policy_digest: str
+    binding: Any
+    server_context: Any
+
+
+def _adopt_https_material(
+    contract: BrokerContract, sealed: VerifiedSealedPolicy
+) -> _HttpsMaterialState:
+    """Verify sealed HTTPS material, load the leaf context, close every source.
+
+    Fail closed anywhere: a stale or mismatched sealed NetworkPolicy, a
+    binding that disagrees with the transport authority, or a leaf that does
+    not authenticate under the sealed task CA means no readiness record is
+    ever emitted.  On success every material source descriptor is closed and
+    PROVEN closed (EBADF), so the post-readiness descriptor census contains
+    no certificate, key, or policy source.
+    """
+    if type(contract) is not BrokerContract or contract.https is None:
+        raise BrokerBoundaryError("https material adoption requires the https contract")
+    if type(sealed) is not VerifiedSealedPolicy:
+        raise BrokerBoundaryError("sealed transport policy has the wrong type")
+    from .cert_helper import (
+        CertHelperError,
+        load_leaf_ssl_context,
+        verify_task_material,
+    )
+    from .network_https import (
+        NetworkPolicySealError,
+        read_sealed_network_policy_fd,
+    )
+
+    https = contract.https
+    _require_distinct_fd_identities((*contract.capability_fds, *https.material_fds))
+    try:
+        net_sealed = read_sealed_network_policy_fd(https.network_policy_fd)
+    except NetworkPolicySealError as exc:
+        raise BrokerBoundaryError(
+            "sealed network policy verification failed"
+        ) from exc
+    network_policy = net_sealed.policy
+    policy = sealed.policy
+    if (
+        network_policy.task_id != policy.task_id
+        or network_policy.task_generation != policy.task_generation
+        or network_policy.launch_nonce != policy.launch_nonce
+    ):
+        raise BrokerBoundaryError(
+            "network policy task context does not match transport authority"
+        )
+    if len(network_policy.grants) != 1:
+        raise BrokerBoundaryError(
+            "https flavor requires exactly one network grant"
+        )
+    hostname = network_policy.grants[0].hostname
+    try:
+        verified = verify_task_material(
+            ca_cert_fd=https.ca_cert_fd,
+            leaf_cert_fd=https.leaf_cert_fd,
+            leaf_key_fd=https.leaf_key_fd,
+            binding_fd=https.binding_fd,
+            task_id=policy.task_id,
+            task_generation=policy.task_generation,
+            launch_nonce=policy.launch_nonce,
+            hostname=hostname,
+            policy_digest=sealed.digest,
+        )
+    except CertHelperError as exc:
+        raise BrokerBoundaryError(
+            "task certificate material did not authenticate"
+        ) from exc
+    if verified.binding.ca_cert_sha256 != network_policy.task_ca_certificate_digest:
+        raise BrokerBoundaryError(
+            "network policy does not commit the sealed task CA"
+        )
+    try:
+        context = load_leaf_ssl_context(
+            ca_cert_fd=https.ca_cert_fd,
+            leaf_cert_fd=https.leaf_cert_fd,
+            leaf_key_fd=https.leaf_key_fd,
+            binding_fd=https.binding_fd,
+            task_id=policy.task_id,
+            task_generation=policy.task_generation,
+            launch_nonce=policy.launch_nonce,
+            hostname=hostname,
+            policy_digest=sealed.digest,
+        )
+    except CertHelperError as exc:
+        raise BrokerBoundaryError("leaf TLS context could not be loaded") from exc
+    for fd in https.material_fds:
+        os.close(fd)
+    for fd in https.material_fds:
+        try:
+            fcntl.fcntl(fd, fcntl.F_GETFD)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                continue
+            raise BrokerBoundaryError(
+                "https material descriptor closure could not be proven"
+            ) from exc
+        raise BrokerBoundaryError("https material descriptor survived closure")
+    return _HttpsMaterialState(
+        network_policy=network_policy,
+        network_policy_digest=net_sealed.digest,
+        binding=verified.binding,
+        server_context=context,
+    )
+
+
 def broker_main(contract: BrokerContract) -> NoReturn:
     """Verify, adopt once, announce once, and serve until fail-closed teardown."""
     if type(contract) is not BrokerContract:
         raise BrokerBoundaryError("broker contract has the wrong type")
-    owned = set(contract.capability_fds)
+    owned = set(contract.entry_fds)
     adopted_fd: int | None = None
+    https_state: _HttpsMaterialState | None = None
     try:
         restore_contract_cloexec(contract)
         try:
             sealed = read_sealed_policy_fd(contract.policy_fd)
         except NetworkIdentityError as exc:
             raise BrokerBoundaryError("sealed policy verification failed") from exc
+        if contract.https is not None:
+            https_state = _adopt_https_material(contract, sealed)
+            for fd in contract.https.material_fds:
+                owned.discard(fd)
         _validate_policy_contract(sealed.policy, contract)
         observation = assert_minimal_process_boundary(contract, sealed.policy)
 
@@ -2420,6 +2826,13 @@ __all__ = [
     "BROKER_ENVIRONMENT",
     "BROKER_FIXTURE_FD",
     "BROKER_HANDOFF_FD",
+    "BROKER_HTTPS_BINDING_FD",
+    "BROKER_HTTPS_CA_CERT_FD",
+    "BROKER_HTTPS_LEAF_CERT_FD",
+    "BROKER_HTTPS_LEAF_KEY_FD",
+    "BROKER_HTTPS_MODULE_ROLES",
+    "BROKER_HTTPS_POLICY_FD",
+    "BROKER_HTTPS_SANDBOX_ENTRIES",
     "BROKER_POLICY_FD",
     "BROKER_ROOT",
     "BROKER_STATUS_FD",
@@ -2427,6 +2840,7 @@ __all__ = [
     "BrokerBoundaryEvidence",
     "BrokerContract",
     "EnvironmentEvidence",
+    "HttpsMaterialContract",
     "MAX_READY_BYTES",
     "MAX_TRANSPORT_OBSERVATION_BYTES",
     "NetworkBrokerReadyRecord",
@@ -2435,6 +2849,8 @@ __all__ = [
     "ProcStatusEvidence",
     "SealedPolicyEvidence",
     "TransportTermination",
+    "VENDOR_ENTRIES",
+    "VENDOR_PATH",
     "assert_minimal_process_boundary",
     "broker_main",
     "build_deny_transport_observation",

@@ -17,6 +17,7 @@ htmlcov/
 venv/
 
 # --- AgenticOS runtime (never belongs in the public repo) ---
+.m4b2-broker-vendor/
 .agenticos/
 runtime/
 .runtime/
