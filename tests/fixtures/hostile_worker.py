@@ -1496,6 +1496,184 @@ def scenario_m4b3_connected_build(
     )
 
 
+def scenario_m4b3_git(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Exec the REAL /usr/bin/git under the profile's routing (M4B-3 Slice 2).
+
+    ``--canary`` carries a JSON option object with ``steps`` (0..16 entries;
+    at least one step or ``env_census`` required).  Each step is one bounded
+    probe:
+
+    - ``{"op": "git", "argv": [...], "env_extra": {}, "env_scrub": [],
+      "cwd": "/workspace", "timeout": 25}`` — run the real git binary with
+      the worker's fixed environment, adjusted per step.
+    - ``{"op": "dns_probe", "hostname": "..."}`` — attempt worker-side
+      resolution (must fail; resolution is broker-side).
+    - ``{"op": "wait_path", "path": "...", "timeout": 20}`` — poll for a
+      host-placed marker (used to interleave origin commits between
+      operations).
+    - ``{"op": "env_census"}``, ``{"op": "fd_census"}``,
+      ``{"op": "home_census"}``, ``{"op": "git_config_list"}`` — isolation
+      censuses.
+
+    Per-step outcomes (exit codes, bounded output tails, failure classes)
+    are evidence inputs, never worker failures: the scenario succeeds when
+    its scripted sequence completes.
+    """
+    started = utc_now_iso()
+    try:
+        options = json.loads(args.canary) if args.canary else {}
+    except ValueError as exc:
+        return make_result(
+            scenario_id, args.target or "", started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+        )
+    steps = options.get("steps", []) if isinstance(options, dict) else None
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 16:
+        return make_result(
+            scenario_id, args.target or "", started, succeeded=False,
+            error_type="ValueError",
+            error_message="canary must carry 1..16 step entries",
+        )
+    results = []
+    for step in steps:
+        if not isinstance(step, dict) or not isinstance(step.get("op"), str):
+            return make_result(
+                scenario_id, args.target or "", started, succeeded=False,
+                error_type="ValueError",
+                error_message="each step requires an op string",
+            )
+        results.append(_m4b3_git_step(step, args.timeout))
+    # The worker completed its scripted sequence: per-step failures are the
+    # probes' expected outcomes, never worker failures.
+    return make_result(
+        scenario_id, args.target or "connected-build-git", started,
+        succeeded=True, details={"steps": results},
+    )
+
+
+def _m4b3_git_step(step: dict[str, Any], default_timeout: float) -> dict[str, Any]:
+    op = step["op"]
+    try:
+        if op == "git":
+            return _m4b3_git_exec(step, default_timeout)
+        if op == "dns_probe":
+            hostname = step.get("hostname", "")
+            try:
+                socket.getaddrinfo(hostname, 443)
+            except OSError as exc:
+                return {
+                    "op": op,
+                    "hostname": hostname,
+                    "resolved": False,
+                    "error_type": type(exc).__name__,
+                }
+            return {"op": op, "hostname": hostname, "resolved": True}
+        if op == "wait_path":
+            path = step.get("path", "")
+            timeout = min(float(step.get("timeout", 20.0)), 30.0)
+            deadline = time.monotonic() + timeout
+            found = False
+            while time.monotonic() < deadline:
+                if os.path.exists(path):
+                    found = True
+                    break
+                time.sleep(0.05)
+            return {"op": op, "path": path, "found": found}
+        if op == "env_census":
+            return {"op": op, "environment": dict(os.environ)}
+        if op == "fd_census":
+            return {"op": op, "fds": _bounded_live_fd_census()}
+        if op == "home_census":
+            home = os.environ.get("HOME", "")
+            entries = sorted(os.listdir(home))[:32] if home else []
+            return {
+                "op": op,
+                "home": home,
+                "entries": entries,
+                "gitconfig_present": os.path.exists(
+                    os.path.join(home, ".gitconfig")
+                ),
+                "git_credentials_present": os.path.exists(
+                    os.path.join(home, ".git-credentials")
+                ),
+            }
+        if op == "git_config_list":
+            completed = subprocess.run(
+                ["/usr/bin/git", "config", "--list", "--show-origin"],
+                env=dict(os.environ),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                cwd="/workspace",
+            )
+            return {
+                "op": op,
+                "exit_code": completed.returncode,
+                "stdout": completed.stdout[-4096:],
+                "stderr": completed.stderr[-1024:],
+            }
+        return {"op": op, "error_type": "UnknownStepOp"}
+    except Exception as exc:  # noqa: BLE001 — per-step fail-closed reporting
+        return {"op": op, "error_type": type(exc).__name__,
+                "error_message": str(exc)[:256]}
+
+
+def _m4b3_git_exec(step: dict[str, Any], default_timeout: float) -> dict[str, Any]:
+    argv = step.get("argv")
+    if (
+        not isinstance(argv, list)
+        or not 1 <= len(argv) <= 16
+        or any(
+            not isinstance(item, str)
+            or len(item) > 512
+            or not item.isascii()
+            or any(ord(char) < 0x20 or ord(char) > 0x7E for char in item)
+            for item in argv
+        )
+    ):
+        return {"op": "git", "error_type": "ValueError",
+                "error_message": "argv must be 1..16 bounded ASCII strings"}
+    cwd = step.get("cwd", "/workspace")
+    if not isinstance(cwd, str) or not cwd.startswith("/workspace"):
+        return {"op": "git", "error_type": "ValueError",
+                "error_message": "git cwd must stay inside /workspace"}
+    env = dict(os.environ)
+    for name in step.get("env_scrub", []):
+        env.pop(name, None)
+    for name, value in (step.get("env_extra") or {}).items():
+        if isinstance(name, str) and isinstance(value, str):
+            env[name] = value
+    timeout = min(float(step.get("timeout", default_timeout)), 30.0)
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/git", *argv],
+            env=env,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        stderr = completed.stderr
+        filters = step.get("stderr_filter")
+        if isinstance(filters, list) and filters:
+            stderr = "\n".join(
+                line
+                for line in stderr.splitlines()
+                if any(needle in line for needle in filters if isinstance(needle, str))
+            )
+        return {
+            "op": "git",
+            "argv": argv,
+            "exit_code": completed.returncode,
+            "stdout": completed.stdout[-4096:],
+            "stderr": stderr[-4096:],
+        }
+    except subprocess.TimeoutExpired:
+        return {"op": "git", "argv": argv, "error_type": "TimeoutExpired"}
+
+
 def _fd_is_open(fd: int) -> bool:
     try:
         os.fstat(fd)
@@ -1706,6 +1884,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "M4B3-01": {"handler": scenario_m4b3_connected_build,
                 "needs": (),
                 "description": "Drive a sequence of CONNECT+TLS+HTTP/1.1 sessions through the fixed proxy."},
+    "M4B3-GIT-01": {"handler": scenario_m4b3_git,
+                "needs": (),
+                "description": "Exec the real git binary through the profile's broker routing."},
     "FS-16": {"handler": scenario_m4a_runtime_view, "needs": (),
                 "description": "Inspect the fixed M4A /workspace and runtime ABI."},
     "PROC-09": {"handler": scenario_m4a_security_state, "needs": (),
