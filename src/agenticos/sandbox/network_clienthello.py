@@ -395,9 +395,11 @@ def run_gate_on_socket(
             return reject("gate concurrency bound exceeded", 0)
 
     previous_timeout: float | None = None
+    timeout_captured = False
     try:
         try:
             previous_timeout = sock.gettimeout()
+            timeout_captured = True
             sock.settimeout(min(POLL_SLICE_SECONDS, timeout))
         except OSError as exc:
             return reject(f"socket error: {exc}", 0)
@@ -437,8 +439,8 @@ def run_gate_on_socket(
     finally:
         if permit is not None:
             permit.release()
-        if previous_timeout is not None:
+        if timeout_captured:
             try:
-                sock.settimeout(previous_timeout)
+                sock.settimeout(previous_timeout)  # None restores blocking mode
             except OSError:
                 pass

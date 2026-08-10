@@ -810,6 +810,22 @@ def test_driver_restores_socket_timeout():
         cli.close()
 
 
+def test_driver_restores_prior_blocking_mode():
+    """A previously blocking socket must be blocking again afterwards
+    (the restore guard used to skip the None case, leaking the 0.25s poll
+    slice onto the caller's socket)."""
+    srv, cli = socket.socketpair()
+    try:
+        srv.settimeout(None)
+        cli.sendall(b"\xde\xad\xbe\xef" * 4)  # instant reject
+        outcome = nch.run_gate_on_socket(srv)
+        assert outcome.decision is nch.GateDecision.REJECT
+        assert srv.gettimeout() is None
+    finally:
+        srv.close()
+        cli.close()
+
+
 def test_feed_after_decision_fails_closed_at_driver_level():
     gate = nch.ClientHelloGate()
     wire = chgen.make_client_hello(APPROVED_BYTES)
