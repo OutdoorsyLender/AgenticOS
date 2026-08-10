@@ -1,16 +1,20 @@
 """Unit tests for the M4B-2 host qualification manifest.
 
-Structure, canonicalization, digest, and verification tests use synthetic
-manifests and run on any platform. Seal-verification and real-host probe
-tests require Linux and skip elsewhere.
+Structure, canonicalization, digest, verification, seal-verification, and
+real-host probe tests all require the qualified Linux host (the probed
+module set is POSIX-only), so the module skips on other platforms.
 """
 
 from __future__ import annotations
 
-import copy
 import sys
 
 import pytest
+
+if not sys.platform.startswith("linux"):
+    pytest.skip("M4B-2 host qualification requires Linux", allow_module_level=True)
+
+import copy
 
 from agenticos.sandbox import host_qualification as hq
 

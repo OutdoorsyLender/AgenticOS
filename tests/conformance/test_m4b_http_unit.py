@@ -14,8 +14,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import h11
 import pytest
+
+h11 = pytest.importorskip("h11")  # gated broker dependency; wheelhouse-pinned
 
 from agenticos.sandbox.network_http import (
     BodyData,
