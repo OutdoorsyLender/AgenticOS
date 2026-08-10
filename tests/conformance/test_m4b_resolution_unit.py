@@ -550,7 +550,9 @@ class TestMalformedResults:
 
     def test_wrong_family_af_unix(self):
         entry = (
-            socket.AF_UNIX,
+            # getattr: AF_UNIX is absent on Windows; -1 is an invalid
+            # family there, taking the same MALFORMED_RESULT path.
+            getattr(socket, "AF_UNIX", -1),
             socket.SOCK_STREAM,
             socket.IPPROTO_TCP,
             "",
@@ -651,7 +653,9 @@ class TestMalformedResults:
             [
                 a(PUBLIC_V4),
                 (
-                    socket.AF_UNIX,
+                    # getattr: AF_UNIX is absent on Windows; -1 is an
+                    # invalid family there, same MALFORMED_RESULT path.
+                    getattr(socket, "AF_UNIX", -1),
                     socket.SOCK_STREAM,
                     socket.IPPROTO_TCP,
                     "",

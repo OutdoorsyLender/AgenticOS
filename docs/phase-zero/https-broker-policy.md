@@ -186,6 +186,54 @@ The controller's own launch validation still requires exactly one grant; the
 zero-grant path guarantees the broker serves nothing rather than failing
 ambiguously if one is ever presented.
 
+## Residual risks (accepted, documented)
+
+Adversarial review of this slice surfaced the following residual risks.
+Each is accepted deliberately; none crosses the earned claim.
+
+- **Controller-resident leaf-key memfd lifetime.** The controller pins the
+  sealed `leaf_key_fd` from helper return until the broker launch dups it
+  into role 39; the controller never re-reads it afterwards, so the fd
+  COULD be dropped immediately after the dup to shrink the exposure
+  window. It is retained for the launch span by design: the memfd is
+  sealed read-only, the controller is the trusted side of the boundary,
+  and the worker/hostile side never sees the fd. Accepted as-is.
+- **Staged-CA-dir SIGKILL persistence.** The helper stages the task CA in
+  a private directory; a SIGKILL mid-launch can strand that directory on
+  disk until cleanup. Only PUBLIC material (certificates, never the CA
+  private key — that lives solely in helper memory and sealed memfds) can
+  persist this way, so the residue is not secret-bearing.
+- **ISATAP / operator-NAT64 embedded-v4 limits.** The special-address
+  policy evaluates embedded IPv4 forms (6to4, Teredo/ISATAP, NAT64
+  well-known and operator-defined prefixes) at the frozen IANA-registry
+  level; an operator-run NAT64 or ISATAP deployment can map those ranges
+  onto reachability the registry alone cannot express. Inherent to any
+  registry-frozen policy; documented, not hidden.
+- **Handshake-byte bound excludes replayed gate bytes.** The per-connection
+  handshake byte bound does not count the ClientHello bytes the gate
+  replays into the TLS handshake (they are bounded separately by the
+  gate's own cap). The two bounds compose; neither is unbounded.
+- **Census admits fds 0-2 by number.** The runtime fd census admits the
+  standard descriptors 0-2 by number alone (they cannot be sealed or
+  re-proven from inside the broker); every other descriptor is census-
+  exact. A broker that starts with a hostile fd on 0-2 inherits it — the
+  launch path controls all three.
+- **Synthesized-terminal pre-exit sliver, hardcoded REVOKED reason.** The
+  runner-synthesized aggregate (broker reaped at clean worker exit before
+  emitting a terminal) covers evidence up to worker exit; a broker that
+  died in the sliver between its last record and worker exit contributes
+  only its already-emitted per-connection records, and the synthesized
+  terminal reason is the hardcoded REVOKED rather than an observed broker
+  verdict. The liveness gates bound the sliver to post-record-processing;
+  no accepted connection can be lost from evidence.
+- **Helper-exit-before-launch is structural, not temporal.** The CA-key
+  lifetime guarantee rests on process STRUCTURE (the helper exits before
+  the broker launch chain starts and before any hostile worker code can
+  run), not on a measured wall-clock interlock; there is no runtime
+  assertion that the helper has already exited at broker main(). The
+  structural argument is total: the key exists only inside the helper's
+  address space, which is gone before exposure is possible.
+
 ## What is not earned
 
 - **No Connected Build claim.** This is task-scoped HTTPS broker policy on

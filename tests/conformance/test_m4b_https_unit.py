@@ -56,6 +56,7 @@ from agenticos.sandbox.network_models import (
     canonical_policy_bytes,
     policy_digest,
 )
+from agenticos.sandbox.special_addresses import ADDRESS_POLICY_VERSION
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1231,7 +1232,7 @@ def _connection_record_kwargs(**changes):
         "launch_nonce": "cd" * 16,
         "policy_digest": "ab" * 32,
         "network_policy_digest": "cd" * 32,
-        "address_policy_version": "AOSADDR/1+test",
+        "address_policy_version": ADDRESS_POLICY_VERSION,
         "connection_index": 1,
         "stage_reached": broker.HttpsConnectionStage.RESPONSE_RELAY,
         "terminal_reason": broker.HttpsConnectionTermination.COMPLETED,

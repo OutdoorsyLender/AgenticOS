@@ -13,7 +13,10 @@ hostname and ALPN policy that OpenSSL alone does not:
   firing is a fresh authorization decision, and ANY second firing — even
   with the correct hostname — aborts the handshake (x28c: CALLBACK_FAILED,
   no server flight follows CH2).  This makes ECH-in-CH2 structurally
-  unreachable.
+  unreachable.  Establishment itself requires proof the authorization ran:
+  the ESTABLISHED path fails closed unless the policy recorded EXACTLY ONE
+  firing, so a stack change that completes the handshake without the
+  callback cannot silently skip hostname authorization.
 * SNI absent -> fail closed (the gate accepts missing SNI; it is not the
   gate's job).
 * post-handshake ALPN enforcement.  The spike measured (E3) that an
@@ -49,6 +52,7 @@ import time
 
 from . import host_qualification
 from . import network_clienthello as nch
+from .network_https import canonicalize_hostname
 
 WORKER_ALPN_PROTOCOL = "http/1.1"       # the only protocol the broker serves
 WORKER_ALPN_PROTOCOLS = (WORKER_ALPN_PROTOCOL,)
@@ -73,6 +77,7 @@ class TerminationCode(str, Enum):
     SNI_ABSENT = "sni_absent"
     SNI_MISMATCH = "sni_mismatch"
     SECOND_CLIENT_HELLO = "second_client_hello"
+    SNI_AUTHORIZATION_MISSING = "sni_authorization_missing"
     ALPN_REJECTED = "alpn_rejected"
     HANDSHAKE_FAILED = "handshake_failed"
     HANDSHAKE_TIMEOUT = "handshake_timeout"
@@ -100,16 +105,23 @@ def _require_canonical_hostname(value: object) -> str:
 
     The SNI authorization comparison is an exact string match against this
     canonical form — no wildcard, suffix, or case ambiguity — so the
-    approved value itself must be unambiguous at configuration time.
+    approved value itself must be unambiguous at configuration time.  The
+    grammar is the ONE canonical grammar of the M4B-2 HTTPS path,
+    :func:`agenticos.sandbox.network_https.canonicalize_hostname`, and the
+    value must EQUAL its own canonical form: raw non-canonical input
+    (uppercase, underscores, ``xn--`` labels, numeric/legacy forms)
+    rejects rather than being "helpfully" normalized into acceptance.
+    Grammar violations surface as ``NormalizationError`` (a ``ValueError``),
+    preserving this function's typed failure mode.
     """
     if type(value) is not str or not value:
         raise ValueError("approved hostname must be a non-empty str")
-    if not value.isascii():
-        raise ValueError("approved hostname must be pure ASCII")
-    if value != value.lower():
-        raise ValueError("approved hostname must be canonical lowercase ASCII")
-    if "*" in value or value.startswith(".") or value.endswith(".") or ".." in value:
-        raise ValueError("approved hostname must be an exact DNS name")
+    canonical = canonicalize_hostname(value)
+    if value != canonical:
+        raise ValueError(
+            f"approved hostname {value!r} is not in canonical form "
+            f"({canonical!r}); raw non-canonical input rejects"
+        )
     return value
 
 
@@ -414,12 +426,20 @@ def terminate_worker_tls(
     policy = prepared.policy
 
     if not gate_outcome.accepted or not gate_outcome.accepted_bytes:
+        try:
+            sock.close()
+        except OSError:
+            pass
         return _deny(
             prepared,
             TerminationCode.GATE_NOT_ACCEPTED,
             f"gate did not accept; no TLS trust established ({gate_outcome.reason})",
         )
     if not (context.options & ssl.OP_NO_RENEGOTIATION):
+        try:
+            sock.close()
+        except OSError:
+            pass
         return _deny(
             prepared,
             TerminationCode.CONTEXT_POLICY_VIOLATION,
@@ -481,6 +501,28 @@ def terminate_worker_tls(
             alpn,
         )
 
+    if policy.firing_count != 1:
+        # Fail closed: a completed handshake without EXACTLY ONE recorded
+        # SNI authorization decision means the policy callback was silently
+        # skipped (0 firings) or the second-firing abort failed to engage
+        # (>1).  Either way hostname authorization cannot be proven.
+        failure = _deny(
+            prepared,
+            TerminationCode.SNI_AUTHORIZATION_MISSING,
+            f"SNI authorization fired {policy.firing_count} times during the "
+            f"handshake; establishment requires exactly one decision",
+        )
+        _flush_and_close(sock, outbio)
+        return TerminationOutcome(
+            failure.code,
+            failure.reason,
+            None,
+            failure.sni_firing_count,
+            failure.sni_seen,
+            sslobj.version(),
+            alpn,
+        )
+
     channel = EstablishedTlsChannel(sslobj, inbio, outbio, sock)
     return TerminationOutcome(
         TerminationCode.ESTABLISHED,
@@ -503,12 +545,18 @@ def _drive_handshake(
     timeout: float,
     max_bytes: int,
 ) -> TerminationOutcome | None:
-    """Bounded handshake drive; ``None`` on success, typed denial otherwise."""
+    """Bounded handshake drive; ``None`` on success, typed denial otherwise.
+
+    The socket's exact previous timeout — including ``None`` (blocking
+    mode) — is restored before returning, whatever the outcome.
+    """
     deadline = time.monotonic() + timeout
     previous_timeout: float | None = None
+    timeout_captured = False
     received = 0
     try:
         previous_timeout = sock.gettimeout()
+        timeout_captured = True
         sock.settimeout(min(POLL_SLICE_SECONDS, timeout))
     except OSError as exc:
         return _deny(prepared, TerminationCode.SOCKET_ERROR, f"socket error: {exc}")
@@ -542,7 +590,7 @@ def _drive_handshake(
             else:
                 return None
     finally:
-        if previous_timeout is not None:
+        if timeout_captured:
             try:
                 sock.settimeout(previous_timeout)
             except OSError:
@@ -696,6 +744,9 @@ def _alpn_probe_leg(
     The client trusts nothing and verifies nothing (certificate
     authentication is the adoption self-audit's proof, not this leg's);
     the leg measures ONLY which ALPN the built worker context selects.
+    A completed handshake must have recorded EXACTLY ONE SNI authorization
+    firing — otherwise the policy callback was silently skipped and the
+    probe fails closed.
     """
     client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     client_context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -711,6 +762,12 @@ def _alpn_probe_leg(
     server_done = client_done = False
     for _ in range(64):
         if server_done and client_done:
+            if prepared.policy.firing_count != 1:
+                raise StartupSelfTestError(
+                    f"probe handshake completed with "
+                    f"{prepared.policy.firing_count} SNI authorization "
+                    f"firings; exactly one is required"
+                )
             return client.selected_alpn_protocol()
         for obj, is_server in ((server, True), (client, False)):
             if (is_server and server_done) or (not is_server and client_done):

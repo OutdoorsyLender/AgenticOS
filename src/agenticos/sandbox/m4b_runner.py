@@ -113,6 +113,7 @@ from .network_broker import (
     validate_broker_environment,
     validate_fixture_fd,
 )
+from .special_addresses import ADDRESS_POLICY_VERSION
 from .network_identity import (
     VerifiedSealedPolicy,
     create_sealed_policy_fd,
@@ -2923,6 +2924,17 @@ def _read_authenticated_https_transport_records(
             ):
                 _reject("https evidence precedes policy activation")
             if type(record) is HttpsConnectionRecord:
+                if record.address_policy_version != ADDRESS_POLICY_VERSION:
+                    # The per-record address-policy version binds the
+                    # evidence to the exact frozen address policy the
+                    # launch validated; any other version is evidence from
+                    # a policy this run never authorized.  The aggregate
+                    # terminal carries no separate address-policy surface:
+                    # it only sums per-record values that each pass this
+                    # check, so no terminal-side field is needed.
+                    _reject(
+                        "https connection address policy version is unrecognized"
+                    )
                 if record.synthetic_origin is not expect_synthetic:
                     _reject(
                         "https connection synthetic marking disagrees with the launch"

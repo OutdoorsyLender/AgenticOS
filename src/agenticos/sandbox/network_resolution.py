@@ -32,8 +32,10 @@ Resolution contract — every ``resolve_all_once`` call:
   such as EAI_AGAIN, or anything else — DNS errors NEVER fail open),
   unexpected address family, socket type, or protocol, malformed
   sockaddr, wrong port, non-zero flowinfo/scope-id (zone-scoped or
-  flow-labeled results are policy ambiguity), unparseable or
-  family-mismatched address strings, and any non-list resolver return.
+  flow-labeled results are policy ambiguity), host strings carrying an
+  IPv6 zone-id (``%`` — the frozen policy never evaluates link scopes),
+  unparseable or family-mismatched address strings, and any non-list
+  resolver return.
 * deduplicates identical (family, address) results deterministically
   (first occurrence wins), then validates EVERY address against the
   frozen IANA special-address policy
@@ -206,6 +208,11 @@ def _validate_entry(
         )
     if not isinstance(host, str) or not isinstance(port, int):
         return None, 0, 0, f"malformed sockaddr fields: {sockaddr!r}"
+    if "%" in host:
+        # IPv6 zone-ids ("fe80::1%eth0", "%25"-encoded) parse in
+        # ipaddress but bind an address to a link/scope the frozen
+        # policy never evaluated — policy ambiguity, fail closed.
+        return None, 0, 0, f"address string carries a zone-id: {host!r}"
     if port != _HTTPS_PORT:
         return None, 0, 0, (
             f"resolver returned port {port}, expected {_HTTPS_PORT}"

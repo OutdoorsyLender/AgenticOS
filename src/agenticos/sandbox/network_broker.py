@@ -2581,6 +2581,7 @@ CONNECT_MAX_HEADER_LINES = 32
 CONNECT_STAGE_TIMEOUT_SECONDS = 5.0
 HTTPS_STAGE_SLICE_SECONDS = 0.25
 HTTPS_CHANNEL_WRITE_TIMEOUT_SECONDS = 10.0
+HTTPS_RESPONSE_IDLE_TIMEOUT_SECONDS = 30.0
 HTTPS_THREAD_JOIN_GRACE_SECONDS = 8.0
 HTTPS_CONNECT_RESPONSE_OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
 HTTPS_CONNECT_RESPONSE_DENIED = (
@@ -2647,12 +2648,23 @@ def _sanitize_gate_reason(reason: object) -> str:
 
 
 def _evidence_hostname(value: object) -> str | None:
-    """Map an observed (possibly hostile) hostname onto the evidence grammar."""
+    """Map an observed (possibly hostile) hostname onto the evidence grammar.
+
+    Values outside the record grammar are replaced by a grammar-valid
+    sentinel: ``non-canonical-`` plus a bounded hex digest of the offending
+    value.  The sentinel itself always satisfies _HTTPS_HOST_EVIDENCE_RE
+    (the former ``<non-canonical>`` placeholder did not — record
+    construction then raised and killed the connection thread), and the
+    digest keeps distinct hostile observations distinguishable in evidence.
+    """
     if value is None:
         return None
     if type(value) is str and _HTTPS_HOST_EVIDENCE_RE.fullmatch(value):
         return value
-    return "<non-canonical>"
+    digest = hashlib.sha256(
+        repr(value).encode("utf-8", "backslashreplace")
+    ).hexdigest()[:16]
+    return f"non-canonical-{digest}"
 
 
 @dataclass(frozen=True)
@@ -3426,7 +3438,13 @@ def _best_effort_plain_send(worker: socket.socket, payload: bytes) -> bool:
 
 
 class _OriginLeg:
-    """One established origin leg plus its evidence fields."""
+    """One established origin leg plus its evidence fields.
+
+    ``verified_hostname`` is the origin channel's OBSERVED certificate
+    identity (the name the channel actually verified the peer against),
+    threaded through so connection evidence records the observation, not
+    the approved expectation.
+    """
 
     def __init__(
         self,
@@ -3434,6 +3452,7 @@ class _OriginLeg:
         sock: socket.socket,
         tls_version: str,
         alpn: str,
+        verified_hostname: str,
         peer_address: str,
         peer_port: int,
         address_policy_version: str,
@@ -3442,6 +3461,7 @@ class _OriginLeg:
         self.sock = sock
         self.tls_version = tls_version
         self.alpn = alpn
+        self.verified_hostname = verified_hostname
         self.peer_address = peer_address
         self.peer_port = peer_port
         self.address_policy_version = address_policy_version
@@ -3510,6 +3530,7 @@ def _establish_fixture_origin(
             sock=outcome.channel.tls_socket,
             tls_version=outcome.channel.tls_version,
             alpn=outcome.channel.alpn_protocol,
+            verified_hostname=outcome.channel.verified_hostname,
             peer_address=str(peer.address),
             peer_port=peer.port,
             address_policy_version=ADDRESS_POLICY_VERSION,
@@ -3547,6 +3568,7 @@ def _establish_origin(
             sock=outcome.channel.tls_socket,
             tls_version=outcome.channel.tls_version,
             alpn=outcome.channel.alpn_protocol,
+            verified_hostname=outcome.channel.verified_hostname,
             peer_address=outcome.channel.peer_address,
             peer_port=outcome.channel.peer_port,
             address_policy_version=resolution.policy_version,
@@ -3562,6 +3584,7 @@ def _relay_origin_response(
     runtime: _HttpsConnectionRuntime,
     channel: Any,
     origin: _OriginLeg,
+    method: str,
     counters: dict[str, int],
 ) -> tuple[str, str]:
     """Bounded verbatim origin->worker relay; h11 CLIENT is framing-only.
@@ -3570,13 +3593,38 @@ def _relay_origin_response(
     logged); the h11 client machine is used ONLY to delimit the response
     (EndOfMessage) so the persistent connection can cycle.  A response h11
     cannot frame fails the connection closed.
+
+    The framer is seeded first with a synthetic h11.Request carrying the
+    ACTUAL request method; the bytes h11 produces are DISCARDED (nothing
+    here touches the wire — only h11's state machine advances, the same
+    synthetic-state-advance trick as StrictHttpParser._check_complete in
+    network_http.py).  h11 frames HEAD/204/304 responses as bodiless ONLY
+    when it has seen the request method; an unseeded framer would wait for
+    body bytes that never come (hanging until grant expiry) and mis-frame
+    any late bytes as a phantom body, desyncing every later response
+    boundary on the persistent connection.
+
+    A silent origin is bounded by HTTPS_RESPONSE_IDLE_TIMEOUT_SECONDS of
+    idle time; every received byte resets the deadline, so only an origin
+    that stops making byte progress trips it — expiry of the bound fails
+    the connection closed instead of spinning until grant expiry.
     """
     import h11
 
     from .network_tls import ChannelError
 
     framer = h11.Connection(h11.CLIENT)
+    try:
+        framer.send(
+            h11.Request(
+                method=method, target="/", headers=[("Host", "origin.invalid")]
+            )
+        )
+        framer.send(h11.EndOfMessage())
+    except h11.LocalProtocolError:
+        return "peer_error", "response_unframeable"
     sock = origin.sock
+    idle_deadline = time.monotonic() + HTTPS_RESPONSE_IDLE_TIMEOUT_SECONDS
     while True:
         if serve.expired():
             return "expired", "expired"
@@ -3589,6 +3637,8 @@ def _relay_origin_response(
         try:
             chunk = sock.recv(min(RELAY_CHUNK_BYTES, budget))
         except socket.timeout:
+            if time.monotonic() >= idle_deadline:
+                return "peer_error", "origin_response_timeout"
             continue
         except OSError:
             if serve.expired():
@@ -3598,6 +3648,12 @@ def _relay_origin_response(
             return "peer_error", "origin_read_failed"
         serve.accountant.commit_read(len(chunk))
         counters["read_from_origin"] += len(chunk)
+        if chunk:
+            # Byte progress resets the idle bound; only a silent origin
+            # can ever hit the deadline.
+            idle_deadline = (
+                time.monotonic() + HTTPS_RESPONSE_IDLE_TIMEOUT_SECONDS
+            )
         try:
             framer.receive_data(chunk)
         except h11.LocalProtocolError:
@@ -3699,41 +3755,47 @@ def _serve_https_connection(
             identity = chain.code.value
             if not chain.verified and chain.stage is not None:
                 identity = f"{chain.code.value}:{chain.stage.value}"
-        record = HttpsConnectionRecord(
-            version=HTTPS_EVIDENCE_VERSION,
-            event=HTTPS_CONNECTION_EVENT,
-            task_id=serve.policy.task_id,
-            task_generation=serve.policy.task_generation,
-            launch_nonce=serve.policy.launch_nonce,
-            policy_digest=transport_policy_digest(serve.policy),
-            network_policy_digest=serve.https_state.network_policy_digest,
-            address_policy_version=address_policy_version or ADDRESS_POLICY_VERSION,
-            connection_index=connection_index,
-            stage_reached=stage,
-            terminal_reason=termination,
-            detail=detail,
-            approved_hostname=serve.approved_hostname,
-            connect_authority=_evidence_hostname(connect_authority),
-            worker_sni=_evidence_hostname(worker_sni_raw),
-            http_host=_evidence_hostname(http_host),
-            origin_tls_name=_evidence_hostname(origin_tls_name),
-            identity_chain=identity,
-            worker_tls_version=worker_tls_version,
-            worker_alpn=worker_alpn,
-            origin_tls_version=origin_tls_version,
-            origin_alpn=origin_alpn,
-            origin_peer_address=origin_peer_address,
-            origin_peer_port=origin_peer_port,
-            synthetic_origin=synthetic,
-            requests_completed=requests_completed,
-            accounted_bytes=accounted,
-            worker_to_origin_bytes=counters["worker_to_origin"],
-            origin_to_worker_bytes=counters["origin_to_worker"],
-            total_bytes=total,
-            discarded_unsent_bytes=accounted - total,
-            observed_at_monotonic_ns=time.monotonic_ns(),
-        )
+        # Record construction AND emission sit inside the fail-closed
+        # guard: a construction failure surfaces in thread_errors instead
+        # of killing the connection thread silently — runtime.abort still
+        # runs and the run's surviving evidence stays intact.
         try:
+            record = HttpsConnectionRecord(
+                version=HTTPS_EVIDENCE_VERSION,
+                event=HTTPS_CONNECTION_EVENT,
+                task_id=serve.policy.task_id,
+                task_generation=serve.policy.task_generation,
+                launch_nonce=serve.policy.launch_nonce,
+                policy_digest=transport_policy_digest(serve.policy),
+                network_policy_digest=serve.https_state.network_policy_digest,
+                address_policy_version=(
+                    address_policy_version or ADDRESS_POLICY_VERSION
+                ),
+                connection_index=connection_index,
+                stage_reached=stage,
+                terminal_reason=termination,
+                detail=detail,
+                approved_hostname=serve.approved_hostname,
+                connect_authority=_evidence_hostname(connect_authority),
+                worker_sni=_evidence_hostname(worker_sni_raw),
+                http_host=_evidence_hostname(http_host),
+                origin_tls_name=_evidence_hostname(origin_tls_name),
+                identity_chain=identity,
+                worker_tls_version=worker_tls_version,
+                worker_alpn=worker_alpn,
+                origin_tls_version=origin_tls_version,
+                origin_alpn=origin_alpn,
+                origin_peer_address=origin_peer_address,
+                origin_peer_port=origin_peer_port,
+                synthetic_origin=synthetic,
+                requests_completed=requests_completed,
+                accounted_bytes=accounted,
+                worker_to_origin_bytes=counters["worker_to_origin"],
+                origin_to_worker_bytes=counters["origin_to_worker"],
+                total_bytes=total,
+                discarded_unsent_bytes=accounted - total,
+                observed_at_monotonic_ns=time.monotonic_ns(),
+            )
             serve.emit_record(record)
         except BrokerBoundaryError as exc:
             serve.thread_errors.append(exc)
@@ -3813,6 +3875,9 @@ def _serve_https_connection(
         origin: _OriginLeg | None = None
         origin_eof = False
         http_done = False
+        # Methods of prevalidated requests, in request order; the response
+        # relay consumes one per forwarded request to seed its framer.
+        request_methods: list[str] = []
         while not http_done:
             if serve.expired():
                 termination, detail = (
@@ -3867,6 +3932,14 @@ def _serve_https_connection(
             serve.accountant.commit_read(len(data))
             counters["read_from_worker"] += len(data)
             feed = parser.feed(data)
+            if feed.rejection is not None:
+                # A rejected feed forwards NOTHING: the typed rejection
+                # short-circuits BEFORE any event processing, so completed
+                # wires carried in the same read never reach the origin and
+                # no origin round trip runs for a denied connection.
+                detail = f"http_{feed.rejection.code.value}"
+                termination = HttpsConnectionTermination.DENIED
+                break
             completed_wires = list(parser.pop_completed_wire())
             denial: str | None = None
             denial_stage: HttpsConnectionStage | None = None
@@ -3874,6 +3947,7 @@ def _serve_https_connection(
                 if denial is not None:
                     break
                 if isinstance(event, RequestHead):
+                    request_methods.append(event.method)
                     try:
                         head_host = normalize_https_authority(event.host)
                     except NormalizationError:
@@ -3897,6 +3971,7 @@ def _serve_https_connection(
                         denial = "http_internal_wire_accounting"
                         break
                     wire = completed_wires.pop(0)
+                    method = request_methods.pop(0)
                     if origin is None:
                         leg, leg_stage, leg_detail = _establish_origin(
                             serve, runtime
@@ -3906,7 +3981,11 @@ def _serve_https_connection(
                             denial_stage = leg_stage
                             break
                         origin = leg
-                        origin_tls_name = serve.approved_hostname
+                        # Evidence records the channel's OBSERVED verified
+                        # identity, never the approved expectation; a
+                        # divergent observation surfaces through
+                        # verify_identity_chain in the connection record.
+                        origin_tls_name = leg.verified_hostname
                         origin_tls_version = leg.tls_version
                         origin_alpn = leg.alpn
                         origin_peer_address = leg.peer_address
@@ -3938,7 +4017,7 @@ def _serve_https_connection(
                     requests_completed += 1
                     stage = HttpsConnectionStage.RESPONSE_RELAY
                     relay_status, relay_detail = _relay_origin_response(
-                        serve, runtime, channel, origin, counters
+                        serve, runtime, channel, origin, method, counters
                     )
                     stage = HttpsConnectionStage.HTTP
                     if relay_status == "done":
@@ -3971,10 +4050,6 @@ def _serve_https_connection(
                 if denial_stage is not None:
                     stage = denial_stage
                 detail = denial
-                termination = HttpsConnectionTermination.DENIED
-                break
-            if feed.rejection is not None:
-                detail = f"http_{feed.rejection.code.value}"
                 termination = HttpsConnectionTermination.DENIED
                 break
     except BaseException as exc:  # noqa: BLE001 — fail closed per connection

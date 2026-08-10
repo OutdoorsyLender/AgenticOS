@@ -40,6 +40,9 @@ Origin TLS hardening (never weakened for the numeric connection):
 * ``verify_mode = CERT_REQUIRED`` and ``check_hostname = True`` — always.
 * minimum TLS 1.2 (``minimum_version = TLSv1_2``), re-verified on the
   established channel as defense in depth.
+* ``OP_NO_RENEGOTIATION`` set on the context AND verified present in the
+  resulting options (mirrors the worker leg): a TLS 1.2 origin cannot
+  drive a renegotiation handshake on this channel.
 * ALPN offers EXACTLY ``["http/1.1"]``; after the handshake the channel is
   accepted only when ``selected_alpn_protocol() == "http/1.1"``.  An
   origin negotiating h2 or nothing is a fail-closed ALPN_FAILED — HTTP/2
@@ -75,6 +78,7 @@ from .network_resolution import (
     ResolutionOutcome,
     ResolvedAddress,
 )
+from .special_addresses import AddressDecision, AddressVerdict
 
 # Evidence-binding version for this stage, chained to the resolution policy
 # version (which itself chains the frozen address-policy version).
@@ -164,8 +168,12 @@ def build_origin_ssl_context(
     A new context per call guarantees trust roots can never persist or
     switch across policies: the only roots loaded are the ones named by
     ``trust_roots`` for THIS connection.  Hardening (CERT_REQUIRED,
-    check_hostname, TLS>=1.2, ALPN http/1.1 only) is applied
-    unconditionally AFTER root loading, so no injection path can weaken it.
+    check_hostname, TLS>=1.2, ALPN http/1.1 only, OP_NO_RENEGOTIATION) is
+    applied unconditionally AFTER root loading, so no injection path can
+    weaken it.  OP_NO_RENEGOTIATION mirrors the worker leg
+    (:mod:`agenticos.sandbox.network_tls`): the bit is set AND verified
+    present in the resulting options, raising (fail-closed via the
+    caller) if the interpreter's ssl module cannot guarantee it.
     """
     if trust_roots is None:
         trust_roots = OriginTrustRoots()
@@ -177,10 +185,17 @@ def build_origin_ssl_context(
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.load_verify_locations(cadata=trust_roots.ca_certs_pem)
     # Hardening is unconditional and comes last: never weakened, never skipped.
+    if not hasattr(ssl, "OP_NO_RENEGOTIATION"):
+        raise ValueError("ssl.OP_NO_RENEGOTIATION is not exposed")
     context.verify_mode = ssl.CERT_REQUIRED
     context.check_hostname = True
     context.minimum_version = _MINIMUM_TLS
     context.set_alpn_protocols([_ONLY_ALPN])
+    context.options |= ssl.OP_NO_RENEGOTIATION
+    if not (context.options & ssl.OP_NO_RENEGOTIATION):
+        raise ValueError(
+            "OP_NO_RENEGOTIATION not present in context options after set"
+        )
     return context
 
 
@@ -230,7 +245,11 @@ def _validate_address_set(
     This is what makes a hostname-typed input impossible: anything that is
     not a ``ResolvedAddress`` whose ``address`` is an ``ipaddress`` object
     consistent with its ``family`` — including plain strings, (host, port)
-    tuples, or bytes — is rejected BEFORE any socket is created.
+    tuples, or bytes — is rejected BEFORE any socket is created.  Every
+    entry must also carry an :class:`AddressVerdict` whose decision is
+    ALLOWED: a non-ALLOWED verdict (one that somehow survived or bypassed
+    Slice 7's deny-the-whole-resolution rule) is a fail-closed rejection,
+    never a filter-and-continue.
     """
     if not isinstance(addresses, (tuple, list)):
         return _invalid_address_set(
@@ -267,6 +286,17 @@ def _validate_address_set(
         if type(item.port) is not int or not 1 <= item.port <= 65535:
             return _invalid_address_set(
                 f"port {item.port!r} is not a valid TCP port"
+            )
+        if type(item.verdict) is not AddressVerdict:
+            return _invalid_address_set(
+                f"ResolvedAddress.verdict is "
+                f"{type(item.verdict).__name__}, not an AddressVerdict"
+            )
+        if item.verdict.decision is not AddressDecision.ALLOWED:
+            return _invalid_address_set(
+                f"ResolvedAddress for {item.address} carries a "
+                f"{item.verdict.decision.value!r} verdict, not allowed; a "
+                "prohibited address can never enter the connect path"
             )
         validated.append(item)
     return tuple(validated)

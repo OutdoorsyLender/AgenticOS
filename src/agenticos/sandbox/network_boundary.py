@@ -222,11 +222,19 @@ def _broker_https_bootstrap() -> str:
         # material roles 36-39 and 43; the HTTPS flavor is DENY-only, never
         # a fixture); sweep every other descriptor before main() so the
         # runtime census proof stays exact.  os.closerange ignores gaps.
+        # closerange high bounds are EXCLUSIVE: (3,30) covers 29, (34,36)
+        # covers 35, (40,43) covers 42, and the final sweep runs to
+        # (1<<31)-1.  That is the largest exclusive bound a C int can
+        # express, and it is COMPLETE: the kernel numbers fds below
+        # RLIMIT_NOFILE, which is capped by fs.nr_open (< (1<<31)-1,
+        # rounded down to a BITS_PER_LONG multiple), so fd (1<<31)-1
+        # itself — the validated pass-fd maximum MAX_SUPERVISOR_FD — is
+        # never actually openable and needs no sweep.
         "import os;"
-        "os.closerange(3,29);"
-        "os.closerange(34,35);"
-        "os.closerange(40,42);"
-        "os.closerange(44,1073741823);"
+        "os.closerange(3,30);"
+        "os.closerange(34,36);"
+        "os.closerange(40,43);"
+        "os.closerange(44,2147483647);"
         "raise SystemExit(importlib.import_module('agenticos.sandbox.network_broker').main())"
     )
 

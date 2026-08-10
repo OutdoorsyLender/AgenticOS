@@ -38,6 +38,15 @@ in the safe direction):
   cross-parser casing differences are exactly the ambiguity class this
   envelope exists to remove); TE+CL together
   is REJECTED; any other coding or coding list is REJECTED.
+* GET/HEAD never carry a request body: ``Content-Length`` > 0 and ANY
+  Transfer-Encoding on GET/HEAD are REJECTED.  A 'GET body' is a CL.0
+  request-desync primitive: if the origin does not consume it, those bytes
+  become a smuggled next request that bypasses method policy.  A bare
+  ``Content-Length: 0`` on GET/HEAD is ACCEPTED — no body bytes follow, so
+  the prevalidator and h11 agree on the message boundary and no desync is
+  possible.  Bodies remain possible only on POST.
+* Request targets starting with ``//`` (network-path references per
+  RFC 3986) are REJECTED; origin-form starts with exactly one ``/``.
 * Chunk extensions are REJECTED (no ``;`` after the chunk size — "no
   invisible chunk extensions"); the chunk-size line is bare hex (1-8
   digits).  Trailers are FORBIDDEN: any trailer section after the final
@@ -45,6 +54,10 @@ in the safe direction):
 * ``Upgrade`` / ``Connection: upgrade`` and ``Expect`` (100-continue
   negotiation) are REJECTED by policy default; WebSocket and nested CONNECT
   are unreachable (CONNECT is outside every method allowlist).
+* The ``close`` connection-token is REJECTED (case-insensitive token match,
+  including multi-token values such as ``keep-alive, close``): the broker
+  controls connection lifetime via grant expiry, so workers must not
+  negotiate it.  A bare ``keep-alive`` token stays accepted.
 * Leading empty lines before the request line are REJECTED (RFC 9110 says
   a server SHOULD ignore at least one; ambiguity is not tolerated here).
 
@@ -119,6 +132,7 @@ class RejectionCode(str, Enum):
     METHOD_NOT_ALLOWED = "method_not_allowed"
     VERSION_REJECTED = "version_rejected"
     TARGET_MALFORMED = "target_malformed"
+    TARGET_NETWORK_PATH_REFERENCE = "target_network_path_reference"
     TARGET_ASTERISK_FORM = "target_asterisk_form"
     TARGET_AUTHORITY_FORM = "target_authority_form"
     TARGET_AUTHORITY_MISMATCH = "target_authority_mismatch"
@@ -139,7 +153,9 @@ class RejectionCode(str, Enum):
     TRANSFER_ENCODING_UNSUPPORTED = "transfer_encoding_unsupported"
     TE_WITH_CONTENT_LENGTH = "te_with_content_length"
     UPGRADE_REJECTED = "upgrade_rejected"
+    CONNECTION_CLOSE_REJECTED = "connection_close_rejected"
     EXPECT_REJECTED = "expect_rejected"
+    BODILESS_METHOD_WITH_BODY = "bodiless_method_with_body"
     CHUNK_SIZE_INVALID = "chunk_size_invalid"
     CHUNK_EXTENSION_REJECTED = "chunk_extension_rejected"
     BODY_TOO_LARGE = "body_too_large"
@@ -576,10 +592,23 @@ class StrictHttpParser:
             self._chunked = True
         elif lname == b"upgrade" and not self._policy.allow_upgrade:
             raise _Reject(RejectionCode.UPGRADE_REJECTED, "Upgrade is denied by policy")
-        elif lname == b"connection" and b"upgrade" in rest.lower() and not self._policy.allow_upgrade:
-            raise _Reject(
-                RejectionCode.UPGRADE_REJECTED, "Connection: upgrade is denied by policy"
-            )
+        elif lname == b"connection":
+            # The 'close' token lets the worker negotiate connection lifetime,
+            # which the broker owns via grant expiry; forwarding it also
+            # strands h11 in MUST_CLOSE and surfaces only later as a
+            # misleading disagreement.  Tokens are matched case-insensitively
+            # because h11 parses connection tokens case-insensitively.
+            tokens = [t.strip(b" ") for t in rest.lower().split(b",")]
+            if b"close" in tokens:
+                raise _Reject(
+                    RejectionCode.CONNECTION_CLOSE_REJECTED,
+                    "the 'close' connection-token is denied: "
+                    "the broker controls connection lifetime",
+                )
+            if b"upgrade" in rest.lower() and not self._policy.allow_upgrade:
+                raise _Reject(
+                    RejectionCode.UPGRADE_REJECTED, "Connection: upgrade is denied by policy"
+                )
         elif lname == b"expect":
             raise _Reject(
                 RejectionCode.EXPECT_REJECTED, "100-continue negotiation is not supported"
@@ -594,6 +623,18 @@ class StrictHttpParser:
             raise _Reject(
                 RejectionCode.TE_WITH_CONTENT_LENGTH,
                 "Transfer-Encoding with Content-Length is rejected",
+            )
+        # GET/HEAD never carry a body: a 'GET body' is a CL.0 desync
+        # primitive — if the origin does not consume it, those bytes become a
+        # smuggled next request that bypasses method policy.  A bare
+        # Content-Length: 0 stays accepted: no body bytes follow, so the
+        # prevalidator and h11 agree on the message boundary.
+        if self._method in ("GET", "HEAD") and (
+            self._chunked or (self._content_length is not None and self._content_length > 0)
+        ):
+            raise _Reject(
+                RejectionCode.BODILESS_METHOD_WITH_BODY,
+                f"{self._method} must not carry a request body",
             )
         self._validate_target_form()
         self._head_pending += b"\r\n"
@@ -621,6 +662,14 @@ class StrictHttpParser:
 
     def _validate_target_form(self) -> None:
         target = self._target
+        # A target starting with '//' is a network-path reference (RFC 3986
+        # section 4.2), NOT origin-form: '//evil.example/path' would re-aim
+        # the request at an attacker-chosen authority downstream.
+        if target.startswith(b"//"):
+            raise _Reject(
+                RejectionCode.TARGET_NETWORK_PATH_REFERENCE,
+                "network-path reference targets ('//authority/...') are rejected",
+            )
         if target.startswith(b"/"):
             return  # origin-form
         for scheme in _ABSOLUTE_SCHEMES:

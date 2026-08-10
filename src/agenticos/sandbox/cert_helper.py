@@ -8,9 +8,17 @@ helper's address space, and the helper exits before any hostile worker
 execution. See docs/phase-zero/dependency-review-m4b2.md for the dependency
 gate and the process-model rationale.
 
+The helper child is spawned under interpreter isolation (``-I``) with a fixed
+minimal (empty) environment and RLIMIT_CORE=0: nothing is inherited from the
+controller's environment or cwd, so a caller-controlled PYTHONPATH
+sitecustomize.py, .pth file, or cwd-shadowed package can never execute inside
+the CA-key-holding child, and the CA key can never reach a core dump.
+
 This module is standard-library-only at import time: ``cryptography`` is
-imported exclusively inside the helper child code path, so the long-lived
-broker runtime may import this module without taking the dependency.
+imported exclusively inside the helper child code path, and the canonical
+hostname grammar (``.network_https``) is imported lazily inside
+``_require_hostname``, so the long-lived broker runtime may import this
+module without taking either dependency.
 
 Transport contract (mirrors network_identity.py / host_qualification.py):
 
@@ -34,6 +42,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import socket
 import ssl
 import stat
@@ -57,7 +66,6 @@ _MAX_STDERR_BYTES = 4096
 _TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _LOWER_HEX_32_RE = re.compile(r"[0-9a-f]{32}\Z")
 _LOWER_HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
-_HOSTNAME_LABEL_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z")
 _REQUIRED_SEALS = (
     fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
 )
@@ -69,6 +77,7 @@ _MEMFD_NAMES = {
     "binding": "aos-task-cert-binding",
 }
 _DEFAULT_HELPER_TIMEOUT_SECONDS = 15.0
+_HELPER_KILL_REAP_TIMEOUT_SECONDS = 5.0
 _AUDIT_TIMEOUT_SECONDS = 5.0
 
 
@@ -178,11 +187,30 @@ def _require_positive_u64(name: str, value: object) -> None:
 
 
 def _require_hostname(value: object) -> None:
-    if type(value) is not str or not value.isascii() or not 1 <= len(value) <= 253:
-        raise CertHelperError("hostname must be a bounded ASCII DNS name")
-    labels = value.split(".")
-    if any(_HOSTNAME_LABEL_RE.fullmatch(label) is None for label in labels):
-        raise CertHelperError("hostname must be lowercase LDH labels, no wildcard")
+    """Fail closed unless ``value`` is already the ONE canonical hostname form.
+
+    The grammar is NOT re-implemented here: the single normalization point,
+    ``network_https.canonicalize_hostname``, decides validity, and the raw
+    input must equal its canonical form. Raw non-canonical input — uppercase,
+    underscores, ``xn--`` punycode labels, all-digit/hex numeric labels (IP
+    literals and inet_aton legacy numerics), empty labels — rejects at this
+    layer exactly as at every other layer, so the cert layer cannot diverge
+    from the authorization grammar. The import is lazy to keep this module
+    standard-library-only at import time (the ``.network_https`` import chain
+    pulls in ``h11``, which is approved for the broker runtime only).
+    """
+    if type(value) is not str:
+        raise CertHelperError("hostname must be a canonical ASCII DNS name")
+    from .network_https import NormalizationError, canonicalize_hostname
+
+    try:
+        canonical = canonicalize_hostname(value)
+    except NormalizationError as exc:
+        raise CertHelperError(
+            "hostname must be a canonical ASCII DNS name"
+        ) from exc
+    if canonical != value:
+        raise CertHelperError("hostname must already be in canonical form")
 
 
 def _require_task_context(
@@ -604,26 +632,60 @@ def _create_sealable_memfd(name: str) -> int:
 
 
 def _helper_environment() -> dict[str, str]:
-    """Child environment: inherit, but guarantee the agenticos source root."""
-    env = dict(os.environ)
+    """Fixed minimal child environment: NOTHING is inherited (CERT-01).
+
+    The helper genuinely needs no environment at all: the interpreter is an
+    absolute path, ``-I`` makes it ignore PYTHONPATH/PYTHON* variables anyway,
+    and ``cryptography`` is resolved from the interpreter's own site-packages.
+    Inheriting ``os.environ`` would let a caller-controlled PYTHONPATH
+    sitecustomize.py (or any PYTHON*/LD_* variable) steer code execution
+    inside the CA-key-holding child — a CA-key theft primitive.
+    """
+    return {}
+
+
+def _helper_preexec() -> None:
+    """Child-side limit applied just before exec: no core dumps (CERT-01).
+
+    The helper holds the task CA private key in memory; a core dump would
+    serialize it to disk. Composed as the sole preexec step — the spawn sets
+    no other rlimits or uid changes.
+    """
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def _helper_command() -> list[str]:
+    """Isolated interpreter invocation with an absolute-path module load.
+
+    ``-I`` (implies ``-E``, ``-P``, ``-s``) ignores PYTHONPATH and the other
+    PYTHON* variables, skips the user site directory, and keeps the cwd off
+    ``sys.path``, so neither a poisoned environment nor a poisoned cwd can
+    inject modules (sitecustomize, .pth hooks, shadow packages) into the
+    helper. Because ``-I`` ignores PYTHONPATH, the module is NOT loaded via
+    ``-m``; instead a tiny bootstrap inserts the ABSOLUTE agenticos source
+    root — derived from this file's own location, never from the environment
+    — and runs the module as ``__main__`` exactly as ``-m`` would.
+    """
     src_root = str(Path(__file__).resolve().parents[2])
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        src_root if not existing else src_root + os.pathsep + existing
+    bootstrap = (
+        "import runpy, sys;"
+        f"sys.path.insert(0, {src_root!r});"
+        "runpy.run_module('agenticos.sandbox.cert_helper', run_name='__main__')"
     )
-    return env
+    return [sys.executable, "-I", "-c", bootstrap]
 
 
 def _spawn_helper(request: dict[str, Any], fds: dict[str, int]) -> subprocess.Popen:
     """Spawn the short-lived helper child; the caller bounds its lifetime."""
     try:
         return subprocess.Popen(
-            [sys.executable, "-m", "agenticos.sandbox.cert_helper"],
+            _helper_command(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             pass_fds=tuple(fds.values()),
             env=_helper_environment(),
+            preexec_fn=_helper_preexec,
         )
     except (OSError, ValueError) as exc:
         raise CertHelperError("could not spawn the certificate helper") from exc
@@ -677,7 +739,17 @@ def generate_task_material(
             stdout, stderr = process.communicate(payload, timeout=timeout_seconds)
         except subprocess.TimeoutExpired as exc:
             process.kill()
-            process.wait()
+            # CERT-03: the reap after kill() is BOUNDED. An unbounded wait
+            # would let a wedged helper block the controller indefinitely;
+            # on reap timeout the launch aborts and fails closed. Any
+            # grandchildren can hold only the already-sealed output memfds
+            # (the only pass_fds), never unsealed material.
+            try:
+                process.wait(timeout=_HELPER_KILL_REAP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                raise CertHelperError(
+                    "certificate helper could not be reaped in bounded time"
+                ) from exc
             raise CertHelperError("certificate helper exceeded its time bound") from exc
         if process.returncode != 0:
             detail = stderr[:_MAX_STDERR_BYTES].decode("ascii", errors="replace")
