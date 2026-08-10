@@ -1,10 +1,15 @@
-"""Real-host integration proof for the M4B-2 slice-9a HTTPS material plumbing.
+"""Real-host integration proof for the M4B-2 HTTPS broker serve path.
 
 Full launches through the authenticated M4B-1 broker boundary carrying the
-sealed NetworkPolicy and sealed task certificate material.  Slice 9a proves
-material + policy plumbing only: the broker verifies, loads, and CLOSES the
-material before readiness, then runs the unchanged DENY loop (dispatch is
-slice 9b).  Conventions mirror test_m4b_integration.py.
+sealed NetworkPolicy and sealed task certificate material.  Slice 9b serves
+the gated HTTPS pipeline in the broker: strict CONNECT authority -> grant
+authorization -> bounded ClientHello gate -> per-connection worker TLS
+termination -> strict HTTP/1.1 prevalidation -> validated resolution ->
+numeric connect -> authenticated origin TLS -> bounded verbatim relay.  The
+origin side is the conformance FixtureFdConnector: an already-connected
+synthetic origin (socketpair to a test TLS server) selected ONLY by the
+private runner API and committed to evidence as non-production synthetic.
+Conventions mirror test_m4b_integration.py.
 """
 
 from __future__ import annotations
@@ -16,15 +21,22 @@ import pytest
 if not sys.platform.startswith("linux"):
     pytest.skip("M4B-2 HTTPS real-host proof requires Linux", allow_module_level=True)
 
+import array
+import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
+import socket
+import ssl
 import subprocess
+import threading
 import time
 import uuid
 
 from agenticos.sandbox import host_qualification as hq
 from agenticos.sandbox import m4b_runner as runner_module
+from agenticos.sandbox import network_broker as broker_module
 from agenticos.sandbox.cert_helper import generate_task_material
 from agenticos.sandbox.evidence import EvidenceCollector
 from agenticos.sandbox.network_https import (
@@ -36,6 +48,7 @@ from agenticos.sandbox.network_https import (
 from agenticos.sandbox.network_models import TransportMode, TransportPolicy, policy_digest
 from agenticos.sandbox.runtime_boundary import M4AProfile
 
+import chgen
 from helpers import WORKER_PATH, pid_alive
 from test_m4b_integration import (
     FAST,
@@ -43,6 +56,7 @@ from test_m4b_integration import (
     _fixed_native_fd_window,
     _same_uid_opaque_fd_baseline,
 )
+from test_m4b_origin_unit import _custom_material, _server_context
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -100,6 +114,11 @@ def m4b2_runner_factory(layout, m4b2_native_helpers, m4b2_host_state, m4b2_vendo
         lifetime=30.0,
         transport_policy=None,
         host_state_dir=None,
+        purpose=GrantPurpose.GENERAL_DOWNLOAD,
+        fixture_origin=None,
+        fixture_addresses=("93.184.216.34",),
+        connection_limit=1,
+        byte_limit=64 * 1024,
     ):
         nonlocal counter
         counter += 1
@@ -116,9 +135,23 @@ def m4b2_runner_factory(layout, m4b2_native_helpers, m4b2_host_state, m4b2_vendo
             proxy_port=18080,
             activated_at_monotonic_ns=now - 1_000_000_000,
             expires_at_monotonic_ns=now + int(lifetime * 1_000_000_000),
-            connection_limit=1,
-            byte_limit=64 * 1024,
+            connection_limit=connection_limit,
+            byte_limit=byte_limit,
         )
+        connector = None
+        if fixture_origin is not None:
+            # Pin the synthetic origin socket above the fixed native FD
+            # window before the launch vacates low descriptors.
+            pinned = fcntl.fcntl(
+                fixture_origin.broker_sock.fileno(), fcntl.F_DUPFD_CLOEXEC, 300
+            )
+            fixture_origin.broker_sock.close()
+            fixture_origin.broker_sock = socket.socket(fileno=pinned)
+            connector = runner_module.FixtureFdConnector(
+                fixture_origin.broker_sock,
+                ca_certs_pem=fixture_origin.pems["ca"].decode("ascii"),
+                addresses=fixture_addresses,
+            )
         runner = runner_module.HttpsCapabilityTransportRunner(
             WORKER_PATH,
             workspace=layout.assigned_worktree,
@@ -132,11 +165,12 @@ def m4b2_runner_factory(layout, m4b2_native_helpers, m4b2_host_state, m4b2_vendo
             collector=EvidenceCollector(normalize_root=layout.root),
             setup_timeout=5.0,
             approved_hostname=hostname,
-            grant_purpose=GrantPurpose.GENERAL_DOWNLOAD,
+            grant_purpose=purpose,
             approval_source="m4b2-integration",
-            approval_reference="slice-9a",
+            approval_reference="slice-9b",
             host_state_dir=host_state_dir or m4b2_host_state,
             broker_vendor_dir=m4b2_vendor,
+            _fixture_connector=connector,
         )
         live_run = runner.run
 
@@ -176,7 +210,13 @@ def test_https_launch_reaches_readiness_and_helper_exited(m4b2_runner_factory):
     assert network_policy.grants[0].hostname == APPROVED_HOSTNAME
     observation = runner.last_transport_observation
     assert observation is not None
-    assert observation.terminal_reason.value == "DENY_NO_RELAY"
+    # Slice 9b: the broker serves the HTTPS pipeline; with no worker
+    # connection the clean worker exit reaps the broker and the runner
+    # synthesizes the aggregate from the (empty) record set.
+    assert observation.terminal_reason.value == "REVOKED"
+    assert runner.last_https_terminal is observation
+    assert runner.last_https_terminal_source == "synthesized_at_worker_exit"
+    assert runner.last_https_connection_records == ()
     _assert_no_m4b_residue(runner)
 
 
@@ -381,3 +421,465 @@ def test_absent_host_manifest_fails_closed(m4b2_runner_factory, tmp_path):
     with pytest.raises(hq.HostQualificationError, match="absent"):
         runner.run(["/usr/bin/true"], cwd="/workspace", env={})
     assert runner.last_https_helper_pid is None
+
+
+# ============================================================================
+# Slice 9b: real-launch HTTPS serve path through the FixtureFdConnector
+# ============================================================================
+
+
+def _origin_read_request(tls):
+    """Read one request head plus any Content-Length body (test origin side)."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = tls.recv(4096)
+        if not chunk:
+            return data
+        data += chunk
+        if len(data) > 65536:
+            raise RuntimeError("origin request head exceeded test bound")
+    head, _, rest = data.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+    while len(rest) < length:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    return head + b"\r\n\r\n" + rest
+
+
+class _SyntheticOriginServer:
+    """A scripted test TLS origin on one end of the fixture socketpair."""
+
+    def __init__(
+        self,
+        cert_dir,
+        *,
+        hostname=APPROVED_HOSTNAME,
+        body=b"agenticos-m4b2-origin-body",
+        delay=0.0,
+        request_count=1,
+    ):
+        cert_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.pems = _custom_material(
+            now - datetime.timedelta(minutes=2),
+            now + datetime.timedelta(hours=1),
+            hostname=hostname,
+        )
+        self.requests = []
+        self.errors = []
+        self.body = body
+        broker_end, server_end = socket.socketpair()
+        # Pin both ends above the fixed native FD window: the launch chain
+        # vacates low descriptors and the origin thread runs across it.
+        for index, sock in enumerate((broker_end, server_end)):
+            pinned = fcntl.fcntl(sock.fileno(), fcntl.F_DUPFD_CLOEXEC, 300 + index)
+            sock.close()
+            if index == 0:
+                broker_end = socket.socket(fileno=pinned)
+            else:
+                server_end = socket.socket(fileno=pinned)
+        self.broker_sock = broker_end
+        self._context = _server_context(cert_dir, self.pems)
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(server_end, delay, request_count),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self, sock, delay, request_count):
+        try:
+            tls = self._context.wrap_socket(sock, server_side=True)
+            tls.settimeout(25.0)
+            for _ in range(request_count):
+                request = _origin_read_request(tls)
+                self.requests.append(request)
+                if delay:
+                    time.sleep(delay)
+                tls.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: "
+                    + str(len(self.body)).encode("ascii")
+                    + b"\r\nConnection: close\r\n\r\n" + self.body
+                )
+            tls.close()
+        except (ssl.SSLError, OSError) as exc:
+            self.errors.append(f"{type(exc).__name__}: {exc}")
+        except RuntimeError as exc:
+            self.errors.append(str(exc))
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def expected_response(self):
+        return (
+            b"HTTP/1.1 200 OK\r\nContent-Length: "
+            + str(len(self.body)).encode("ascii")
+            + b"\r\nConnection: close\r\n\r\n" + self.body
+        )
+
+    def join(self, timeout=8.0):
+        self._thread.join(timeout)
+        assert not self._thread.is_alive(), "synthetic origin thread stuck"
+
+    def close(self):
+        try:
+            self.broker_sock.close()
+        except OSError:
+            pass
+
+
+def _https_worker_options(target, options):
+    return _worker_argv(
+        "--scenario",
+        "M4B2-01",
+        "--target",
+        target,
+        "--canary",
+        json.dumps(options, separators=(",", ":")),
+    )
+
+
+def _sole_connection_record(runner):
+    records = runner.last_https_connection_records
+    assert records is not None and len(records) == 1, records
+    return records[0]
+
+
+def test_https_full_path_worker_receives_exact_origin_bytes(
+    m4b2_runner_factory, tmp_path
+):
+    origin = _SyntheticOriginServer(tmp_path / "origin")
+    runner = m4b2_runner_factory(fixture_origin=origin)
+    process = runner.run(
+        _https_worker_options(f"{APPROVED_HOSTNAME}:443", {}),
+        cwd="/workspace",
+        env={},
+    )
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["succeeded"] is True, result
+    details = result["details"]
+    assert details["connect_reply"].startswith("HTTP/1.1 200")
+    assert details["tls_version"] == "TLSv1.3"
+    assert details["alpn"] == "http/1.1"
+    response = details["responses"][0]
+    assert response["status"] == 200
+    assert bytes.fromhex(response["body_hex"]) == origin.body
+
+    expected_request = (
+        f"GET / HTTP/1.1\r\nHost: {APPROVED_HOSTNAME}\r\n\r\n"
+    ).encode("ascii")
+    origin.join()
+    assert origin.requests == [expected_request]
+    assert origin.errors == []
+    expected_response = origin.expected_response()
+
+    terminal = runner.last_https_terminal
+    assert terminal is not None
+    assert terminal.terminal_reason.value == "REVOKED"
+    assert terminal.synthetic_origin is True
+    # Clean worker exit reaps the broker: the aggregate is synthesized from
+    # the authenticated per-connection records (see network_broker.py).
+    assert runner.last_https_terminal_source == "synthesized_at_worker_exit"
+    record = _sole_connection_record(runner)
+    # The whole identity chain is bound to the approved hostname.
+    assert record.identity_chain == "verified"
+    assert record.connect_authority == APPROVED_HOSTNAME
+    assert record.worker_sni == APPROVED_HOSTNAME
+    assert record.http_host == APPROVED_HOSTNAME
+    assert record.origin_tls_name == APPROVED_HOSTNAME
+    assert record.worker_tls_version == "TLSv1.3"
+    assert record.origin_tls_version == "TLSv1.3"
+    assert record.worker_alpn == "http/1.1"
+    assert record.origin_alpn == "http/1.1"
+    assert record.origin_peer_address == "93.184.216.34"
+    assert record.origin_peer_port == 443
+    assert record.synthetic_origin is True
+    assert record.terminal_reason.value == "completed"
+    assert record.requests_completed == 1
+    # Byte accounting invariants, exact both directions.
+    assert record.worker_to_origin_bytes == len(expected_request)
+    assert record.origin_to_worker_bytes == len(expected_response)
+    assert record.total_bytes == len(expected_request) + len(expected_response)
+    assert record.accounted_bytes == (
+        record.total_bytes + record.discarded_unsent_bytes
+    )
+    assert terminal.connection_count == 1
+    assert terminal.accounted_bytes == record.accounted_bytes
+    assert terminal.worker_to_origin_bytes == record.worker_to_origin_bytes
+    assert terminal.origin_to_worker_bytes == record.origin_to_worker_bytes
+    origin.close()
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_ech_clienthello_denied(m4b2_runner_factory, tmp_path):
+    origin = _SyntheticOriginServer(tmp_path / "origin")
+    runner = m4b2_runner_factory(fixture_origin=origin)
+    hello = chgen.make_client_hello(APPROVED_HOSTNAME.encode("ascii"), ech=True)
+    process = runner.run(
+        _https_worker_options(
+            f"{APPROVED_HOSTNAME}:443", {"raw_tls_hex": hello.hex()}
+        ),
+        cwd="/workspace",
+        env={},
+    )
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    details = result["details"]
+    # The CONNECT is authorized (200), then the ECH-bearing ClientHello is
+    # rejected at the gate: no TLS trust is ever established.
+    assert details["connect_reply"].startswith("HTTP/1.1 200")
+    assert details["raw_received_length"] == 0
+    origin.close()
+    origin.join()
+    assert origin.requests == []
+    record = _sole_connection_record(runner)
+    assert record.stage_reached.value == "clienthello_gate"
+    assert record.terminal_reason.value == "denied"
+    assert "0xfe0d" in record.detail
+    assert record.worker_sni is None
+    assert record.worker_tls_version is None
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_wrong_sni_denied(m4b2_runner_factory, tmp_path):
+    origin = _SyntheticOriginServer(tmp_path / "origin")
+    runner = m4b2_runner_factory(fixture_origin=origin)
+    process = runner.run(
+        _https_worker_options(
+            f"{APPROVED_HOSTNAME}:443", {"sni": "evil.example.com"}
+        ),
+        cwd="/workspace",
+        env={},
+    )
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["succeeded"] is False, result
+    origin.close()
+    origin.join()
+    assert origin.requests == []
+    record = _sole_connection_record(runner)
+    assert record.stage_reached.value == "worker_tls"
+    assert record.detail == "worker_tls_sni_mismatch"
+    assert record.worker_sni == "evil.example.com"
+    assert record.identity_chain == "identity_divergence:worker_sni"
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_host_grant_mismatch_denied(m4b2_runner_factory, tmp_path):
+    origin = _SyntheticOriginServer(tmp_path / "origin")
+    runner = m4b2_runner_factory(fixture_origin=origin)
+    options = {"requests": [{"method": "GET", "path": "/", "host": "evil.example.com"}]}
+    process = runner.run(
+        _https_worker_options(f"{APPROVED_HOSTNAME}:443", options),
+        cwd="/workspace",
+        env={},
+    )
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["succeeded"] is False, result
+    assert "error" in result["details"]["responses"][0]
+    origin.close()
+    origin.join()
+    assert origin.requests == [], "a divergent Host reached the origin"
+    record = _sole_connection_record(runner)
+    assert record.stage_reached.value == "http_prevalidation"
+    assert record.detail == "http_host_mismatch"
+    assert record.identity_chain == "identity_divergence:http_host"
+    assert record.requests_completed == 0
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_te_cl_smuggling_denied(m4b2_runner_factory, tmp_path):
+    origin = _SyntheticOriginServer(tmp_path / "origin")
+    runner = m4b2_runner_factory(fixture_origin=origin)
+    options = {
+        "requests": [
+            {
+                "method": "GET",
+                "path": "/",
+                "body": "abcd",
+                "extra_headers": [["Transfer-Encoding", "chunked"]],
+            }
+        ]
+    }
+    process = runner.run(
+        _https_worker_options(f"{APPROVED_HOSTNAME}:443", options),
+        cwd="/workspace",
+        env={},
+    )
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["succeeded"] is False, result
+    origin.close()
+    origin.join()
+    assert origin.requests == []
+    record = _sole_connection_record(runner)
+    assert record.stage_reached.value == "http_prevalidation"
+    assert record.detail == "http_te_with_content_length"
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_post_allowed_for_git_smart_fetch(m4b2_runner_factory, tmp_path):
+    origin = _SyntheticOriginServer(tmp_path / "origin")
+    runner = m4b2_runner_factory(
+        fixture_origin=origin, purpose=GrantPurpose.GIT_SMART_FETCH
+    )
+    options = {
+        "requests": [
+            {"method": "POST", "path": "/git-upload-pack", "body": "0000"}
+        ]
+    }
+    process = runner.run(
+        _https_worker_options(f"{APPROVED_HOSTNAME}:443", options),
+        cwd="/workspace",
+        env={},
+    )
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["succeeded"] is True, result
+    expected_request = (
+        f"POST /git-upload-pack HTTP/1.1\r\nHost: {APPROVED_HOSTNAME}\r\n"
+        "Content-Length: 4\r\n\r\n0000"
+    ).encode("ascii")
+    origin.join()
+    assert origin.requests == [expected_request]
+    record = _sole_connection_record(runner)
+    assert record.requests_completed == 1
+    assert record.worker_to_origin_bytes == len(expected_request)
+    assert record.terminal_reason.value == "completed"
+    origin.close()
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_post_denied_for_general_download(m4b2_runner_factory, tmp_path):
+    origin = _SyntheticOriginServer(tmp_path / "origin")
+    runner = m4b2_runner_factory(fixture_origin=origin)
+    options = {
+        "requests": [
+            {"method": "POST", "path": "/git-upload-pack", "body": "0000"}
+        ]
+    }
+    process = runner.run(
+        _https_worker_options(f"{APPROVED_HOSTNAME}:443", options),
+        cwd="/workspace",
+        env={},
+    )
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["succeeded"] is False, result
+    origin.close()
+    origin.join()
+    assert origin.requests == []
+    record = _sole_connection_record(runner)
+    assert record.stage_reached.value == "http_prevalidation"
+    assert record.detail == "http_method_not_allowed"
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_origin_wrong_hostname_cert_fails_closed(
+    m4b2_runner_factory, tmp_path
+):
+    origin = _SyntheticOriginServer(
+        tmp_path / "origin", hostname="evil.example.com"
+    )
+    runner = m4b2_runner_factory(fixture_origin=origin)
+    process = runner.run(
+        _https_worker_options(f"{APPROVED_HOSTNAME}:443", {}),
+        cwd="/workspace",
+        env={},
+    )
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    # The origin TLS verification fails closed: no origin bytes reach the
+    # worker even though the test CA is trusted for the fixture.
+    assert result["succeeded"] is False, result
+    response = result["details"]["responses"][0]
+    assert "error" in response and response.get("status") is None
+    origin.close()
+    origin.join()
+    assert origin.requests == []
+    record = _sole_connection_record(runner)
+    assert record.stage_reached.value == "origin_tls"
+    assert record.detail == "origin_verification_failed"
+    assert record.origin_to_worker_bytes == 0
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_prohibited_fixture_address_denied_before_connect(
+    m4b2_runner_factory, tmp_path
+):
+    origin = _SyntheticOriginServer(tmp_path / "origin")
+    runner = m4b2_runner_factory(
+        fixture_origin=origin, fixture_addresses=("127.0.0.1",)
+    )
+    process = runner.run(
+        _https_worker_options(f"{APPROVED_HOSTNAME}:443", {}),
+        cwd="/workspace",
+        env={},
+    )
+    assert process.exit_code == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["succeeded"] is False, result
+    origin.close()
+    origin.join()
+    # The prohibited loopback resolution is denied before the fixture socket
+    # is ever used: no TLS handshake reaches the synthetic origin.
+    assert origin.requests == []
+    record = _sole_connection_record(runner)
+    assert record.stage_reached.value == "resolution"
+    assert record.detail == "origin_prohibited_address"
+    assert record.origin_tls_version is None
+    assert record.worker_to_origin_bytes == 0
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_revoke_mid_connection_tears_down(m4b2_runner_factory, tmp_path):
+    origin = _SyntheticOriginServer(tmp_path / "origin", delay=10.0)
+    runner = m4b2_runner_factory(fixture_origin=origin)
+    process = runner.run(
+        _https_worker_options(f"{APPROVED_HOSTNAME}:443", {}),
+        cwd="/workspace",
+        env={},
+        timeout=3.0,
+    )
+    assert process.timed_out is True, process
+    terminal = runner.last_https_terminal
+    assert terminal is not None
+    assert terminal.terminal_reason.value == "REVOKED"
+    assert terminal.synthetic_origin is True
+    # The revoke was processed while the worker lived: a real broker terminal.
+    assert runner.last_https_terminal_source == "broker"
+    record = _sole_connection_record(runner)
+    assert record.terminal_reason.value == "revoked"
+    origin.close()
+    _assert_no_m4b_residue(runner)
+
+
+def test_https_expiry_tears_down_connections(m4b2_runner_factory, tmp_path):
+    origin = _SyntheticOriginServer(tmp_path / "origin", delay=10.0)
+    runner = m4b2_runner_factory(fixture_origin=origin, lifetime=6.0)
+    # Mid-run policy expiry exits the broker with an EXPIRED terminal; the
+    # worker stays alive past it (post_sleep), so the pump's broker-liveness
+    # gate deterministically fails the run closed — exactly how M4B-1 treats
+    # a mid-run broker death.  Connection-level expiry accounting (closed
+    # connections, discarded buffered bytes) is proven in the unit suite
+    # (test_serve_expiry_*).
+    with pytest.raises(runner_module.CapabilityTransportError):
+        runner.run(
+            _https_worker_options(
+                f"{APPROVED_HOSTNAME}:443", {"post_sleep": 8.0}
+            ),
+            cwd="/workspace",
+            env={},
+        )
+    origin.close()
+    _assert_no_m4b_residue(runner)

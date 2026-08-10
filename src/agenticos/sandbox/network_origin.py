@@ -552,7 +552,17 @@ def open_origin_tls(
             tls,
         )
     peer = tls.getpeername()
-    peer_address, peer_port = str(peer[0]), int(peer[1])
+    if (
+        isinstance(peer, tuple)
+        and len(peer) >= 2
+        and isinstance(peer[1], int)
+    ):
+        peer_address, peer_port = str(peer[0]), int(peer[1])
+    else:
+        # A non-INET transport (the conformance fixture's already-connected
+        # socketpair) carries no numeric peer; evidence records "unknown"
+        # here and the validated declared address set instead.
+        peer_address, peer_port = "unknown", 0
     return OriginTLSOutcome(
         code=OriginTLSCode.ESTABLISHED,
         reason=(

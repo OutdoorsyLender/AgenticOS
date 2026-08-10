@@ -90,9 +90,17 @@ from .network_broker import (
     BROKER_HTTPS_POLICY_FD,
     BROKER_POLICY_FD,
     BROKER_STATUS_FD,
+    CONTROL_HTTPS_FIXTURE,
     CONTROL_REVOKE,
     EnvironmentEvidence,
+    HTTPS_CONNECTION_EVENT,
+    HTTPS_EVIDENCE_VERSION,
+    HTTPS_FIXTURE_VERSION,
+    HTTPS_TERMINAL_EVENT,
+    HttpsConnectionRecord,
+    HttpsTransportTerminal,
     INTERPRETER_PATH,
+    MAX_HTTPS_EVIDENCE_BYTES,
     MAX_READY_BYTES,
     MAX_TRANSPORT_OBSERVATION_BYTES,
     NetworkBrokerReadyRecord,
@@ -124,6 +132,7 @@ from .network_https import (
     NetworkPolicy,
     canonicalize_hostname,
     create_sealed_network_policy_fd,
+    network_policy_digest,
 )
 from .network_models import (
     TransportMode,
@@ -659,6 +668,29 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             os.close(pinned)
             raise
         return pinned
+
+    def _read_terminal_transport_observation(
+        self,
+        fd: int,
+        transport_policy: TransportPolicy,
+        *,
+        budget: float,
+    ) -> NetworkTransportObservation:
+        """Read the flavor's authenticated terminal transport evidence.
+
+        M4B-1 flavors read exactly one AOSTRANSPORT/1 observation; the HTTPS
+        flavor overrides this hook to read its parallel AOSHTTPEV/1 protocol.
+        """
+        return _read_authenticated_transport_observation(
+            fd,
+            expected_policy=transport_policy,
+            expected_policy_digest=policy_digest(transport_policy),
+            budget=budget,
+        )
+
+    def _deliver_broker_fixture(self, prepared: _PreparedLiveLaunch) -> None:
+        """Flavor hook after the supervisor spawn; M4B-1 flavors deliver nothing."""
+        return None
 
     def check_support(self, refresh: bool = False):
         support = super().check_support(refresh=refresh)
@@ -1341,6 +1373,8 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 except OSError:
                     pass
 
+            self._deliver_broker_fixture(prepared)
+
             broker_setup = read_broker_bwrap_setup_status(
                 prepared.broker_json_status_r, timeout=self.setup_timeout
             )
@@ -1625,10 +1659,9 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                         budget=remaining_terminal_budget(),
                     )
                     self.last_transport_observation = (
-                        _read_authenticated_transport_observation(
+                        self._read_terminal_transport_observation(
                             prepared.broker_control_w,
-                            expected_policy=transport_policy,
-                            expected_policy_digest=policy_digest(transport_policy),
+                            transport_policy,
                             budget=remaining_terminal_budget(),
                         )
                     )
@@ -1677,10 +1710,9 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                     first_out, first_err, trailing_out, trailing_err
                 )
                 self.last_transport_observation = (
-                    _read_authenticated_transport_observation(
+                    self._read_terminal_transport_observation(
                         prepared.broker_control_w,
-                        expected_policy=transport_policy,
-                        expected_policy_digest=policy_digest(transport_policy),
+                        transport_policy,
                         budget=self.setup_timeout,
                     )
                 )
@@ -1874,7 +1906,8 @@ def _build_normalized_transport_boundary_evidence(
         or type(worker_namespace) is not NamespaceEvidence
         or type(ready) is not NetworkBrokerReadyRecord
         or type(transport_policy) is not TransportPolicy
-        or type(transport_observation) is not NetworkTransportObservation
+        or type(transport_observation)
+        not in (NetworkTransportObservation, HttpsTransportTerminal)
         or type(launcher_outcome) is not dict
         or listener_evidence != ready.listener
     ):
@@ -2702,6 +2735,264 @@ def _require_exact_transport_observation_eof(
                 ) from restore_error
 
 
+class FixtureFdConnector:
+    """Conformance-only synthetic origin connector (non-production).
+
+    Holds ONE already-connected socket (typically a socketpair to a test TLS
+    server), the explicit trust roots the broker must use for origin TLS on
+    that socket, and the declared numeric address set the broker validates
+    against the frozen special-address policy.  It is selectable ONLY by the
+    private conformance runner API — never by policy or worker input — and
+    every evidence record produced under it is marked synthetic.
+    """
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        *,
+        ca_certs_pem: str,
+        addresses: Sequence[str],
+    ) -> None:
+        import ipaddress
+
+        if type(sock) is not socket.socket or sock.fileno() < 0:
+            raise CapabilityTransportError("fixture connector socket is invalid")
+        if (
+            type(ca_certs_pem) is not str
+            or not ca_certs_pem
+            or not ca_certs_pem.isascii()
+        ):
+            raise CapabilityTransportError("fixture trust roots must be ASCII PEM")
+        canonical: list[str] = []
+        for entry in addresses:
+            if type(entry) is not str:
+                raise CapabilityTransportError("fixture address is invalid")
+            try:
+                parsed = ipaddress.ip_address(entry)
+            except ValueError as exc:
+                raise CapabilityTransportError(
+                    "fixture address is invalid"
+                ) from exc
+            if str(parsed) != entry:
+                raise CapabilityTransportError(
+                    "fixture address must be in canonical form"
+                )
+            canonical.append(entry)
+        if not 1 <= len(canonical) <= 8:
+            raise CapabilityTransportError("fixture address set must be 1..8 entries")
+        self._sock = sock
+        self.ca_certs_pem = ca_certs_pem
+        self.addresses = tuple(canonical)
+
+    @property
+    def fd(self) -> int:
+        return self._sock.fileno()
+
+    def control_payload(self) -> bytes:
+        payload = {
+            "version": HTTPS_FIXTURE_VERSION,
+            "ca_certs_pem": self.ca_certs_pem,
+            "addresses": list(self.addresses),
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        return CONTROL_HTTPS_FIXTURE + encoded
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def _deliver_fixture_connector(fd: int, connector: FixtureFdConnector) -> None:
+    """Send the armed fixture (one SCM_RIGHTS fd + bounded JSON) to the broker."""
+    payload = connector.control_payload()
+    channel = socket.socket(fileno=os.dup(fd))
+    try:
+        rights = array.array("i", [connector.fd])
+        sent = channel.sendmsg(
+            [payload],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+            socket.MSG_NOSIGNAL,
+        )
+        if sent != len(payload):
+            raise CapabilityTransportError("fixture connector send was short")
+    except OSError as exc:
+        raise CapabilityTransportError("fixture connector send failed") from exc
+    finally:
+        channel.close()
+
+
+def _read_authenticated_https_transport_records(
+    fd: int,
+    *,
+    expected_policy: TransportPolicy,
+    expected_network_policy_digest: str,
+    expect_synthetic: bool,
+    budget: float,
+) -> tuple[HttpsTransportTerminal, tuple[HttpsConnectionRecord, ...], bool]:
+    """Read the HTTPS evidence protocol and authenticate its authority.
+
+    Wire protocol on the authenticated control channel: zero or more eagerly
+    emitted AOSHTTPEV/1 HTTPS_CONNECTION_TERMINATED packets, then — whenever
+    the broker's serve loop ends while the worker still lives — exactly one
+    aggregate HTTPS_TRANSPORT_TERMINATED packet and the write-side shutdown.
+    A clean worker exit reaps the broker with it (unchanged M4B-1 death
+    semantics), so the channel can instead end at EOF without a terminal
+    packet; the buffered per-connection records survive the broker's death.
+    In that case the runner synthesizes the aggregate itself (flagged by the
+    third return value): its launch-time liveness gates prove the broker
+    could only have died at or after worker exit, since a mid-run broker
+    death fails the output pump closed before this reader runs.
+    """
+    if type(fd) is not int or fd < 0 or type(expected_policy) is not TransportPolicy:
+        _reject("https transport evidence authority is invalid")
+    expected_policy_digest = policy_digest(expected_policy)
+    deadline = time.monotonic() + budget
+    channel = socket.socket(fileno=os.dup(fd))
+    ancillary_size = socket.CMSG_SPACE(array.array("i").itemsize * 8)
+    records: list[HttpsConnectionRecord] = []
+    terminal: HttpsTransportTerminal | None = None
+    reached_eof = False
+    try:
+        while time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            ready, _, _ = select.select(
+                [channel], [], [], min(0.1, remaining)
+            )
+            if not ready:
+                continue
+            payload, ancillary, flags, _address = channel.recvmsg(
+                MAX_HTTPS_EVIDENCE_BYTES + 1,
+                ancillary_size,
+                socket.MSG_CMSG_CLOEXEC,
+            )
+            _close_received_rights(ancillary)
+            if not payload:
+                reached_eof = True
+                break
+            if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+                _reject("https evidence record exceeded its bound")
+            allowed_flags = socket.MSG_CMSG_CLOEXEC | socket.MSG_EOR
+            if flags & ~allowed_flags or ancillary:
+                _reject("https evidence carried unauthorized metadata")
+            try:
+                sniffed = json.loads(payload)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise CapabilityTransportError(
+                    "https evidence record is not bounded JSON"
+                ) from exc
+            if type(sniffed) is not dict:
+                _reject("https evidence record is not an object")
+            kind = (sniffed.get("version"), sniffed.get("event"))
+            try:
+                if kind == (HTTPS_EVIDENCE_VERSION, HTTPS_CONNECTION_EVENT):
+                    record: HttpsConnectionRecord | HttpsTransportTerminal = (
+                        HttpsConnectionRecord.from_bytes(payload)
+                    )
+                elif kind == (HTTPS_EVIDENCE_VERSION, HTTPS_TERMINAL_EVENT):
+                    record = HttpsTransportTerminal.from_bytes(payload)
+                else:
+                    _reject("https evidence record type is unrecognized")
+            except CapabilityTransportError:
+                raise
+            except BaseException as exc:
+                raise CapabilityTransportError(
+                    "https evidence record is invalid"
+                ) from exc
+            if terminal is not None:
+                _reject("https evidence arrived after the terminal record")
+            if (
+                record.task_id != expected_policy.task_id
+                or record.task_generation != expected_policy.task_generation
+                or record.launch_nonce != expected_policy.launch_nonce
+                or record.policy_digest != expected_policy_digest
+                or record.network_policy_digest != expected_network_policy_digest
+            ):
+                _reject("https evidence does not match launch authority")
+            if record.observed_at_monotonic_ns < (
+                expected_policy.activated_at_monotonic_ns
+            ):
+                _reject("https evidence precedes policy activation")
+            if type(record) is HttpsConnectionRecord:
+                if record.synthetic_origin is not expect_synthetic:
+                    _reject(
+                        "https connection synthetic marking disagrees with the launch"
+                    )
+                records.append(record)
+                if len(records) > expected_policy.connection_limit:
+                    _reject("https evidence exceeds connection authority")
+                continue
+            terminal = record
+        if not reached_eof:
+            _reject("https evidence read timed out before channel EOF")
+        if {record.connection_index for record in records} != set(
+            range(1, len(records) + 1)
+        ):
+            _reject("https connection indexes are not the exact accepted set")
+        sums = {
+            "accounted_bytes": sum(r.accounted_bytes for r in records),
+            "worker_to_origin_bytes": sum(
+                r.worker_to_origin_bytes for r in records
+            ),
+            "origin_to_worker_bytes": sum(
+                r.origin_to_worker_bytes for r in records
+            ),
+            "total_bytes": sum(r.total_bytes for r in records),
+            "discarded_unsent_bytes": sum(
+                r.discarded_unsent_bytes for r in records
+            ),
+        }
+        broker_emitted = terminal is not None
+        if terminal is None:
+            # Platform reap at clean worker exit: synthesize the aggregate
+            # from the authenticated per-connection records only.
+            terminal = HttpsTransportTerminal(
+                version=HTTPS_EVIDENCE_VERSION,
+                event=HTTPS_TERMINAL_EVENT,
+                task_id=expected_policy.task_id,
+                task_generation=expected_policy.task_generation,
+                launch_nonce=expected_policy.launch_nonce,
+                policy_digest=expected_policy_digest,
+                network_policy_digest=expected_network_policy_digest,
+                observed_at_monotonic_ns=time.monotonic_ns(),
+                connection_count=len(records),
+                accounted_bytes=sums["accounted_bytes"],
+                worker_to_origin_bytes=sums["worker_to_origin_bytes"],
+                origin_to_worker_bytes=sums["origin_to_worker_bytes"],
+                total_bytes=sums["total_bytes"],
+                discarded_unsent_bytes=sums["discarded_unsent_bytes"],
+                terminal_reason=TransportTermination.REVOKED,
+                synthetic_origin=expect_synthetic,
+            )
+        if terminal.terminal_reason is TransportTermination.EXPIRED:
+            if terminal.observed_at_monotonic_ns < (
+                expected_policy.expires_at_monotonic_ns
+            ):
+                _reject("https expiry evidence is premature")
+        elif terminal.observed_at_monotonic_ns >= (
+            expected_policy.expires_at_monotonic_ns
+        ):
+            _reject("https terminal evidence is after policy expiry")
+        if terminal.connection_count != len(records):
+            _reject("https terminal connection count disagrees with the records")
+        for name, expected_total in sums.items():
+            if getattr(terminal, name) != expected_total:
+                _reject(f"https terminal {name} disagrees with the records")
+        if (
+            terminal.connection_count > expected_policy.connection_limit
+            or terminal.accounted_bytes > expected_policy.byte_limit
+        ):
+            _reject("https terminal evidence exceeds policy authority")
+        if terminal.synthetic_origin is not expect_synthetic:
+            _reject("https terminal synthetic marking disagrees with the launch")
+        return terminal, tuple(records), broker_emitted
+    finally:
+        channel.close()
+
+
 def _revoke_broker_control(fd: int, *, budget: float) -> None:
     deadline = time.monotonic() + budget
     channel = socket.socket(fileno=os.dup(fd))
@@ -3281,14 +3572,19 @@ def _coordinate_operations(
 class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
     """M4B-2 HTTPS flavor: sealed task TLS material through the broker boundary.
 
-    Slice 9a wires material + policy only: the controller qualifies the
-    host against its recorded manifest, runs the SHORT-LIVED certificate
-    helper to completion (it exits before any launch step and therefore
-    before any hostile exec), seals the AOSHTTPS/1 NetworkPolicy, and
-    launches the DENY transport with the material riding the authenticated
-    broker boundary.  The broker verifies and loads it, closes every
-    source descriptor, and reaches readiness only when the whole chain
-    authenticates.  HTTPS dispatch arrives in slice 9b.
+    The controller qualifies the host against its recorded manifest, runs the
+    SHORT-LIVED certificate helper to completion (it exits before any launch
+    step and therefore before any hostile exec), seals the AOSHTTPS/1
+    NetworkPolicy, and launches the DENY transport with the material riding
+    the authenticated broker boundary.  The broker verifies and loads it,
+    closes every source descriptor, and then serves the slice-9b gated HTTPS
+    pipeline (CONNECT authority -> grant authorization -> ClientHello gate ->
+    worker TLS termination -> strict HTTP/1.1 prevalidation -> validated
+    resolution -> numeric connect -> authenticated origin TLS -> bounded
+    relay), emitting parallel AOSHTTPEV/1 evidence on the control channel.
+    The private ``_fixture_connector`` selects the conformance-only synthetic
+    origin (never selectable by policy or worker input; always recorded as
+    non-production synthetic evidence).
     """
 
     name = "bubblewrap-landlock-capability-transport-https"
@@ -3304,6 +3600,7 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
         host_state_dir,
         helper_timeout: float = 15.0,
         grant_wall_lifetime_ns: int = 12 * 3600 * 1_000_000_000,
+        _fixture_connector: FixtureFdConnector | None = None,
         **kwargs,
     ) -> None:
         super().__init__(worker_path, **kwargs)
@@ -3314,6 +3611,13 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
             )
         if type(grant_purpose) is not GrantPurpose:
             raise CapabilityTransportError("grant_purpose must be a GrantPurpose")
+        if _fixture_connector is not None and type(_fixture_connector) is not (
+            FixtureFdConnector
+        ):
+            raise CapabilityTransportError(
+                "the synthetic origin connector is conformance-runner private API"
+            )
+        self._fixture_connector = _fixture_connector
         self._approved_hostname = canonicalize_hostname(approved_hostname)
         self._grant_purpose = grant_purpose
         self._approval_source = approval_source
@@ -3334,6 +3638,94 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
         self.last_https_helper_pid: int | None = None
         self.last_https_network_policy: NetworkPolicy | None = None
         self.last_https_ca_cert_size: int | None = None
+        self.last_https_terminal: HttpsTransportTerminal | None = None
+        self.last_https_connection_records: (
+            tuple[HttpsConnectionRecord, ...] | None
+        ) = None
+        self.last_https_terminal_source: str | None = None
+        self.last_https_fixture_used = False
+
+    def _deliver_broker_fixture(self, prepared: _PreparedLiveLaunch) -> None:
+        """Arm the conformance synthetic origin on the authenticated channel."""
+        connector = self._fixture_connector
+        if connector is None:
+            return None
+        _deliver_fixture_connector(prepared.broker_control_w, connector)
+        self.last_https_fixture_used = True
+        self._emit(
+            "HTTPS_SYNTHETIC_ORIGIN_ARMED",
+            synthetic_origin=True,
+            non_production=True,
+            declared_addresses=list(connector.addresses),
+        )
+        return None
+
+    def _read_terminal_transport_observation(
+        self,
+        fd: int,
+        transport_policy: TransportPolicy,
+        *,
+        budget: float,
+    ) -> HttpsTransportTerminal:
+        """Read the parallel AOSHTTPEV/1 records and authenticate them."""
+        network_policy = self.last_https_network_policy
+        if type(network_policy) is not NetworkPolicy:
+            raise CapabilityTransportError(
+                "https terminal evidence requires the assembled network policy"
+            )
+        terminal, records, broker_emitted = (
+            _read_authenticated_https_transport_records(
+                fd,
+                expected_policy=transport_policy,
+                expected_network_policy_digest=network_policy_digest(
+                    network_policy
+                ),
+                expect_synthetic=self._fixture_connector is not None,
+                budget=budget,
+            )
+        )
+        self.last_https_terminal = terminal
+        self.last_https_connection_records = records
+        self.last_https_terminal_source = (
+            "broker" if broker_emitted else "synthesized_at_worker_exit"
+        )
+        self._emit(
+            "HTTPS_TRANSPORT_EVIDENCE",
+            synthetic_origin=terminal.synthetic_origin,
+            non_production=terminal.synthetic_origin,
+            terminal_source=self.last_https_terminal_source,
+            terminal_reason=terminal.terminal_reason.value,
+            connection_count=terminal.connection_count,
+            accounted_bytes=terminal.accounted_bytes,
+            discarded_unsent_bytes=terminal.discarded_unsent_bytes,
+            connection_records=[
+                {
+                    "connection_index": record.connection_index,
+                    "stage_reached": record.stage_reached.value,
+                    "terminal_reason": record.terminal_reason.value,
+                    "detail": record.detail,
+                    "identity_chain": record.identity_chain,
+                    "worker_tls_version": record.worker_tls_version,
+                    "worker_alpn": record.worker_alpn,
+                    "origin_tls_version": record.origin_tls_version,
+                    "origin_alpn": record.origin_alpn,
+                    "origin_peer": (
+                        None
+                        if record.origin_peer_address is None
+                        else f"{record.origin_peer_address}:"
+                        f"{record.origin_peer_port}"
+                    ),
+                    "synthetic_origin": record.synthetic_origin,
+                    "requests_completed": record.requests_completed,
+                    "accounted_bytes": record.accounted_bytes,
+                    "worker_to_origin_bytes": record.worker_to_origin_bytes,
+                    "origin_to_worker_bytes": record.origin_to_worker_bytes,
+                    "discarded_unsent_bytes": record.discarded_unsent_bytes,
+                }
+                for record in records
+            ],
+        )
+        return terminal
 
     def _assemble_https_material(self) -> _PreparedHttpsMaterial:
         """Host-gate, run the helper to EXIT, and seal the NetworkPolicy."""
@@ -3408,6 +3800,12 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
         _prepared_material: _PreparedHttpsMaterial | None = None,
     ) -> ProcessResult:
         """Assemble material (helper exits here), then launch via the M4B-1 chain."""
+        if _prepared_material is not None:
+            self.last_https_network_policy = _prepared_material.network_policy
+        self.last_https_terminal = None
+        self.last_https_connection_records = None
+        self.last_https_terminal_source = None
+        self.last_https_fixture_used = False
         material = (
             self._assemble_https_material()
             if _prepared_material is None
@@ -3437,6 +3835,7 @@ __all__ = [
     "BrokerVendorError",
     "CapabilityTransportError",
     "CapabilityTransportRunner",
+    "FixtureFdConnector",
     "HOST_MANIFEST_FILENAME",
     "HOST_MANIFEST_RECORD_VERSION",
     "HttpsCapabilityTransportRunner",

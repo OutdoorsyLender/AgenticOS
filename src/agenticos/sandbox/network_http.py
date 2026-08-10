@@ -285,6 +285,7 @@ class StrictHttpParser:
         self._head_pending = bytearray()   # head wire bytes, fed to h11 on accept
         self._wire_out = bytearray()       # validated body wire bytes for h11
         self._checks: list = []            # pending structural cross-checks
+        self._completed_wire: list = []    # exact wire bytes per completed request
 
     @property
     def rejection(self) -> Rejection | None:
@@ -293,6 +294,18 @@ class StrictHttpParser:
     @property
     def policy(self) -> HttpPolicy:
         return self._policy
+
+    def pop_completed_wire(self) -> tuple:
+        """Exact validated wire bytes of completed requests, in order.
+
+        Slice 9b forwarding boundary: the broker forwards exactly these
+        bytes to the origin — the prevalidated request, byte for byte.
+        Reading clears the completed set; a rejected or partial request
+        leaves no completed wire behind.
+        """
+        completed = tuple(self._completed_wire)
+        self._completed_wire.clear()
+        return completed
 
     def _reset_request_state(self) -> None:
         self._method = ""
@@ -306,6 +319,7 @@ class StrictHttpParser:
         self._body_seen = 0
         self._body_remaining = 0
         self._chunk_remaining = 0
+        self._request_wire = bytearray()   # exact wire bytes, current request
 
     # -- public boundary ----------------------------------------------------
 
@@ -432,6 +446,7 @@ class StrictHttpParser:
                     )
                 del self._buf[:2]
                 self._wire_out += b"\r\n"
+                self._request_wire += b"\r\n"
                 self._state = _ST_CHUNK_SIZE
             elif self._state == _ST_FINAL_CRLF:
                 line = self._next_line(
@@ -444,6 +459,7 @@ class StrictHttpParser:
                         RejectionCode.TRAILER_REJECTED, "trailers are forbidden by policy"
                     )
                 self._wire_out += b"\r\n"
+                self._request_wire += b"\r\n"
                 self._complete_request()
             else:  # unreachable; fail closed
                 raise _Reject(RejectionCode.H11_DISAGREEMENT, f"bad state {self._state}")
@@ -592,6 +608,7 @@ class StrictHttpParser:
         )
         self._events.append(head)
         self._wire_out += self._head_pending
+        self._request_wire += self._head_pending
         self._head_pending = bytearray()
         self._checks.append(("head", head))
         if self._chunked:
@@ -646,6 +663,7 @@ class StrictHttpParser:
                 RejectionCode.BODY_TOO_LARGE, "chunked body exceeds the policy body bound"
             )
         self._wire_out += line + b"\r\n"
+        self._request_wire += line + b"\r\n"
         if size == 0:
             self._state = _ST_FINAL_CRLF
         else:
@@ -655,11 +673,13 @@ class StrictHttpParser:
     def _emit_body(self, data: bytes) -> None:
         self._body_seen += len(data)
         self._wire_out += data
+        self._request_wire += data
         self._events.append(BodyData(self._request_index, data))
 
     def _complete_request(self) -> None:
         self._events.append(RequestComplete(self._request_index, self._body_seen))
         self._checks.append(("complete", self._request_index, self._body_seen))
+        self._completed_wire.append(bytes(self._request_wire))
         self._request_index += 1
         self._reset_request_state()
         self._state = _ST_REQUEST_LINE

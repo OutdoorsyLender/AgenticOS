@@ -836,3 +836,1378 @@ def test_https_runner_requires_deny_policy(tmp_path):
             approval_reference="ref-1",
             host_state_dir=tmp_path,
         )
+
+
+# ============================================================================
+# Slice 9b: HTTPS serve path state machine (in-process doubles)
+# ============================================================================
+#
+# The broker's per-connection pipeline is exercised synchronously over
+# socketpairs with real TLS on both legs: the worker leg uses a real
+# OpenSSL client trusting only the task CA, the origin leg uses the
+# conformance fixture (an already-connected socketpair to a scripted test
+# TLS server) exactly as the FixtureFdConnector arms it over the control
+# channel.  Patterns mirror test_m4b_unit.py (_run_relay_thread) and
+# test_m4b_tls_unit.py (real/synthetic TLS clients).
+
+import array
+import datetime
+import ssl
+import threading
+import types
+
+from agenticos.sandbox import cert_helper as cert_helper_module
+from agenticos.sandbox import network_tls as tls_module
+from agenticos.sandbox import network_clienthello as clienthello_module
+
+import chgen
+from test_m4b_origin_unit import _custom_material, _server_context
+
+
+SERVE_HOSTNAME = "cdn.example.com"
+OTHER_HOSTNAME = "other.example.com"
+SERVE_TASK = {
+    "task_id": "task-https-serve",
+    "task_generation": 9,
+    "launch_nonce": "cd" * 16,
+    "hostname": SERVE_HOSTNAME,
+    "policy_digest": "ab" * 32,
+}
+
+
+@pytest.fixture(scope="module")
+def serve_leaf_material():
+    material = cert_helper_module.generate_task_material(**SERVE_TASK)
+    try:
+        yield {
+            "context": cert_helper_module.load_leaf_ssl_context(
+                ca_cert_fd=material.ca_cert_fd,
+                leaf_cert_fd=material.leaf_cert_fd,
+                leaf_key_fd=material.leaf_key_fd,
+                binding_fd=material.binding_fd,
+                **SERVE_TASK,
+            ),
+            "ca_pem": os.pread(
+                material.ca_cert_fd, os.fstat(material.ca_cert_fd).st_size, 0
+            ).decode("ascii"),
+        }
+    finally:
+        material.close()
+
+
+def _serve_policy(*, connection_limit=4, byte_limit=1 << 20, lifetime_ns=None):
+    now = time.monotonic_ns()
+    return TransportPolicy(
+        version="AOSNET/1",
+        task_id=SERVE_TASK["task_id"],
+        task_generation=SERVE_TASK["task_generation"],
+        launch_nonce=SERVE_TASK["launch_nonce"],
+        mode=TransportMode.DENY,
+        proxy_host="127.0.0.1",
+        proxy_port=18080,
+        activated_at_monotonic_ns=now - 1_000_000_000,
+        expires_at_monotonic_ns=(
+            now + (30_000_000_000 if lifetime_ns is None else lifetime_ns)
+        ),
+        connection_limit=connection_limit,
+        byte_limit=byte_limit,
+    )
+
+
+def _serve_network_policy(
+    policy, *, purpose=GrantPurpose.GENERAL_DOWNLOAD, hostname=SERVE_HOSTNAME
+):
+    now_wall = time.time_ns()
+    grant = NetworkGrant(
+        grant_id="g-serve-1",
+        hostname=hostname,
+        purpose=purpose,
+        approval_source="unit-test",
+        approval_reference="serve-1",
+        granted_at_wall_ns=now_wall,
+        expires_at_wall_ns=now_wall + 3_600_000_000_000,
+        activated_at_monotonic_ns=policy.activated_at_monotonic_ns,
+        expires_at_monotonic_ns=policy.expires_at_monotonic_ns,
+        connection_limit=policy.connection_limit,
+        byte_limit=policy.byte_limit,
+    )
+    return NetworkPolicy(
+        version="AOSHTTPS/1",
+        task_id=policy.task_id,
+        task_generation=policy.task_generation,
+        launch_nonce=policy.launch_nonce,
+        task_ca_certificate_digest="ab" * 32,
+        grants=(grant,),
+    )
+
+
+def _serve_https_state(network_policy, server_context):
+    return broker._HttpsMaterialState(
+        network_policy=network_policy,
+        network_policy_digest=network_policy_digest(network_policy),
+        binding=None,
+        server_context=server_context,
+    )
+
+
+def _origin_pems(hostname=SERVE_HOSTNAME):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return _custom_material(
+        now - datetime.timedelta(minutes=2),
+        now + datetime.timedelta(hours=1),
+        hostname=hostname,
+    )
+
+
+def _origin_read_request(tls):
+    """Read one request head plus any Content-Length body from the origin leg."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = tls.recv(4096)
+        if not chunk:
+            return data
+        data += chunk
+        if len(data) > 65536:
+            raise RuntimeError("origin request head exceeded test bound")
+    head, _, rest = data.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+    while len(rest) < length:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    return head + b"\r\n\r\n" + rest
+
+
+class _ScriptedOrigin:
+    """A scripted test TLS server on one end of the fixture socketpair."""
+
+    def __init__(self, tmp_path, pems, responder, *, request_count=1):
+        self._broker_end, server_end = socket.socketpair()
+        self.fd = self._broker_end.fileno()
+        self.requests = []
+        self.errors = []
+        self._context = _server_context(tmp_path, pems)
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(server_end, responder, request_count),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self, sock, responder, request_count):
+        try:
+            tls = self._context.wrap_socket(sock, server_side=True)
+            tls.settimeout(20.0)
+            for index in range(request_count):
+                request = _origin_read_request(tls)
+                self.requests.append(request)
+                if not responder(tls, request, index):
+                    break
+            tls.close()
+        except (ssl.SSLError, OSError) as exc:
+            self.errors.append(f"{type(exc).__name__}: {exc}")
+        except RuntimeError as exc:
+            self.errors.append(str(exc))
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def join(self, timeout=8.0):
+        self._thread.join(timeout)
+        assert not self._thread.is_alive(), "scripted origin thread stuck"
+
+    def close(self):
+        try:
+            self._broker_end.close()
+        except OSError:
+            pass
+
+
+def _ok_responder(body=b"hello", *, status=b"200 OK", keepalive=True):
+    def respond(tls, _request, _index):
+        connection = b"" if keepalive else b"Connection: close\r\n"
+        tls.sendall(
+            b"HTTP/1.1 " + status + b"\r\nContent-Length: "
+            + str(len(body)).encode("ascii") + b"\r\n" + connection
+            + b"\r\n" + body
+        )
+        return True
+
+    return respond
+
+
+def _slow_responder(delay=10.0):
+    def respond(tls, _request, _index):
+        time.sleep(delay)
+        return True
+
+    return respond
+
+
+class _ServeRun:
+    def __init__(self, serve, control_peer, origin, thread):
+        self.serve = serve
+        self.control_peer = control_peer
+        self.origin = origin
+        self.thread = thread
+
+    def read_record(self):
+        self.control_peer.settimeout(5.0)
+        payload = self.control_peer.recv(broker.MAX_HTTPS_EVIDENCE_BYTES + 1)
+        return broker.HttpsConnectionRecord.from_bytes(payload)
+
+
+def _start_serve_connection(
+    tmp_path,
+    serve_leaf_material,
+    *,
+    purpose=GrantPurpose.GENERAL_DOWNLOAD,
+    connection_limit=4,
+    byte_limit=1 << 20,
+    lifetime_ns=None,
+    origin=True,
+    origin_pems=None,
+    origin_responder=None,
+    origin_request_count=1,
+    fixture_addresses=("93.184.216.34",),
+):
+    """Wire one in-process connection through _serve_https_connection."""
+    policy = _serve_policy(
+        connection_limit=connection_limit,
+        byte_limit=byte_limit,
+        lifetime_ns=lifetime_ns,
+    )
+    network_policy = _serve_network_policy(policy, purpose=purpose)
+    https_state = _serve_https_state(
+        network_policy, serve_leaf_material["context"]
+    )
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    serve = broker._HttpsServeState(policy, https_state, control_broker.fileno())
+    origin_server = None
+    if origin:
+        pems = origin_pems or _origin_pems()
+        origin_server = _ScriptedOrigin(
+            tmp_path,
+            pems,
+            origin_responder or _ok_responder(),
+            request_count=origin_request_count,
+        )
+        serve.fixture = broker._HttpsFixtureState(
+            origin_server.fd,
+            pems["ca"].decode("ascii"),
+            tuple(fixture_addresses),
+        )
+    worker_broker, worker_client = socket.socketpair()
+    runtime = broker._HttpsConnectionRuntime(worker_broker)
+    serve.runtimes.append(runtime)
+    thread = threading.Thread(
+        target=broker._serve_https_connection,
+        args=(serve, runtime, 1),
+        daemon=True,
+    )
+    run = _ServeRun(serve, control_peer, origin_server, thread)
+    run.control_broker = control_broker
+    run.worker_client = worker_client
+    run.policy = policy
+    run.network_policy = network_policy
+    thread.start()
+    return run
+
+
+def _close_tls(tls):
+    try:
+        tls.settimeout(1.0)
+    except OSError:
+        pass
+    try:
+        tls.unwrap()
+    except (ssl.SSLError, OSError):
+        pass
+    try:
+        tls.close()
+    except OSError:
+        pass
+
+
+def _finish_serve_run(run, *, origin_join=True):
+    run.thread.join(15.0)
+    assert not run.thread.is_alive(), "serve connection thread stuck"
+    assert not run.serve.thread_errors, (
+        f"serve thread emitted errors: {run.serve.thread_errors}"
+    )
+    if run.origin is not None:
+        # Unblock a never-used scripted origin (its handshake wait ends).
+        run.origin.close()
+        if origin_join:
+            run.origin.join()
+    record = run.read_record()
+    run.control_peer.close()
+    run.control_broker.close()
+    try:
+        run.worker_client.close()
+    except OSError:
+        pass
+    return record
+
+
+def _worker_connect(sock, authority=SERVE_HOSTNAME, *, raw_head=None, timeout=5.0):
+    head = raw_head
+    if head is None:
+        head = f"CONNECT {authority} HTTP/1.1\r\n\r\n".encode("ascii")
+    sock.settimeout(timeout)
+    sock.sendall(head)
+    reply = b""
+    while b"\r\n\r\n" not in reply:
+        try:
+            chunk = sock.recv(4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        reply += chunk
+    return reply
+
+
+def _worker_tls(sock, ca_pem, *, sni=SERVE_HOSTNAME, alpn=("http/1.1",), timeout=10.0):
+    client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_context.load_verify_locations(cadata=ca_pem)
+    client_context.verify_mode = ssl.CERT_REQUIRED
+    client_context.check_hostname = True
+    client_context.set_alpn_protocols(list(alpn))
+    tls = client_context.wrap_socket(sock, server_hostname=sni)
+    tls.settimeout(timeout)
+    return tls
+
+
+def _read_worker_response(tls, timeout=8.0):
+    """Read one Content-Length-delimited response; None on EOF/error."""
+    tls.settimeout(timeout)
+    head = b""
+    try:
+        while b"\r\n\r\n" not in head:
+            chunk = tls.recv(4096)
+            if not chunk:
+                return None
+            head += chunk
+    except (ssl.SSLError, OSError):
+        return None
+    raw, _, body = head.partition(b"\r\n\r\n")
+    length = 0
+    for line in raw.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+    try:
+        while len(body) < length:
+            chunk = tls.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+    except (ssl.SSLError, OSError):
+        return None
+    return raw + b"\r\n\r\n" + body
+
+
+# -- evidence record codecs ----------------------------------------------------
+
+
+def _connection_record_kwargs(**changes):
+    values = {
+        "version": broker.HTTPS_EVIDENCE_VERSION,
+        "event": broker.HTTPS_CONNECTION_EVENT,
+        "task_id": "task-https-serve",
+        "task_generation": 9,
+        "launch_nonce": "cd" * 16,
+        "policy_digest": "ab" * 32,
+        "network_policy_digest": "cd" * 32,
+        "address_policy_version": "AOSADDR/1+test",
+        "connection_index": 1,
+        "stage_reached": broker.HttpsConnectionStage.RESPONSE_RELAY,
+        "terminal_reason": broker.HttpsConnectionTermination.COMPLETED,
+        "detail": "worker_closed",
+        "approved_hostname": SERVE_HOSTNAME,
+        "connect_authority": SERVE_HOSTNAME,
+        "worker_sni": SERVE_HOSTNAME,
+        "http_host": SERVE_HOSTNAME,
+        "origin_tls_name": SERVE_HOSTNAME,
+        "identity_chain": "verified",
+        "worker_tls_version": "TLSv1.3",
+        "worker_alpn": "http/1.1",
+        "origin_tls_version": "TLSv1.3",
+        "origin_alpn": "http/1.1",
+        "origin_peer_address": "93.184.216.34",
+        "origin_peer_port": 443,
+        "synthetic_origin": True,
+        "requests_completed": 1,
+        "accounted_bytes": 84,
+        "worker_to_origin_bytes": 41,
+        "origin_to_worker_bytes": 43,
+        "total_bytes": 84,
+        "discarded_unsent_bytes": 0,
+        "observed_at_monotonic_ns": time.monotonic_ns(),
+    }
+    values.update(changes)
+    return values
+
+
+def test_https_connection_record_round_trip_and_canonicality():
+    record = broker.HttpsConnectionRecord(**_connection_record_kwargs())
+    payload = record.to_bytes()
+    assert broker.HttpsConnectionRecord.from_bytes(payload) == record
+    with pytest.raises(broker.BrokerBoundaryError):
+        broker.HttpsConnectionRecord.from_bytes(payload + b" ")
+    with pytest.raises(broker.BrokerBoundaryError):
+        broker.HttpsConnectionRecord.from_bytes(payload[:-1])
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"total_bytes": 85},  # total != w2o + o2w
+        {"accounted_bytes": 83},  # accounted != total + discarded
+        {"connection_index": 0},
+        {"worker_sni": "evil\x01host"},
+        {"synthetic_origin": "yes"},
+        {"origin_peer_port": 65536},
+    ],
+)
+def test_https_connection_record_rejects_invalid_invariants(changes):
+    with pytest.raises(broker.BrokerBoundaryError):
+        broker.HttpsConnectionRecord(**_connection_record_kwargs(**changes))
+
+
+def test_https_terminal_record_round_trip_and_aliases():
+    terminal = broker.HttpsTransportTerminal(
+        version=broker.HTTPS_EVIDENCE_VERSION,
+        event=broker.HTTPS_TERMINAL_EVENT,
+        task_id="task-https-serve",
+        task_generation=9,
+        launch_nonce="cd" * 16,
+        policy_digest="ab" * 32,
+        network_policy_digest="cd" * 32,
+        observed_at_monotonic_ns=time.monotonic_ns(),
+        connection_count=2,
+        accounted_bytes=100,
+        worker_to_origin_bytes=60,
+        origin_to_worker_bytes=40,
+        total_bytes=100,
+        discarded_unsent_bytes=0,
+        terminal_reason=broker.TransportTermination.REVOKED,
+        synthetic_origin=True,
+    )
+    payload = terminal.to_bytes()
+    assert broker.HttpsTransportTerminal.from_bytes(payload) == terminal
+    assert terminal.worker_to_fixture_bytes == 60
+    assert terminal.fixture_to_worker_bytes == 40
+    with pytest.raises(broker.BrokerBoundaryError):
+        broker.HttpsConnectionRecord.from_bytes(payload)
+
+
+@pytest.mark.parametrize("reason", [
+    broker.TransportTermination.DENY_NO_RELAY,
+    broker.TransportTermination.COMPLETED,
+])
+def test_https_terminal_rejects_non_https_outcomes(reason):
+    with pytest.raises(broker.BrokerBoundaryError):
+        broker.HttpsTransportTerminal(
+            version=broker.HTTPS_EVIDENCE_VERSION,
+            event=broker.HTTPS_TERMINAL_EVENT,
+            task_id="task-https-serve",
+            task_generation=9,
+            launch_nonce="cd" * 16,
+            policy_digest="ab" * 32,
+            network_policy_digest="cd" * 32,
+            observed_at_monotonic_ns=time.monotonic_ns(),
+            connection_count=0,
+            accounted_bytes=0,
+            worker_to_origin_bytes=0,
+            origin_to_worker_bytes=0,
+            total_bytes=0,
+            discarded_unsent_bytes=0,
+            terminal_reason=reason,
+            synthetic_origin=False,
+        )
+
+
+# -- CONNECT stage --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "head,code",
+    [
+        (b"CONNECT cdn.example.com:444 HTTP/1.1\r\n\r\n",
+         "connect_authority_port_not_443"),
+        (b"CONNECT cdn.example.com:0443 HTTP/1.1\r\n\r\n",
+         "connect_authority_port_not_443"),
+        (b"CONNECT https://cdn.example.com:443 HTTP/1.1\r\n\r\n",
+         "connect_authority_ambiguous_colons"),
+        (b"CONNECT user@cdn.example.com:443 HTTP/1.1\r\n\r\n",
+         "connect_authority_userinfo"),
+        (b"GET cdn.example.com:443 HTTP/1.1\r\n\r\n",
+         "connect_method_not_connect"),
+        (b"CONNECT cdn.example.com:443 HTTP/1.0\r\n\r\n",
+         "connect_version_rejected"),
+        (b"CONNECT  cdn.example.com:443 HTTP/1.1\r\n\r\n",
+         "connect_request_line_malformed"),
+        (b"CONNECT cdn.example.com:443 HTTP/1.1\r\nGET / HTTP/1.1\r\n\r\n",
+         "connect_header_malformed"),
+        (b"CONNECT cdn.example.com:443 HTTP/1.1\r\n Folded: x\r\n\r\n",
+         "connect_obs_fold_rejected"),
+        (b"CONNECT cdn.example.com:443 HTTP/1.1\r\nBad Header: x\r\n\r\n",
+         "connect_header_name_invalid"),
+    ],
+)
+def test_serve_connect_parse_strictness(tmp_path, serve_leaf_material, head, code):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    reply = _worker_connect(run.worker_client, raw_head=head)
+    assert b"200" not in reply
+    record = _finish_serve_run(run)
+    assert record.stage_reached is broker.HttpsConnectionStage.CONNECT
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+    assert record.detail == code
+    assert record.accounted_bytes == 0
+    assert run.serve.guard.in_flight == 0
+
+
+def test_serve_authorization_denied_before_200(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    reply = _worker_connect(run.worker_client, authority=OTHER_HOSTNAME)
+    assert reply.startswith(b"HTTP/1.1 403")
+    record = _finish_serve_run(run)
+    assert record.stage_reached is broker.HttpsConnectionStage.AUTHORIZATION
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+    assert record.detail == "authorization_no_match"
+    assert record.connect_authority == OTHER_HOSTNAME
+    assert record.identity_chain == "identity_divergence:connect_authority"
+    assert run.serve.guard.in_flight == 0
+
+
+def test_serve_no_gate_before_connect_authorized(
+    tmp_path, serve_leaf_material, monkeypatch
+):
+    gate_calls = []
+    configure_calls = []
+    real_gate = clienthello_module.run_gate_on_socket
+    monkeypatch.setattr(
+        clienthello_module,
+        "run_gate_on_socket",
+        lambda *a, **k: gate_calls.append(1) or real_gate(*a, **k),
+    )
+    monkeypatch.setattr(
+        tls_module,
+        "configure_worker_server_context",
+        lambda *a, **k: configure_calls.append(1),
+    )
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    # A TLS record header on the wire where a CONNECT request line belongs.
+    reply = _worker_connect(
+        run.worker_client, raw_head=b"\x16\x03\x01\x02\x00\r\n\r\n"
+    )
+    assert b"200" not in reply
+    record = _finish_serve_run(run)
+    assert record.stage_reached is broker.HttpsConnectionStage.CONNECT
+    assert record.detail == "connect_request_line_malformed"
+    assert gate_calls == []
+    assert configure_calls == []
+    assert run.serve.guard.in_flight == 0
+
+
+# -- gate and worker-TLS stages ---------------------------------------------------
+
+
+def test_serve_ech_denied_after_valid_connect_zero_sni_firings(
+    tmp_path, serve_leaf_material, monkeypatch
+):
+    configure_calls = []
+    real_configure = tls_module.configure_worker_server_context
+    monkeypatch.setattr(
+        tls_module,
+        "configure_worker_server_context",
+        lambda *a, **k: configure_calls.append(1) or real_configure(*a, **k),
+    )
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    reply = _worker_connect(run.worker_client)
+    assert reply.startswith(b"HTTP/1.1 200")
+    hello = chgen.make_client_hello(SERVE_HOSTNAME.encode("ascii"), ech=True)
+    run.worker_client.sendall(hello)
+    # The denial closes the connection without any TLS trust established.
+    run.worker_client.settimeout(5.0)
+    drained = b""
+    try:
+        while True:
+            chunk = run.worker_client.recv(65536)
+            if not chunk:
+                break
+            drained += chunk
+    except OSError:
+        pass
+    record = _finish_serve_run(run)
+    assert record.stage_reached is broker.HttpsConnectionStage.GATE
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+    assert "0xfe0d" in record.detail
+    assert configure_calls == [], "worker TLS configuration ran before gate accept"
+    assert record.worker_tls_version is None
+    assert record.worker_sni is None
+
+
+def test_serve_wrong_sni_denied(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    reply = _worker_connect(run.worker_client)
+    assert reply.startswith(b"HTTP/1.1 200")
+    with pytest.raises((ssl.SSLError, OSError)):
+        _worker_tls(run.worker_client, serve_leaf_material["ca_pem"],
+                    sni=OTHER_HOSTNAME)
+    record = _finish_serve_run(run)
+    assert record.stage_reached is broker.HttpsConnectionStage.WORKER_TLS
+    assert record.detail == "worker_tls_sni_mismatch"
+    assert record.worker_sni == OTHER_HOSTNAME
+    assert record.identity_chain == "identity_divergence:worker_sni"
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+
+
+def _hrr_ch1(hostname):
+    return chgen.make_client_hello(
+        hostname, supported_groups=[0x001D, 0x0018], key_share_group=0x0018
+    )
+
+
+def test_serve_second_client_hello_aborts(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    reply = _worker_connect(run.worker_client)
+    assert reply.startswith(b"HTTP/1.1 200")
+    sock = run.worker_client
+    sock.settimeout(5.0)
+    sock.sendall(_hrr_ch1(SERVE_HOSTNAME.encode("ascii")))
+    # Drain the HelloRetryRequest flight.
+    try:
+        sock.recv(65536)
+    except OSError:
+        pass
+    sock.sendall(chgen.make_client_hello(SERVE_HOSTNAME.encode("ascii")))
+    drained = b""
+    try:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            drained += chunk
+    except OSError:
+        pass
+    record = _finish_serve_run(run)
+    assert record.stage_reached is broker.HttpsConnectionStage.WORKER_TLS
+    assert record.detail == "worker_tls_second_client_hello"
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+
+
+def test_serve_alpn_h2_only_denied(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    reply = _worker_connect(run.worker_client)
+    assert reply.startswith(b"HTTP/1.1 200")
+    # h2-only client: the handshake completes with no usable ALPN.
+    client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_context.load_verify_locations(cadata=serve_leaf_material["ca_pem"])
+    client_context.verify_mode = ssl.CERT_REQUIRED
+    client_context.check_hostname = True
+    client_context.set_alpn_protocols(["h2"])
+    try:
+        client_context.wrap_socket(run.worker_client, server_hostname=SERVE_HOSTNAME)
+    except (ssl.SSLError, OSError):
+        pass
+    record = _finish_serve_run(run)
+    assert record.stage_reached is broker.HttpsConnectionStage.WORKER_TLS
+    assert record.detail == "worker_tls_alpn_rejected"
+    assert record.worker_tls_version is not None
+
+
+# -- HTTP prevalidation and identity chain -----------------------------------------
+
+
+def _established_tls_worker(run, serve_leaf_material):
+    reply = _worker_connect(run.worker_client)
+    assert reply.startswith(b"HTTP/1.1 200")
+    return _worker_tls(run.worker_client, serve_leaf_material["ca_pem"])
+
+
+def test_serve_full_path_origin_and_evidence(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    tls = _established_tls_worker(run, serve_leaf_material)
+    request = f"GET /resource HTTP/1.1\r\nHost: {SERVE_HOSTNAME}\r\n\r\n".encode("ascii")
+    tls.sendall(request)
+    response = _read_worker_response(tls)
+    assert response is not None
+    assert response.startswith(b"HTTP/1.1 200 OK")
+    assert response.endswith(b"hello")
+    _close_tls(tls)
+    record = _finish_serve_run(run)
+    assert run.origin.requests == [request]
+    assert record.terminal_reason is broker.HttpsConnectionTermination.COMPLETED
+    assert record.stage_reached is broker.HttpsConnectionStage.HTTP
+    assert record.identity_chain == "verified"
+    assert record.connect_authority == SERVE_HOSTNAME
+    assert record.worker_sni == SERVE_HOSTNAME
+    assert record.http_host == SERVE_HOSTNAME
+    assert record.origin_tls_name == SERVE_HOSTNAME
+    assert record.worker_tls_version == "TLSv1.3"
+    assert record.origin_tls_version == "TLSv1.3"
+    assert record.worker_alpn == "http/1.1"
+    assert record.origin_alpn == "http/1.1"
+    assert record.origin_peer_address == "93.184.216.34"
+    assert record.origin_peer_port == 443
+    assert record.synthetic_origin is True
+    assert record.requests_completed == 1
+    assert record.worker_to_origin_bytes == len(request)
+    assert record.origin_to_worker_bytes == len(response)
+    assert record.total_bytes == len(request) + len(response)
+    assert record.accounted_bytes == record.total_bytes + (
+        record.discarded_unsent_bytes
+    )
+
+
+def test_serve_host_mismatch_denied_before_origin(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    tls = _established_tls_worker(run, serve_leaf_material)
+    tls.sendall(
+        f"GET / HTTP/1.1\r\nHost: {OTHER_HOSTNAME}\r\n\r\n".encode("ascii")
+    )
+    # The denial tears the tunnel down without a response.
+    assert _read_worker_response(tls) is None
+    _close_tls(tls)
+    record = _finish_serve_run(run)
+    assert run.origin.requests == [], "a divergent Host reached the origin"
+    assert record.stage_reached is broker.HttpsConnectionStage.HTTP
+    assert record.detail == "http_host_mismatch"
+    assert record.http_host == OTHER_HOSTNAME
+    assert record.identity_chain == "identity_divergence:http_host"
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+    assert record.requests_completed == 0
+
+
+def test_serve_post_denied_for_general_download(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    tls = _established_tls_worker(run, serve_leaf_material)
+    tls.sendall(
+        f"POST /git-upload-pack HTTP/1.1\r\nHost: {SERVE_HOSTNAME}\r\n"
+        "Content-Length: 4\r\n\r\n".encode("ascii") + b"body"
+    )
+    assert _read_worker_response(tls) is None
+    _close_tls(tls)
+    record = _finish_serve_run(run)
+    assert run.origin.requests == []
+    assert record.detail == "http_method_not_allowed"
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+
+
+def test_serve_post_allowed_for_git_smart_fetch(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(
+        tmp_path, serve_leaf_material, purpose=GrantPurpose.GIT_SMART_FETCH
+    )
+    tls = _established_tls_worker(run, serve_leaf_material)
+    request = (
+        f"POST /git-upload-pack HTTP/1.1\r\nHost: {SERVE_HOSTNAME}\r\n"
+        "Content-Length: 4\r\n\r\n".encode("ascii") + b"body"
+    )
+    tls.sendall(request)
+    response = _read_worker_response(tls)
+    assert response is not None and response.endswith(b"hello")
+    _close_tls(tls)
+    record = _finish_serve_run(run)
+    assert run.origin.requests == [request]
+    assert record.requests_completed == 1
+    assert record.worker_to_origin_bytes == len(request)
+    assert record.terminal_reason is broker.HttpsConnectionTermination.COMPLETED
+
+
+def test_serve_pipelined_second_host_denied(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(
+        tmp_path, serve_leaf_material, origin_request_count=1
+    )
+    tls = _established_tls_worker(run, serve_leaf_material)
+    first = f"GET /one HTTP/1.1\r\nHost: {SERVE_HOSTNAME}\r\n\r\n".encode("ascii")
+    second = f"GET /two HTTP/1.1\r\nHost: {OTHER_HOSTNAME}\r\n\r\n".encode("ascii")
+    tls.sendall(first + second)
+    response = _read_worker_response(tls)
+    assert response is not None and response.endswith(b"hello")
+    # The second, divergent request is never answered nor forwarded.
+    assert _read_worker_response(tls) is None
+    _close_tls(tls)
+    record = _finish_serve_run(run)
+    assert run.origin.requests == [first]
+    assert record.requests_completed == 1
+    assert record.detail == "http_host_mismatch"
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+    assert record.worker_to_origin_bytes == len(first)
+
+
+def test_serve_te_cl_smuggling_denied_pre_forwarding(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    tls = _established_tls_worker(run, serve_leaf_material)
+    tls.sendall(
+        f"GET / HTTP/1.1\r\nHost: {SERVE_HOSTNAME}\r\n"
+        "Content-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0\r\n\r\n".encode("ascii")
+    )
+    assert _read_worker_response(tls) is None
+    _close_tls(tls)
+    record = _finish_serve_run(run)
+    assert run.origin.requests == []
+    assert record.detail == "http_te_with_content_length"
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+
+
+# -- limits, expiry, revocation -----------------------------------------------------
+
+
+def test_serve_byte_limit_enforced_mid_relay(tmp_path, serve_leaf_material):
+    request = f"GET / HTTP/1.1\r\nHost: {SERVE_HOSTNAME}\r\n\r\n".encode("ascii")
+    full_response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    byte_limit = len(request) + 9
+    run = _start_serve_connection(
+        tmp_path, serve_leaf_material, byte_limit=byte_limit
+    )
+    tls = _established_tls_worker(run, serve_leaf_material)
+    tls.sendall(request)
+    partial = b""
+    try:
+        while True:
+            chunk = tls.recv(4096)
+            if not chunk:
+                break
+            partial += chunk
+    except (ssl.SSLError, OSError):
+        pass
+    _close_tls(tls)
+    record = _finish_serve_run(run)
+    assert record.terminal_reason is broker.HttpsConnectionTermination.BYTE_LIMIT
+    assert record.accounted_bytes == byte_limit
+    assert record.worker_to_origin_bytes == len(request)
+    assert record.origin_to_worker_bytes == len(partial)
+    assert len(partial) < len(full_response)
+
+
+def test_serve_expiry_mid_relay_discards_buffered_bytes(
+    tmp_path, serve_leaf_material
+):
+    run = _start_serve_connection(
+        tmp_path,
+        serve_leaf_material,
+        lifetime_ns=1_500_000_000,
+    )
+    tls = _established_tls_worker(run, serve_leaf_material)
+    request = f"GET / HTTP/1.1\r\nHost: {SERVE_HOSTNAME}\r\n\r\n".encode("ascii")
+    tls.sendall(request)
+    assert _read_worker_response(tls) is not None
+    # A partial second request is read but never completed or forwarded;
+    # expiry must account it as discarded, never as forwarded bytes.
+    partial = b"GET /partial HTTP/1.1"
+    tls.sendall(partial)
+    time.sleep(2.0)
+    _close_tls(tls)
+    record = _finish_serve_run(run)
+    assert record.terminal_reason is broker.HttpsConnectionTermination.EXPIRED
+    assert record.discarded_unsent_bytes == len(partial)
+    assert record.accounted_bytes == record.total_bytes + len(partial)
+    assert record.worker_to_origin_bytes == len(request)
+    assert run.origin.requests == [request]
+
+
+def _dup_cloexec_fd(fd):
+    import fcntl as _fcntl
+
+    return _fcntl.fcntl(fd, _fcntl.F_DUPFD_CLOEXEC, 100)
+
+
+def _start_serve_transport_thread(
+    tmp_path,
+    serve_leaf_material,
+    *,
+    connection_limit=1,
+    byte_limit=1 << 20,
+    lifetime_ns=None,
+    origin_responder=None,
+    origin_request_count=1,
+    fixture_addresses=("93.184.216.34",),
+):
+    """Run serve_https_transport on a real listener with the fixture armed
+    through the authenticated control message (the runner's delivery path)."""
+    policy = _serve_policy(
+        connection_limit=connection_limit,
+        byte_limit=byte_limit,
+        lifetime_ns=lifetime_ns,
+    )
+    network_policy = _serve_network_policy(policy)
+    https_state = _serve_https_state(
+        network_policy, serve_leaf_material["context"]
+    )
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # The broker's listener contract forbids SO_REUSEADDR; retry briefly to
+    # ride out a previous test's TIME_WAIT on the fixed port instead.
+    bind_deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            listener.bind(("127.0.0.1", 18080))
+            break
+        except OSError:
+            if time.monotonic() >= bind_deadline:
+                raise
+            time.sleep(0.1)
+    listener.listen(4)
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    pems = _origin_pems()
+    origin_server = _ScriptedOrigin(
+        tmp_path,
+        pems,
+        origin_responder or _ok_responder(),
+        request_count=origin_request_count,
+    )
+    owned = (
+        _dup_cloexec_fd(listener.fileno()),
+        _dup_cloexec_fd(control_broker.fileno()),
+    )
+    outcomes = []
+
+    def run():
+        try:
+            outcomes.append(
+                broker.serve_https_transport(
+                    policy, https_state,
+                    listener_fd=owned[0], control_fd=owned[1],
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001
+            outcomes.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    payload = broker.CONTROL_HTTPS_FIXTURE + json.dumps(
+        {
+            "version": broker.HTTPS_FIXTURE_VERSION,
+            "ca_certs_pem": pems["ca"].decode("ascii"),
+            "addresses": list(fixture_addresses),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    control_peer.sendmsg(
+        [payload],
+        [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+          array.array("i", [origin_server.fd]))],
+    )
+    return types.SimpleNamespace(
+        thread=thread,
+        outcomes=outcomes,
+        listener=listener,
+        control_broker=control_broker,
+        control_peer=control_peer,
+        origin=origin_server,
+        owned=owned,
+        policy=policy,
+    )
+
+
+def _cleanup_serve_transport(serve):
+    serve.origin.close()
+    serve.listener.close()
+    serve.control_broker.close()
+    serve.control_peer.close()
+    for fd in serve.owned:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _tcp_worker():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10.0)
+    sock.connect(("127.0.0.1", 18080))
+    return sock
+
+
+def _read_evidence_packets(control_peer, count):
+    packets = []
+    control_peer.settimeout(10.0)
+    for _ in range(count):
+        packets.append(control_peer.recv(broker.MAX_HTTPS_EVIDENCE_BYTES + 1))
+    return packets
+
+
+def _join_serve_transport(serve):
+    serve.thread.join(15.0)
+    assert not serve.thread.is_alive()
+    assert len(serve.outcomes) == 1
+    terminal = serve.outcomes[0]
+    assert type(terminal) is broker.HttpsTransportTerminal, terminal
+    return terminal
+
+
+def test_serve_revoke_mid_connection_tears_down(tmp_path, serve_leaf_material):
+    serve = _start_serve_transport_thread(
+        tmp_path, serve_leaf_material, origin_responder=_slow_responder(10.0)
+    )
+    try:
+        worker = _tcp_worker()
+        reply = _worker_connect(worker)
+        assert reply.startswith(b"HTTP/1.1 200")
+        tls = _worker_tls(worker, serve_leaf_material["ca_pem"])
+        tls.sendall(
+            f"GET / HTTP/1.1\r\nHost: {SERVE_HOSTNAME}\r\n\r\n".encode("ascii")
+        )
+        serve.control_peer.send(broker.CONTROL_REVOKE)
+        packets = _read_evidence_packets(serve.control_peer, 1)
+        terminal = _join_serve_transport(serve)
+        assert terminal.terminal_reason is broker.TransportTermination.REVOKED
+        assert terminal.connection_count == 1
+        record = broker.HttpsConnectionRecord.from_bytes(packets[0])
+        assert record.terminal_reason is broker.HttpsConnectionTermination.REVOKED
+        assert terminal.synthetic_origin is True
+        try:
+            tail = tls.recv(4096)
+            assert tail == b""
+        except (ssl.SSLError, OSError):
+            pass
+    finally:
+        _cleanup_serve_transport(serve)
+
+
+def test_serve_expiry_closes_listener_and_connections(
+    tmp_path, serve_leaf_material
+):
+    serve = _start_serve_transport_thread(
+        tmp_path,
+        serve_leaf_material,
+        lifetime_ns=2_000_000_000,
+        origin_responder=_slow_responder(10.0),
+    )
+    try:
+        worker = _tcp_worker()
+        reply = _worker_connect(worker)
+        assert reply.startswith(b"HTTP/1.1 200")
+        tls = _worker_tls(worker, serve_leaf_material["ca_pem"])
+        tls.sendall(
+            f"GET / HTTP/1.1\r\nHost: {SERVE_HOSTNAME}\r\n\r\n".encode("ascii")
+        )
+        packets = _read_evidence_packets(serve.control_peer, 1)
+        terminal = _join_serve_transport(serve)
+        assert terminal.terminal_reason is broker.TransportTermination.EXPIRED
+        assert terminal.observed_at_monotonic_ns >= (
+            serve.policy.expires_at_monotonic_ns
+        )
+        record = broker.HttpsConnectionRecord.from_bytes(packets[0])
+        assert record.terminal_reason is broker.HttpsConnectionTermination.EXPIRED
+        assert terminal.accounted_bytes == (
+            terminal.total_bytes + terminal.discarded_unsent_bytes
+        )
+    finally:
+        _cleanup_serve_transport(serve)
+
+
+def test_serve_connection_limit_terminates(tmp_path, serve_leaf_material):
+    serve = _start_serve_transport_thread(
+        tmp_path, serve_leaf_material, connection_limit=1
+    )
+    try:
+        first = _tcp_worker()
+        second = _tcp_worker()
+        second.settimeout(5.0)
+        # The over-limit connection is aborted and the broker terminates.
+        try:
+            assert second.recv(64) == b""
+        except OSError:
+            pass
+        packets = _read_evidence_packets(serve.control_peer, 1)
+        terminal = _join_serve_transport(serve)
+        assert (
+            terminal.terminal_reason
+            is broker.TransportTermination.CONNECTION_LIMIT
+        )
+        assert terminal.connection_count == 1
+        first.close()
+    finally:
+        _cleanup_serve_transport(serve)
+
+
+# -- fixture control-message validation ----------------------------------------------
+
+
+def _fixture_control_serve(tmp_path, serve_leaf_material):
+    policy = _serve_policy()
+    network_policy = _serve_network_policy(policy)
+    https_state = _serve_https_state(
+        network_policy, serve_leaf_material["context"]
+    )
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    serve = broker._HttpsServeState(policy, https_state, control_broker.fileno())
+    return serve, control_broker, control_peer
+
+
+def _send_fixture_message(control_peer, payload, fds=()):
+    ancillary = []
+    if fds:
+        ancillary = [
+            (socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", list(fds)))
+        ]
+    control_peer.sendmsg([payload], ancillary)
+
+
+def test_https_fixture_control_message_arming_and_validation(
+    tmp_path, serve_leaf_material
+):
+    serve, control_broker, control_peer = _fixture_control_serve(
+        tmp_path, serve_leaf_material
+    )
+    pems = _origin_pems()
+    good_fd, keep = socket.socketpair()
+    payload = broker.CONTROL_HTTPS_FIXTURE + json.dumps(
+        {
+            "version": broker.HTTPS_FIXTURE_VERSION,
+            "ca_certs_pem": pems["ca"].decode("ascii"),
+            "addresses": ["93.184.216.34"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    # A fixture message without its descriptor is malformed.
+    _send_fixture_message(control_peer, payload)
+    assert broker._read_https_control(control_broker, serve) is (
+        broker.TransportTermination.MALFORMED_CONTROL
+    )
+    # A valid message arms the fixture exactly once.
+    _send_fixture_message(control_peer, payload, fds=(good_fd.fileno(),))
+    assert broker._read_https_control(control_broker, serve) is None
+    assert serve.fixture is not None
+    assert serve.fixture.addresses == ("93.184.216.34",)
+    # A second fixture message is malformed.
+    _send_fixture_message(control_peer, payload, fds=(good_fd.fileno(),))
+    assert broker._read_https_control(control_broker, serve) is (
+        broker.TransportTermination.MALFORMED_CONTROL
+    )
+    # REVOKE remains intact on the extended control reader.
+    control_peer.send(broker.CONTROL_REVOKE)
+    assert broker._read_https_control(control_broker, serve) is (
+        broker.TransportTermination.REVOKED
+    )
+    serve.fixture = None
+    keep.close()
+    good_fd.close()
+    control_broker.close()
+    control_peer.close()
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"version": "AOSHTTPSFIX/2", "ca_certs_pem": "x",
+         "addresses": ["93.184.216.34"]},
+        {"version": "AOSHTTPSFIX/1", "ca_certs_pem": "",
+         "addresses": ["93.184.216.34"]},
+        {"version": "AOSHTTPSFIX/1", "ca_certs_pem": "x", "addresses": []},
+        {"version": "AOSHTTPSFIX/1", "ca_certs_pem": "x",
+         "addresses": ["999.1.1.1"]},
+        {"version": "AOSHTTPSFIX/1", "ca_certs_pem": "x",
+         "addresses": ["93.184.216.34"], "extra": 1},
+    ],
+)
+def test_https_fixture_payload_rejected(tmp_path, serve_leaf_material, document):
+    serve, control_broker, control_peer = _fixture_control_serve(
+        tmp_path, serve_leaf_material
+    )
+    good_fd, keep = socket.socketpair()
+    payload = broker.CONTROL_HTTPS_FIXTURE + json.dumps(
+        document, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    _send_fixture_message(control_peer, payload, fds=(good_fd.fileno(),))
+    assert broker._read_https_control(control_broker, serve) is (
+        broker.TransportTermination.MALFORMED_CONTROL
+    )
+    assert serve.fixture is None
+    keep.close()
+    good_fd.close()
+    control_broker.close()
+    control_peer.close()
+
+
+# -- runner-side HTTPS evidence reader -----------------------------------------------
+
+
+def test_https_evidence_reader_authenticates_records(tmp_path):
+    policy = _serve_policy(connection_limit=4)
+    network_policy = _serve_network_policy(policy)
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    record = broker.HttpsConnectionRecord(
+        **_connection_record_kwargs(
+            policy_digest=policy_digest(policy),
+            network_policy_digest=network_policy_digest(network_policy),
+        )
+    )
+    terminal = broker.HttpsTransportTerminal(
+        version=broker.HTTPS_EVIDENCE_VERSION,
+        event=broker.HTTPS_TERMINAL_EVENT,
+        task_id=policy.task_id,
+        task_generation=policy.task_generation,
+        launch_nonce=policy.launch_nonce,
+        policy_digest=policy_digest(policy),
+        network_policy_digest=network_policy_digest(network_policy),
+        observed_at_monotonic_ns=time.monotonic_ns(),
+        connection_count=1,
+        accounted_bytes=84,
+        worker_to_origin_bytes=41,
+        origin_to_worker_bytes=43,
+        total_bytes=84,
+        discarded_unsent_bytes=0,
+        terminal_reason=broker.TransportTermination.REVOKED,
+        synthetic_origin=True,
+    )
+    broker._emit_https_packet(control_broker.fileno(), record.to_bytes(), final=False)
+    broker._emit_https_packet(control_broker.fileno(), terminal.to_bytes(), final=True)
+    read_terminal, records, broker_emitted = (
+        runner_module._read_authenticated_https_transport_records(
+            control_peer.fileno(),
+            expected_policy=policy,
+            expected_network_policy_digest=network_policy_digest(network_policy),
+            expect_synthetic=True,
+            budget=5.0,
+        )
+    )
+    assert read_terminal == terminal
+    assert records == (record,)
+    assert broker_emitted is True
+    control_broker.close()
+    control_peer.close()
+
+
+def test_https_evidence_reader_synthesizes_after_worker_exit_reap(tmp_path):
+    """Clean worker exit reaps the broker: records + EOF, no terminal packet."""
+    policy = _serve_policy(connection_limit=4)
+    network_policy = _serve_network_policy(policy)
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    record = broker.HttpsConnectionRecord(
+        **_connection_record_kwargs(
+            policy_digest=policy_digest(policy),
+            network_policy_digest=network_policy_digest(network_policy),
+            synthetic_origin=False,
+        )
+    )
+    # The eager record lands while the worker lives; the broker is then
+    # reaped (close without any terminal packet or shutdown).
+    broker._emit_https_packet(control_broker.fileno(), record.to_bytes(), final=False)
+    control_broker.close()
+    read_terminal, records, broker_emitted = (
+        runner_module._read_authenticated_https_transport_records(
+            control_peer.fileno(),
+            expected_policy=policy,
+            expected_network_policy_digest=network_policy_digest(network_policy),
+            expect_synthetic=False,
+            budget=5.0,
+        )
+    )
+    assert broker_emitted is False
+    assert records == (record,)
+    assert read_terminal.terminal_reason is broker.TransportTermination.REVOKED
+    assert read_terminal.connection_count == 1
+    assert read_terminal.accounted_bytes == record.accounted_bytes
+    assert read_terminal.total_bytes == record.total_bytes
+    assert read_terminal.discarded_unsent_bytes == (
+        record.discarded_unsent_bytes
+    )
+    assert read_terminal.synthetic_origin is False
+    control_peer.close()
+
+
+def test_https_evidence_reader_rejects_wrong_authority(tmp_path):
+    policy = _serve_policy(connection_limit=4)
+    network_policy = _serve_network_policy(policy)
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    terminal = broker.HttpsTransportTerminal(
+        version=broker.HTTPS_EVIDENCE_VERSION,
+        event=broker.HTTPS_TERMINAL_EVENT,
+        task_id=policy.task_id,
+        task_generation=policy.task_generation,
+        launch_nonce=policy.launch_nonce,
+        policy_digest=policy_digest(policy),
+        network_policy_digest="00" * 32,  # not the sealed network policy
+        observed_at_monotonic_ns=time.monotonic_ns(),
+        connection_count=0,
+        accounted_bytes=0,
+        worker_to_origin_bytes=0,
+        origin_to_worker_bytes=0,
+        total_bytes=0,
+        discarded_unsent_bytes=0,
+        terminal_reason=broker.TransportTermination.REVOKED,
+        synthetic_origin=False,
+    )
+    broker._emit_https_packet(control_broker.fileno(), terminal.to_bytes(), final=True)
+    with pytest.raises(runner_module.CapabilityTransportError):
+        runner_module._read_authenticated_https_transport_records(
+            control_peer.fileno(),
+            expected_policy=policy,
+            expected_network_policy_digest=network_policy_digest(network_policy),
+            expect_synthetic=False,
+            budget=5.0,
+        )
+    control_broker.close()
+    control_peer.close()
+
+
+def test_https_evidence_reader_rejects_record_after_terminal(tmp_path):
+    policy = _serve_policy(connection_limit=4)
+    network_policy = _serve_network_policy(policy)
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    kwargs = _connection_record_kwargs(
+        policy_digest=policy_digest(policy),
+        network_policy_digest=network_policy_digest(network_policy),
+    )
+    terminal = broker.HttpsTransportTerminal(
+        version=broker.HTTPS_EVIDENCE_VERSION,
+        event=broker.HTTPS_TERMINAL_EVENT,
+        task_id=policy.task_id,
+        task_generation=policy.task_generation,
+        launch_nonce=policy.launch_nonce,
+        policy_digest=policy_digest(policy),
+        network_policy_digest=network_policy_digest(network_policy),
+        observed_at_monotonic_ns=time.monotonic_ns(),
+        connection_count=0,
+        accounted_bytes=0,
+        worker_to_origin_bytes=0,
+        origin_to_worker_bytes=0,
+        total_bytes=0,
+        discarded_unsent_bytes=0,
+        terminal_reason=broker.TransportTermination.REVOKED,
+        synthetic_origin=True,
+    )
+    broker._emit_https_packet(control_broker.fileno(), terminal.to_bytes(), final=False)
+    broker._emit_https_packet(
+        control_broker.fileno(),
+        broker.HttpsConnectionRecord(**kwargs).to_bytes(),
+        final=True,
+    )
+    with pytest.raises(runner_module.CapabilityTransportError):
+        runner_module._read_authenticated_https_transport_records(
+            control_peer.fileno(),
+            expected_policy=policy,
+            expected_network_policy_digest=network_policy_digest(network_policy),
+            expect_synthetic=True,
+            budget=5.0,
+        )
+    control_broker.close()
+    control_peer.close()

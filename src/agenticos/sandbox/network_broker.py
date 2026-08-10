@@ -24,6 +24,7 @@ import socket
 import stat
 import struct
 import sys
+import threading
 import time
 from typing import Any, NoReturn
 
@@ -2529,6 +2530,1631 @@ def serve_transport(
         _close_owned(owned_raw)
 
 
+# -- M4B-2 HTTPS serve path (slice 9b) ------------------------------------------
+#
+# Evidence design choice: the HTTPS flavor runs under a DENY transport policy,
+# and the M4B-1 AOSTRANSPORT/1 observation cannot express per-connection HTTPS
+# truth (its connection_count is capped at one and its DENY semantics require
+# zero totals), so extending it would weaken a format M4B-1 authenticates.
+# Instead the broker emits PARALLEL HTTPS evidence records on the same
+# authenticated control channel under their own version tag: zero or more
+# HTTPS_CONNECTION_TERMINATED records (one per accepted connection, emitted
+# EAGERLY in completion order) followed — whenever the serve loop ends while
+# the worker still lives (revoke-while-alive, expiry, control EOF, limit) —
+# by exactly one aggregate HTTPS_TRANSPORT_TERMINATED record and the
+# write-side shutdown.  M4B-1 record formats, readers, and
+# DENY/SYNTHETIC_FIXTURE_FD semantics are byte-compatibly untouched.
+#
+# Platform constraint (broker death semantics, unchanged from M4B-1): the
+# broker is parented to the supervisor, which execs the worker chain; when
+# the worker exits, the broker is reaped with it.  Records buffered on the
+# seqpacket control channel remain readable by the controller afterwards
+# (the same mechanism M4B-1's upfront DENY observation relies on).  A clean
+# worker exit therefore yields the eager per-connection records plus channel
+# EOF WITHOUT a terminal record; the runner authenticates the records and
+# synthesizes the aggregate itself (its own liveness gates prove the broker
+# died only at or after worker exit — a mid-run broker death fails the pump
+# closed).  Mid-run expiry exits the broker with an EXPIRED terminal and,
+# exactly as in M4B-1, fails the run closed at the broker-liveness gate.
+#
+# Concurrency posture: the main selector thread owns the listener and the
+# control channel; each accepted connection is served on its own bounded
+# worker thread.  Simultaneous ClientHello gates are bounded by
+# BoundedGateGuard; per-connection worker-TLS termination is serialized on one
+# mutex because the SNI policy installs on the shared task-leaf context;
+# post-handshake relay runs concurrently per connection.  Aggregate byte and
+# connection authority is enforced across all threads by one locked
+# accountant.  Accepted connections are bounded by the grant connection limit;
+# exceeding it terminates the broker (CONNECTION_LIMIT), mirroring M4B-1.
+
+HTTPS_EVIDENCE_VERSION = "AOSHTTPEV/1"
+HTTPS_CONNECTION_EVENT = "HTTPS_CONNECTION_TERMINATED"
+HTTPS_TERMINAL_EVENT = "HTTPS_TRANSPORT_TERMINATED"
+MAX_HTTPS_EVIDENCE_BYTES = 4096
+MAX_HTTPS_CONTROL_BYTES = 16384
+CONTROL_HTTPS_FIXTURE = b"AOSBROKERCTL/1 HTTPS-FIXTURE\n"
+HTTPS_FIXTURE_VERSION = "AOSHTTPSFIX/1"
+HTTPS_FIXTURE_MAX_PEM_BYTES = 8192
+HTTPS_FIXTURE_MAX_ADDRESSES = 8
+CONNECT_HEAD_MAX_BYTES = 16384
+CONNECT_MAX_HEADER_LINES = 32
+CONNECT_STAGE_TIMEOUT_SECONDS = 5.0
+HTTPS_STAGE_SLICE_SECONDS = 0.25
+HTTPS_CHANNEL_WRITE_TIMEOUT_SECONDS = 10.0
+HTTPS_THREAD_JOIN_GRACE_SECONDS = 8.0
+HTTPS_CONNECT_RESPONSE_OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+HTTPS_CONNECT_RESPONSE_DENIED = (
+    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+)
+_HTTPS_HOST_EVIDENCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}\Z")
+_HTTPS_TCHAR = frozenset(
+    b"!#$%&'*+-.^_`|~0123456789"
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
+
+
+class HttpsConnectionStage(str, Enum):
+    """The furthest trust stage one worker connection reached."""
+
+    CONNECT = "connect"
+    AUTHORIZATION = "authorization"
+    GATE = "clienthello_gate"
+    WORKER_TLS = "worker_tls"
+    HTTP = "http_prevalidation"
+    RESOLUTION = "resolution"
+    ORIGIN_CONNECT = "origin_connect"
+    ORIGIN_TLS = "origin_tls"
+    REQUEST_FORWARD = "request_forward"
+    RESPONSE_RELAY = "response_relay"
+
+
+class HttpsConnectionTermination(str, Enum):
+    """Per-connection terminal verdict of the HTTPS serve path."""
+
+    COMPLETED = "completed"
+    DENIED = "denied"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+    BYTE_LIMIT = "byte_limit"
+    PEER_ERROR = "peer_error"
+
+
+def _https_evidence_text(name: str, value: object, maximum: int = 160) -> str:
+    if type(value) is not str or not 0 < len(value) <= maximum:
+        raise BrokerBoundaryError(f"https evidence {name} is invalid")
+    if any(ord(char) < 0x20 or ord(char) > 0x7E for char in value):
+        raise BrokerBoundaryError(f"https evidence {name} is not printable ASCII")
+    return value
+
+
+def _https_optional_hostname(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or not _HTTPS_HOST_EVIDENCE_RE.fullmatch(value):
+        raise BrokerBoundaryError(f"https evidence {label} is invalid")
+    return value
+
+
+def _sanitize_gate_reason(reason: object) -> str:
+    """Bound a gate rejection reason to safe printable ASCII for evidence."""
+    if type(reason) is not str:
+        return "rejected"
+    cleaned = "".join(
+        char if 0x20 <= ord(char) <= 0x7E and char not in "\"\\" else "_"
+        for char in reason
+    )
+    return cleaned[:160] or "rejected"
+
+
+def _evidence_hostname(value: object) -> str | None:
+    """Map an observed (possibly hostile) hostname onto the evidence grammar."""
+    if value is None:
+        return None
+    if type(value) is str and _HTTPS_HOST_EVIDENCE_RE.fullmatch(value):
+        return value
+    return "<non-canonical>"
+
+
+@dataclass(frozen=True)
+class HttpsConnectionRecord:
+    """Canonical broker-owned per-connection HTTPS evidence (AOSHTTPEV/1)."""
+
+    version: str
+    event: str
+    task_id: str
+    task_generation: int
+    launch_nonce: str
+    policy_digest: str
+    network_policy_digest: str
+    address_policy_version: str
+    connection_index: int
+    stage_reached: HttpsConnectionStage
+    terminal_reason: HttpsConnectionTermination
+    detail: str
+    approved_hostname: str
+    connect_authority: str | None
+    worker_sni: str | None
+    http_host: str | None
+    origin_tls_name: str | None
+    identity_chain: str
+    worker_tls_version: str | None
+    worker_alpn: str | None
+    origin_tls_version: str | None
+    origin_alpn: str | None
+    origin_peer_address: str | None
+    origin_peer_port: int
+    synthetic_origin: bool
+    requests_completed: int
+    accounted_bytes: int
+    worker_to_origin_bytes: int
+    origin_to_worker_bytes: int
+    total_bytes: int
+    discarded_unsent_bytes: int
+    observed_at_monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        if self.version != HTTPS_EVIDENCE_VERSION:
+            raise BrokerBoundaryError("https connection record version is invalid")
+        if self.event != HTTPS_CONNECTION_EVENT:
+            raise BrokerBoundaryError("https connection record event is invalid")
+        if type(self.task_id) is not str or not _TASK_ID_RE.fullmatch(self.task_id):
+            raise BrokerBoundaryError("https connection record task ID is invalid")
+        _positive_u64("https connection record generation", self.task_generation)
+        if type(self.launch_nonce) is not str or not _HEX_32_RE.fullmatch(
+            self.launch_nonce
+        ):
+            raise BrokerBoundaryError("https connection record nonce is invalid")
+        for label, digest in (
+            ("policy digest", self.policy_digest),
+            ("network policy digest", self.network_policy_digest),
+        ):
+            if type(digest) is not str or not _HEX_64_RE.fullmatch(digest):
+                raise BrokerBoundaryError(
+                    f"https connection record {label} is invalid"
+                )
+        _https_evidence_text(
+            "address policy version", self.address_policy_version, 128
+        )
+        _positive_u64("https connection index", self.connection_index)
+        if type(self.stage_reached) is not HttpsConnectionStage:
+            raise BrokerBoundaryError("https connection record stage is invalid")
+        if type(self.terminal_reason) is not HttpsConnectionTermination:
+            raise BrokerBoundaryError("https connection record reason is invalid")
+        _https_evidence_text("detail", self.detail)
+        _https_optional_hostname(self.approved_hostname, "approved hostname")
+        for label, value in (
+            ("CONNECT authority", self.connect_authority),
+            ("worker SNI", self.worker_sni),
+            ("HTTP host", self.http_host),
+            ("origin TLS name", self.origin_tls_name),
+        ):
+            _https_optional_hostname(value, label)
+        _https_evidence_text("identity chain", self.identity_chain, 64)
+        for label, value in (
+            ("worker TLS version", self.worker_tls_version),
+            ("worker ALPN", self.worker_alpn),
+            ("origin TLS version", self.origin_tls_version),
+            ("origin ALPN", self.origin_alpn),
+            ("origin peer address", self.origin_peer_address),
+        ):
+            if value is not None:
+                _https_evidence_text(label, value, 64)
+        if type(self.origin_peer_port) is not int or not 0 <= (
+            self.origin_peer_port
+        ) <= 65535:
+            raise BrokerBoundaryError("https connection record peer port is invalid")
+        if type(self.synthetic_origin) is not bool:
+            raise BrokerBoundaryError("https connection record synthetic flag is invalid")
+        _nonnegative_u64("https requests completed", self.requests_completed)
+        for name, value in (
+            ("accounted bytes", self.accounted_bytes),
+            ("worker-to-origin bytes", self.worker_to_origin_bytes),
+            ("origin-to-worker bytes", self.origin_to_worker_bytes),
+            ("total bytes", self.total_bytes),
+            ("discarded unsent bytes", self.discarded_unsent_bytes),
+        ):
+            _nonnegative_u64(f"https connection record {name}", value)
+        if self.total_bytes != (
+            self.worker_to_origin_bytes + self.origin_to_worker_bytes
+        ):
+            raise BrokerBoundaryError("https connection byte total is inconsistent")
+        if self.accounted_bytes != self.total_bytes + self.discarded_unsent_bytes:
+            raise BrokerBoundaryError("https connection accounting is inconsistent")
+        _positive_u64(
+            "https connection record monotonic timestamp",
+            self.observed_at_monotonic_ns,
+        )
+
+    def to_bytes(self) -> bytes:
+        payload = {
+            "accounted_bytes": self.accounted_bytes,
+            "address_policy_version": self.address_policy_version,
+            "approved_hostname": self.approved_hostname,
+            "connect_authority": self.connect_authority,
+            "connection_index": self.connection_index,
+            "detail": self.detail,
+            "discarded_unsent_bytes": self.discarded_unsent_bytes,
+            "event": self.event,
+            "http_host": self.http_host,
+            "identity_chain": self.identity_chain,
+            "launch_nonce": self.launch_nonce,
+            "network_policy_digest": self.network_policy_digest,
+            "observed_at_monotonic_ns": self.observed_at_monotonic_ns,
+            "origin_alpn": self.origin_alpn,
+            "origin_peer_address": self.origin_peer_address,
+            "origin_peer_port": self.origin_peer_port,
+            "origin_tls_name": self.origin_tls_name,
+            "origin_tls_version": self.origin_tls_version,
+            "origin_to_worker_bytes": self.origin_to_worker_bytes,
+            "policy_digest": self.policy_digest,
+            "requests_completed": self.requests_completed,
+            "stage_reached": self.stage_reached.value,
+            "synthetic_origin": self.synthetic_origin,
+            "task_generation": self.task_generation,
+            "task_id": self.task_id,
+            "terminal_reason": self.terminal_reason.value,
+            "total_bytes": self.total_bytes,
+            "version": self.version,
+            "worker_alpn": self.worker_alpn,
+            "worker_sni": self.worker_sni,
+            "worker_tls_version": self.worker_tls_version,
+            "worker_to_origin_bytes": self.worker_to_origin_bytes,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        if len(encoded) > MAX_HTTPS_EVIDENCE_BYTES:
+            raise BrokerBoundaryError("https connection record is oversized")
+        return encoded
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> HttpsConnectionRecord:
+        decoded = _exact_dict(
+            _decode_json(payload, MAX_HTTPS_EVIDENCE_BYTES, "https connection record"),
+            {
+                "accounted_bytes",
+                "address_policy_version",
+                "approved_hostname",
+                "connect_authority",
+                "connection_index",
+                "detail",
+                "discarded_unsent_bytes",
+                "event",
+                "http_host",
+                "identity_chain",
+                "launch_nonce",
+                "network_policy_digest",
+                "observed_at_monotonic_ns",
+                "origin_alpn",
+                "origin_peer_address",
+                "origin_peer_port",
+                "origin_tls_name",
+                "origin_tls_version",
+                "origin_to_worker_bytes",
+                "policy_digest",
+                "requests_completed",
+                "stage_reached",
+                "synthetic_origin",
+                "task_generation",
+                "task_id",
+                "terminal_reason",
+                "total_bytes",
+                "version",
+                "worker_alpn",
+                "worker_sni",
+                "worker_tls_version",
+                "worker_to_origin_bytes",
+            },
+            "https connection record",
+        )
+        try:
+            record = cls(
+                version=decoded["version"],
+                event=decoded["event"],
+                task_id=decoded["task_id"],
+                task_generation=decoded["task_generation"],
+                launch_nonce=decoded["launch_nonce"],
+                policy_digest=decoded["policy_digest"],
+                network_policy_digest=decoded["network_policy_digest"],
+                address_policy_version=decoded["address_policy_version"],
+                connection_index=decoded["connection_index"],
+                stage_reached=HttpsConnectionStage(decoded["stage_reached"]),
+                terminal_reason=HttpsConnectionTermination(
+                    decoded["terminal_reason"]
+                ),
+                detail=decoded["detail"],
+                approved_hostname=decoded["approved_hostname"],
+                connect_authority=decoded["connect_authority"],
+                worker_sni=decoded["worker_sni"],
+                http_host=decoded["http_host"],
+                origin_tls_name=decoded["origin_tls_name"],
+                identity_chain=decoded["identity_chain"],
+                worker_tls_version=decoded["worker_tls_version"],
+                worker_alpn=decoded["worker_alpn"],
+                origin_tls_version=decoded["origin_tls_version"],
+                origin_alpn=decoded["origin_alpn"],
+                origin_peer_address=decoded["origin_peer_address"],
+                origin_peer_port=decoded["origin_peer_port"],
+                synthetic_origin=decoded["synthetic_origin"],
+                requests_completed=decoded["requests_completed"],
+                accounted_bytes=decoded["accounted_bytes"],
+                worker_to_origin_bytes=decoded["worker_to_origin_bytes"],
+                origin_to_worker_bytes=decoded["origin_to_worker_bytes"],
+                total_bytes=decoded["total_bytes"],
+                discarded_unsent_bytes=decoded["discarded_unsent_bytes"],
+                observed_at_monotonic_ns=decoded["observed_at_monotonic_ns"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BrokerBoundaryError(
+                "https connection record fields are invalid"
+            ) from exc
+        if record.to_bytes() != payload:
+            raise BrokerBoundaryError(
+                "https connection record encoding is not canonical"
+            )
+        return record
+
+
+@dataclass(frozen=True)
+class HttpsTransportTerminal:
+    """Canonical aggregate terminal HTTPS evidence (AOSHTTPEV/1)."""
+
+    version: str
+    event: str
+    task_id: str
+    task_generation: int
+    launch_nonce: str
+    policy_digest: str
+    network_policy_digest: str
+    observed_at_monotonic_ns: int
+    connection_count: int
+    accounted_bytes: int
+    worker_to_origin_bytes: int
+    origin_to_worker_bytes: int
+    total_bytes: int
+    discarded_unsent_bytes: int
+    terminal_reason: TransportTermination
+    synthetic_origin: bool
+
+    def __post_init__(self) -> None:
+        if self.version != HTTPS_EVIDENCE_VERSION:
+            raise BrokerBoundaryError("https terminal record version is invalid")
+        if self.event != HTTPS_TERMINAL_EVENT:
+            raise BrokerBoundaryError("https terminal record event is invalid")
+        if type(self.task_id) is not str or not _TASK_ID_RE.fullmatch(self.task_id):
+            raise BrokerBoundaryError("https terminal record task ID is invalid")
+        _positive_u64("https terminal record generation", self.task_generation)
+        if type(self.launch_nonce) is not str or not _HEX_32_RE.fullmatch(
+            self.launch_nonce
+        ):
+            raise BrokerBoundaryError("https terminal record nonce is invalid")
+        for label, digest in (
+            ("policy digest", self.policy_digest),
+            ("network policy digest", self.network_policy_digest),
+        ):
+            if type(digest) is not str or not _HEX_64_RE.fullmatch(digest):
+                raise BrokerBoundaryError(f"https terminal record {label} is invalid")
+        _positive_u64(
+            "https terminal record monotonic timestamp",
+            self.observed_at_monotonic_ns,
+        )
+        for name, value in (
+            ("connection count", self.connection_count),
+            ("accounted bytes", self.accounted_bytes),
+            ("worker-to-origin bytes", self.worker_to_origin_bytes),
+            ("origin-to-worker bytes", self.origin_to_worker_bytes),
+            ("total bytes", self.total_bytes),
+            ("discarded unsent bytes", self.discarded_unsent_bytes),
+        ):
+            _nonnegative_u64(f"https terminal record {name}", value)
+        if self.total_bytes != (
+            self.worker_to_origin_bytes + self.origin_to_worker_bytes
+        ):
+            raise BrokerBoundaryError("https terminal byte total is inconsistent")
+        if self.accounted_bytes != self.total_bytes + self.discarded_unsent_bytes:
+            raise BrokerBoundaryError("https terminal accounting is inconsistent")
+        if type(self.terminal_reason) is not TransportTermination:
+            raise BrokerBoundaryError("https terminal record reason is invalid")
+        if self.terminal_reason in {
+            TransportTermination.DENY_NO_RELAY,
+            TransportTermination.COMPLETED,
+        }:
+            raise BrokerBoundaryError(
+                "https terminal record reason is not an HTTPS serve outcome"
+            )
+        if type(self.synthetic_origin) is not bool:
+            raise BrokerBoundaryError("https terminal record synthetic flag is invalid")
+
+    @property
+    def worker_to_fixture_bytes(self) -> int:
+        """M4B-1-shaped alias: the normalized runner evidence is flavor-blind."""
+        return self.worker_to_origin_bytes
+
+    @property
+    def fixture_to_worker_bytes(self) -> int:
+        """M4B-1-shaped alias: the normalized runner evidence is flavor-blind."""
+        return self.origin_to_worker_bytes
+
+    def to_bytes(self) -> bytes:
+        payload = {
+            "accounted_bytes": self.accounted_bytes,
+            "connection_count": self.connection_count,
+            "discarded_unsent_bytes": self.discarded_unsent_bytes,
+            "event": self.event,
+            "launch_nonce": self.launch_nonce,
+            "network_policy_digest": self.network_policy_digest,
+            "observed_at_monotonic_ns": self.observed_at_monotonic_ns,
+            "origin_to_worker_bytes": self.origin_to_worker_bytes,
+            "policy_digest": self.policy_digest,
+            "synthetic_origin": self.synthetic_origin,
+            "task_generation": self.task_generation,
+            "task_id": self.task_id,
+            "terminal_reason": self.terminal_reason.value,
+            "total_bytes": self.total_bytes,
+            "version": self.version,
+            "worker_to_origin_bytes": self.worker_to_origin_bytes,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        if len(encoded) > MAX_HTTPS_EVIDENCE_BYTES:
+            raise BrokerBoundaryError("https terminal record is oversized")
+        return encoded
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> HttpsTransportTerminal:
+        decoded = _exact_dict(
+            _decode_json(payload, MAX_HTTPS_EVIDENCE_BYTES, "https terminal record"),
+            {
+                "accounted_bytes",
+                "connection_count",
+                "discarded_unsent_bytes",
+                "event",
+                "launch_nonce",
+                "network_policy_digest",
+                "observed_at_monotonic_ns",
+                "origin_to_worker_bytes",
+                "policy_digest",
+                "synthetic_origin",
+                "task_generation",
+                "task_id",
+                "terminal_reason",
+                "total_bytes",
+                "version",
+                "worker_to_origin_bytes",
+            },
+            "https terminal record",
+        )
+        try:
+            record = cls(
+                version=decoded["version"],
+                event=decoded["event"],
+                task_id=decoded["task_id"],
+                task_generation=decoded["task_generation"],
+                launch_nonce=decoded["launch_nonce"],
+                policy_digest=decoded["policy_digest"],
+                network_policy_digest=decoded["network_policy_digest"],
+                observed_at_monotonic_ns=decoded["observed_at_monotonic_ns"],
+                connection_count=decoded["connection_count"],
+                accounted_bytes=decoded["accounted_bytes"],
+                worker_to_origin_bytes=decoded["worker_to_origin_bytes"],
+                origin_to_worker_bytes=decoded["origin_to_worker_bytes"],
+                total_bytes=decoded["total_bytes"],
+                discarded_unsent_bytes=decoded["discarded_unsent_bytes"],
+                terminal_reason=TransportTermination(decoded["terminal_reason"]),
+                synthetic_origin=decoded["synthetic_origin"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BrokerBoundaryError(
+                "https terminal record fields are invalid"
+            ) from exc
+        if record.to_bytes() != payload:
+            raise BrokerBoundaryError(
+                "https terminal record encoding is not canonical"
+            )
+        return record
+
+
+def _emit_https_packet(control_fd: int, payload: bytes, *, final: bool) -> None:
+    """Send one HTTPS evidence packet; only the final one closes the channel."""
+    if len(payload) > MAX_HTTPS_EVIDENCE_BYTES:
+        raise BrokerBoundaryError("https evidence packet is oversized")
+    _validate_connected_unix_socket(
+        control_fd, socket.SOCK_SEQPACKET, "broker control"
+    )
+    duplicate = _duplicate_cloexec(control_fd)
+    channel: socket.socket | None = None
+    try:
+        channel = socket.socket(fileno=duplicate)
+        duplicate = -1
+        sent = channel.send(payload, socket.MSG_NOSIGNAL)
+        if sent != len(payload):
+            raise BrokerBoundaryError("https evidence send was short")
+        if final:
+            channel.shutdown(socket.SHUT_WR)
+    except BrokerBoundaryError:
+        raise
+    except OSError as exc:
+        raise BrokerBoundaryError("https evidence send failed") from exc
+    finally:
+        if channel is not None:
+            channel.close()
+        elif duplicate >= 0:
+            os.close(duplicate)
+
+
+class _HttpsFixtureState:
+    """One conformance-only synthetic origin armed over the control channel.
+
+    The fixture is selected ONLY by the controller (never by policy or worker
+    input): exactly one already-connected socket plus its explicit trust roots
+    and declared numeric resolution arrive as one authenticated control
+    message before the first connection.  It supplies exactly ONE origin
+    connection per launch; every record produced under it is marked
+    ``synthetic_origin=True`` (non-production).
+    """
+
+    def __init__(
+        self, fd: int, ca_certs_pem: str, addresses: tuple[str, ...]
+    ) -> None:
+        self.fd = fd
+        self.ca_certs_pem = ca_certs_pem
+        self.addresses = addresses
+        self.spent = False
+
+
+class _HttpsByteAccountant:
+    """Aggregate, lock-protected byte authority across all connections."""
+
+    def __init__(self, byte_limit: int) -> None:
+        self._limit = byte_limit
+        self._lock = threading.Lock()
+        self.accounted = 0
+        self.worker_to_origin = 0
+        self.origin_to_worker = 0
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    def read_budget(self) -> int:
+        with self._lock:
+            return self._limit - self.accounted
+
+    def commit_read(self, count: int) -> None:
+        with self._lock:
+            self.accounted += count
+            if self.accounted > self._limit:
+                raise BrokerBoundaryError("https byte accounting exceeded its limit")
+
+    def commit_worker_to_origin(self, count: int) -> None:
+        with self._lock:
+            self.worker_to_origin += count
+
+    def commit_origin_to_worker(self, count: int) -> None:
+        with self._lock:
+            self.origin_to_worker += count
+
+    def snapshot(self) -> tuple[int, int, int]:
+        with self._lock:
+            return self.accounted, self.worker_to_origin, self.origin_to_worker
+
+
+class _HttpsConnectionRuntime:
+    """Live abort handles for one in-flight connection (teardown plumbing)."""
+
+    def __init__(self, worker_sock: socket.socket) -> None:
+        self._lock = threading.Lock()
+        self._worker_sock: socket.socket | None = worker_sock
+        self._channel: Any = None
+        self._origin_sock: socket.socket | None = None
+
+    def set_channel(self, channel: Any) -> None:
+        with self._lock:
+            self._channel = channel
+
+    def set_origin(self, origin_sock: socket.socket | None) -> None:
+        with self._lock:
+            self._origin_sock = origin_sock
+
+    def abort(self) -> None:
+        with self._lock:
+            worker_sock, channel, origin_sock = (
+                self._worker_sock,
+                self._channel,
+                self._origin_sock,
+            )
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                pass
+        _abort_socket(origin_sock)
+        _abort_socket(worker_sock)
+
+
+class _HttpsServeState:
+    """Shared broker-owned state for one HTTPS serve run."""
+
+    def __init__(
+        self,
+        policy: TransportPolicy,
+        https_state: _HttpsMaterialState,
+        control_fd: int,
+    ) -> None:
+        from .network_clienthello import BoundedGateGuard
+
+        self.policy = policy
+        self.https_state = https_state
+        self.network_policy = https_state.network_policy
+        self.grant = self.network_policy.grants[0]
+        self.approved_hostname = self.grant.hostname
+        self.control_fd = control_fd
+        self.connection_limit = min(
+            policy.connection_limit, self.grant.connection_limit
+        )
+        self.accountant = _HttpsByteAccountant(
+            min(policy.byte_limit, self.grant.byte_limit)
+        )
+        self.guard = BoundedGateGuard()
+        self.tls_configure_lock = threading.Lock()
+        self.emit_lock = threading.Lock()
+        self.abort = threading.Event()
+        self.fixture: _HttpsFixtureState | None = None
+        self.connections_accepted = 0
+        self.records_emitted = 0
+        self.byte_limit_reached = False
+        self.runtimes: list[_HttpsConnectionRuntime] = []
+        self.threads: list[threading.Thread] = []
+        self.thread_errors: list[BaseException] = []
+
+    def expired(self) -> bool:
+        return time.monotonic_ns() >= self.policy.expires_at_monotonic_ns
+
+    def emit_record(self, record: HttpsConnectionRecord) -> None:
+        with self.emit_lock:
+            _emit_https_packet(self.control_fd, record.to_bytes(), final=False)
+            self.records_emitted += 1
+
+    def abort_connections(self) -> None:
+        self.abort.set()
+        for runtime in tuple(self.runtimes):
+            runtime.abort()
+
+
+def _parse_https_fixture(payload: bytes, fd: int) -> _HttpsFixtureState:
+    """Validate the controller-sent conformance fixture control message."""
+    import ipaddress
+
+    decoded = _exact_dict(
+        _decode_json(payload, MAX_HTTPS_CONTROL_BYTES, "https fixture"),
+        {"version", "ca_certs_pem", "addresses"},
+        "https fixture",
+    )
+    if decoded["version"] != HTTPS_FIXTURE_VERSION:
+        raise BrokerBoundaryError("https fixture version is invalid")
+    pem = decoded["ca_certs_pem"]
+    if (
+        type(pem) is not str
+        or not pem
+        or not pem.isascii()
+        or len(pem.encode("ascii")) > HTTPS_FIXTURE_MAX_PEM_BYTES
+    ):
+        raise BrokerBoundaryError("https fixture trust roots are invalid")
+    raw_addresses = decoded["addresses"]
+    if (
+        type(raw_addresses) is not list
+        or not 1 <= len(raw_addresses) <= HTTPS_FIXTURE_MAX_ADDRESSES
+    ):
+        raise BrokerBoundaryError("https fixture address set is invalid")
+    addresses: list[str] = []
+    for entry in raw_addresses:
+        if type(entry) is not str:
+            raise BrokerBoundaryError("https fixture address is invalid")
+        try:
+            parsed = ipaddress.ip_address(entry)
+        except ValueError as exc:
+            raise BrokerBoundaryError("https fixture address is invalid") from exc
+        if str(parsed) != entry:
+            raise BrokerBoundaryError("https fixture address is not canonical")
+        addresses.append(entry)
+    if type(fd) is not int or fd < 0:
+        raise BrokerBoundaryError("https fixture descriptor is invalid")
+    try:
+        os.fstat(fd)
+    except OSError as exc:
+        raise BrokerBoundaryError("https fixture descriptor is not open") from exc
+    return _HttpsFixtureState(fd, pem, tuple(addresses))
+
+
+def _read_https_control(
+    channel: socket.socket, serve: _HttpsServeState
+) -> TransportTermination | None:
+    """HTTPS-flavor control read: REVOKE/EOF plus the conformance fixture.
+
+    M4B-1's ``_read_control`` is deliberately untouched; the fixture verb is
+    recognized only here, on the HTTPS serve loop, and is accepted at most
+    once and only before the first accepted connection.
+    """
+    try:
+        payload, ancillary, flags, _address = channel.recvmsg(
+            MAX_HTTPS_CONTROL_BYTES + 1,
+            socket.CMSG_SPACE(array_itemsize() * 2),
+            socket.MSG_DONTWAIT | socket.MSG_CMSG_CLOEXEC,
+        )
+    except BlockingIOError:
+        return None
+    except OSError:
+        return TransportTermination.PEER_ERROR
+    received_fds: set[int] = set()
+    for level, kind, data in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            complete = len(data) - (len(data) % array.array("i").itemsize)
+            if complete:
+                values = array.array("i")
+                values.frombytes(data[:complete])
+                received_fds.update(values)
+
+    def close_received() -> None:
+        for received_fd in received_fds:
+            try:
+                os.close(received_fd)
+            except OSError:
+                pass
+        received_fds.clear()
+
+    if payload.startswith(CONTROL_HTTPS_FIXTURE):
+        if (
+            len(received_fds) != 1
+            or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+            or serve.fixture is not None
+            or serve.connections_accepted
+        ):
+            close_received()
+            return TransportTermination.MALFORMED_CONTROL
+        fixture_fd = received_fds.pop()
+        try:
+            serve.fixture = _parse_https_fixture(
+                payload[len(CONTROL_HTTPS_FIXTURE):], fixture_fd
+            )
+        except BrokerBoundaryError:
+            try:
+                os.close(fixture_fd)
+            except OSError:
+                pass
+            return TransportTermination.MALFORMED_CONTROL
+        return None
+    close_received()
+    if ancillary or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+        return TransportTermination.MALFORMED_CONTROL
+    if payload == b"":
+        return TransportTermination.CONTROL_EOF
+    if payload == CONTROL_REVOKE:
+        return TransportTermination.REVOKED
+    return TransportTermination.MALFORMED_CONTROL
+
+
+def _read_connect_head(
+    serve: _HttpsServeState, worker: socket.socket
+) -> tuple[bytes | None, str]:
+    """Bounded byte-at-a-time CONNECT head read (no over-read into TLS)."""
+    head = bytearray()
+    deadline = time.monotonic() + CONNECT_STAGE_TIMEOUT_SECONDS
+    worker.settimeout(HTTPS_STAGE_SLICE_SECONDS)
+    while b"\r\n\r\n" not in head:
+        if serve.expired():
+            return None, "expired"
+        if serve.abort.is_set():
+            return None, "aborted"
+        if len(head) >= CONNECT_HEAD_MAX_BYTES:
+            return None, "head_bound_exceeded"
+        if time.monotonic() >= deadline:
+            return None, "timeout"
+        try:
+            chunk = worker.recv(1)
+        except socket.timeout:
+            continue
+        except OSError:
+            return None, "socket_error"
+        if chunk == b"":
+            return None, "eof"
+        head += chunk
+    return bytes(head), "ok"
+
+
+def _parse_connect_authority(head: bytes) -> tuple[str | None, str]:
+    """Strict raw-byte CONNECT-authority parse; the only CONNECT on the wire."""
+    from .network_https import NormalizationError, normalize_https_authority
+
+    lines = head[:-4].split(b"\r\n")
+    request_line = lines[0]
+    parts = request_line.split(b" ")
+    if len(parts) != 3 or any(part == b"" for part in parts):
+        return None, "request_line_malformed"
+    method, authority, version = parts
+    if method != b"CONNECT":
+        return None, "method_not_connect"
+    if version != b"HTTP/1.1":
+        return None, "version_rejected"
+    try:
+        hostname = normalize_https_authority(authority)
+    except NormalizationError as exc:
+        return None, f"authority_{exc.code.value}"
+    if len(lines) - 1 > CONNECT_MAX_HEADER_LINES:
+        return None, "too_many_headers"
+    for line in lines[1:]:
+        if not line:
+            return None, "header_malformed"
+        if line[0] in (0x20, 0x09):
+            return None, "obs_fold_rejected"
+        colon = line.find(b":")
+        if colon == -1:
+            return None, "header_malformed"
+        name = line[:colon]
+        if not name or any(byte not in _HTTPS_TCHAR for byte in name):
+            return None, "header_name_invalid"
+        rest = line[colon + 1:]
+        if rest.startswith(b" "):
+            rest = rest[1:]
+        if (
+            any(byte < 0x20 or byte > 0x7E for byte in rest)
+            or rest.startswith(b" ")
+            or rest.endswith(b" ")
+        ):
+            return None, "header_value_invalid"
+    return hostname, "ok"
+
+
+def _best_effort_plain_send(worker: socket.socket, payload: bytes) -> bool:
+    try:
+        worker.settimeout(HTTPS_STAGE_SLICE_SECONDS)
+        worker.sendall(payload)
+    except OSError:
+        return False
+    return True
+
+
+class _OriginLeg:
+    """One established origin leg plus its evidence fields."""
+
+    def __init__(
+        self,
+        *,
+        sock: socket.socket,
+        tls_version: str,
+        alpn: str,
+        peer_address: str,
+        peer_port: int,
+        address_policy_version: str,
+        synthetic: bool,
+    ) -> None:
+        self.sock = sock
+        self.tls_version = tls_version
+        self.alpn = alpn
+        self.peer_address = peer_address
+        self.peer_port = peer_port
+        self.address_policy_version = address_policy_version
+        self.synthetic = synthetic
+
+
+def _establish_fixture_origin(
+    serve: _HttpsServeState,
+    runtime: _HttpsConnectionRuntime,
+) -> tuple[_OriginLeg | None, HttpsConnectionStage, str]:
+    """Synthetic origin: validated declared set + TLS over the armed socket."""
+    import ipaddress
+
+    from .network_origin import OriginTrustRoots, open_origin_tls
+    from .network_resolution import ResolvedAddress
+    from .special_addresses import (
+        ADDRESS_POLICY_VERSION,
+        AddressDecision,
+        validate_address,
+    )
+
+    fixture = serve.fixture
+    if fixture is None:
+        return None, HttpsConnectionStage.ORIGIN_CONNECT, "origin_fixture_absent"
+    if fixture.spent:
+        return None, HttpsConnectionStage.ORIGIN_CONNECT, "origin_fixture_spent"
+    resolved: list[ResolvedAddress] = []
+    prohibited = 0
+    for text in fixture.addresses:
+        address = ipaddress.ip_address(text)
+        verdict = validate_address(address)
+        if verdict.decision is AddressDecision.ALLOWED:
+            family = (
+                socket.AF_INET
+                if isinstance(address, ipaddress.IPv4Address)
+                else socket.AF_INET6
+            )
+            resolved.append(
+                ResolvedAddress(
+                    address=address, family=family, port=443, verdict=verdict
+                )
+            )
+        else:
+            prohibited += 1
+    if prohibited or not resolved:
+        return None, HttpsConnectionStage.RESOLUTION, "origin_prohibited_address"
+    fixture.spent = True
+    sock = _wrap_owned_socket(os.dup(fixture.fd), "https fixture origin")
+    runtime.set_origin(sock)
+    outcome = open_origin_tls(
+        sock,
+        serve.approved_hostname,
+        trust_roots=OriginTrustRoots(fixture.ca_certs_pem),
+    )
+    if not outcome.established:
+        return (
+            None,
+            HttpsConnectionStage.ORIGIN_TLS,
+            f"origin_{outcome.code.value}",
+        )
+    assert outcome.channel is not None
+    runtime.set_origin(outcome.channel.tls_socket)
+    peer = resolved[0]
+    return (
+        _OriginLeg(
+            sock=outcome.channel.tls_socket,
+            tls_version=outcome.channel.tls_version,
+            alpn=outcome.channel.alpn_protocol,
+            peer_address=str(peer.address),
+            peer_port=peer.port,
+            address_policy_version=ADDRESS_POLICY_VERSION,
+            synthetic=True,
+        ),
+        HttpsConnectionStage.ORIGIN_TLS,
+        "ok",
+    )
+
+
+def _establish_origin(
+    serve: _HttpsServeState,
+    runtime: _HttpsConnectionRuntime,
+) -> tuple[_OriginLeg | None, HttpsConnectionStage, str]:
+    """Resolve once, connect numeric, authenticate origin TLS (or fixture)."""
+    from .network_origin import OriginHTTPSCode, open_origin_https
+    from .network_resolution import resolve_all_once
+
+    if serve.fixture is not None:
+        return _establish_fixture_origin(serve, runtime)
+    resolution = resolve_all_once(serve.approved_hostname)
+    outcome = open_origin_https(resolution, serve.grant)
+    if not outcome.established:
+        stage = {
+            OriginHTTPSCode.RESOLUTION_DENIED: HttpsConnectionStage.RESOLUTION,
+            OriginHTTPSCode.HOSTNAME_MISMATCH: HttpsConnectionStage.RESOLUTION,
+            OriginHTTPSCode.INVALID_ADDRESS_SET: HttpsConnectionStage.RESOLUTION,
+            OriginHTTPSCode.CONNECT_FAILED: HttpsConnectionStage.ORIGIN_CONNECT,
+        }.get(outcome.code, HttpsConnectionStage.ORIGIN_TLS)
+        return None, stage, f"origin_{outcome.code.value}"
+    assert outcome.channel is not None
+    runtime.set_origin(outcome.channel.tls_socket)
+    return (
+        _OriginLeg(
+            sock=outcome.channel.tls_socket,
+            tls_version=outcome.channel.tls_version,
+            alpn=outcome.channel.alpn_protocol,
+            peer_address=outcome.channel.peer_address,
+            peer_port=outcome.channel.peer_port,
+            address_policy_version=resolution.policy_version,
+            synthetic=False,
+        ),
+        HttpsConnectionStage.ORIGIN_TLS,
+        "ok",
+    )
+
+
+def _relay_origin_response(
+    serve: _HttpsServeState,
+    runtime: _HttpsConnectionRuntime,
+    channel: Any,
+    origin: _OriginLeg,
+    counters: dict[str, int],
+) -> tuple[str, str]:
+    """Bounded verbatim origin->worker relay; h11 CLIENT is framing-only.
+
+    The origin response is relayed byte-exact (nothing stripped, nothing
+    logged); the h11 client machine is used ONLY to delimit the response
+    (EndOfMessage) so the persistent connection can cycle.  A response h11
+    cannot frame fails the connection closed.
+    """
+    import h11
+
+    from .network_tls import ChannelError
+
+    framer = h11.Connection(h11.CLIENT)
+    sock = origin.sock
+    while True:
+        if serve.expired():
+            return "expired", "expired"
+        if serve.abort.is_set():
+            return "revoked", "aborted"
+        budget = serve.accountant.read_budget()
+        if budget <= 0:
+            return "byte_limit", "byte_limit"
+        sock.settimeout(HTTPS_STAGE_SLICE_SECONDS)
+        try:
+            chunk = sock.recv(min(RELAY_CHUNK_BYTES, budget))
+        except socket.timeout:
+            continue
+        except OSError:
+            if serve.expired():
+                return "expired", "expired"
+            if serve.abort.is_set():
+                return "revoked", "aborted"
+            return "peer_error", "origin_read_failed"
+        serve.accountant.commit_read(len(chunk))
+        counters["read_from_origin"] += len(chunk)
+        try:
+            framer.receive_data(chunk)
+        except h11.LocalProtocolError:
+            return "peer_error", "response_unframeable"
+        completed = False
+        try:
+            while True:
+                event = framer.next_event()
+                if event is h11.NEED_DATA or event is h11.PAUSED:
+                    break
+                if isinstance(event, h11.EndOfMessage):
+                    completed = True
+                    break
+        except h11.LocalProtocolError:
+            return "peer_error", "response_unframeable"
+        if chunk:
+            try:
+                channel.write(
+                    chunk, timeout=HTTPS_CHANNEL_WRITE_TIMEOUT_SECONDS
+                )
+            except ChannelError:
+                if serve.expired():
+                    return "expired", "expired"
+                if serve.abort.is_set():
+                    return "revoked", "aborted"
+                return "peer_error", "worker_write_failed"
+            serve.accountant.commit_origin_to_worker(len(chunk))
+            counters["origin_to_worker"] += len(chunk)
+        if completed:
+            # An EOF-delimited response completes here; the origin leg is
+            # spent afterwards and the NEXT request ends the connection.
+            return ("done_eof" if chunk == b"" else "done"), "ok"
+        if chunk == b"":
+            # EOF before the framer could delimit the response: fail closed.
+            return "peer_error", "origin_truncated_response"
+
+
+def _serve_https_connection(
+    serve: _HttpsServeState,
+    runtime: _HttpsConnectionRuntime,
+    connection_index: int,
+) -> None:
+    """Serve one accepted worker connection through the full trust pipeline."""
+    from . import network_clienthello as nch
+    from . import network_tls as ntls
+    from .network_http import RequestComplete, RequestHead, StrictHttpParser
+    from .network_https import (
+        NormalizationError,
+        authorize_grant,
+        normalize_https_authority,
+        verify_identity_chain,
+    )
+
+    worker = runtime._worker_sock
+    assert worker is not None
+    stage = HttpsConnectionStage.CONNECT
+    connect_authority: str | None = None
+    worker_sni_raw: str | None = None
+    http_host: str | None = None
+    origin_tls_name: str | None = None
+    worker_tls_version: str | None = None
+    worker_alpn: str | None = None
+    origin_tls_version: str | None = None
+    origin_alpn: str | None = None
+    origin_peer_address: str | None = None
+    origin_peer_port = 0
+    address_policy_version = ""
+    # The synthetic marking follows the ARMED fixture (non-production mode
+    # for the whole launch), not merely connections that reached the origin.
+    synthetic = serve.fixture is not None
+    requests_completed = 0
+    counters = {
+        "read_from_worker": 0,
+        "read_from_origin": 0,
+        "worker_to_origin": 0,
+        "origin_to_worker": 0,
+    }
+    termination = HttpsConnectionTermination.DENIED
+    detail = "denied"
+
+    def finish() -> None:
+        from .special_addresses import ADDRESS_POLICY_VERSION
+
+        total = counters["worker_to_origin"] + counters["origin_to_worker"]
+        accounted = counters["read_from_worker"] + counters["read_from_origin"]
+        chain = verify_identity_chain(
+            serve.grant,
+            connect_authority=connect_authority,
+            worker_sni=worker_sni_raw,
+            http_host=http_host,
+            origin_tls_name=origin_tls_name,
+            evidence_name=serve.approved_hostname,
+        )
+        identity = chain.code.value
+        if not chain.verified and chain.stage is not None:
+            identity = f"{chain.code.value}:{chain.stage.value}"
+        record = HttpsConnectionRecord(
+            version=HTTPS_EVIDENCE_VERSION,
+            event=HTTPS_CONNECTION_EVENT,
+            task_id=serve.policy.task_id,
+            task_generation=serve.policy.task_generation,
+            launch_nonce=serve.policy.launch_nonce,
+            policy_digest=transport_policy_digest(serve.policy),
+            network_policy_digest=serve.https_state.network_policy_digest,
+            address_policy_version=address_policy_version or ADDRESS_POLICY_VERSION,
+            connection_index=connection_index,
+            stage_reached=stage,
+            terminal_reason=termination,
+            detail=detail,
+            approved_hostname=serve.approved_hostname,
+            connect_authority=_evidence_hostname(connect_authority),
+            worker_sni=_evidence_hostname(worker_sni_raw),
+            http_host=_evidence_hostname(http_host),
+            origin_tls_name=_evidence_hostname(origin_tls_name),
+            identity_chain=identity,
+            worker_tls_version=worker_tls_version,
+            worker_alpn=worker_alpn,
+            origin_tls_version=origin_tls_version,
+            origin_alpn=origin_alpn,
+            origin_peer_address=origin_peer_address,
+            origin_peer_port=origin_peer_port,
+            synthetic_origin=synthetic,
+            requests_completed=requests_completed,
+            accounted_bytes=accounted,
+            worker_to_origin_bytes=counters["worker_to_origin"],
+            origin_to_worker_bytes=counters["origin_to_worker"],
+            total_bytes=total,
+            discarded_unsent_bytes=accounted - total,
+            observed_at_monotonic_ns=time.monotonic_ns(),
+        )
+        try:
+            serve.emit_record(record)
+        except BrokerBoundaryError as exc:
+            serve.thread_errors.append(exc)
+        runtime.abort()
+
+    try:
+        head, read_code = _read_connect_head(serve, worker)
+        if head is None:
+            if read_code == "aborted":
+                termination = HttpsConnectionTermination.REVOKED
+            elif read_code == "expired":
+                termination = HttpsConnectionTermination.EXPIRED
+            detail = f"connect_{read_code}"
+            return
+        authority, parse_code = _parse_connect_authority(head)
+        if authority is None:
+            detail = f"connect_{parse_code}"
+            return
+        connect_authority = authority
+
+        stage = HttpsConnectionStage.AUTHORIZATION
+        authorization = authorize_grant(
+            serve.network_policy,
+            authority,
+            at_monotonic_ns=time.monotonic_ns(),
+        )
+        if not authorization.authorized:
+            detail = f"authorization_{authorization.code.value}"
+            _best_effort_plain_send(worker, HTTPS_CONNECT_RESPONSE_DENIED)
+            return
+        # The 200 response is sent ONLY after policy permits the TLS attempt.
+        if not _best_effort_plain_send(worker, HTTPS_CONNECT_RESPONSE_OK):
+            termination = HttpsConnectionTermination.PEER_ERROR
+            detail = "connect_response_failed"
+            return
+
+        stage = HttpsConnectionStage.GATE
+        gate = nch.run_gate_on_socket(worker, guard=serve.guard)
+        if not gate.accepted:
+            if serve.expired():
+                termination = HttpsConnectionTermination.EXPIRED
+                detail = "gate_expired"
+            elif serve.abort.is_set():
+                termination = HttpsConnectionTermination.REVOKED
+                detail = "gate_aborted"
+            else:
+                detail = f"gate_{_sanitize_gate_reason(gate.reason)}"
+            return
+
+        stage = HttpsConnectionStage.WORKER_TLS
+        # The per-connection SNI policy installs on the shared task-leaf
+        # context, so configuration + handshake are serialized broker-wide.
+        with serve.tls_configure_lock:
+            prepared = ntls.configure_worker_server_context(
+                serve.https_state.server_context, serve.approved_hostname
+            )
+            outcome = ntls.terminate_worker_tls(worker, gate, prepared)
+        worker_sni_raw = outcome.sni_seen[0] if outcome.sni_seen else None
+        worker_tls_version = outcome.tls_version
+        worker_alpn = outcome.alpn_selected
+        if not outcome.established:
+            if serve.expired():
+                termination = HttpsConnectionTermination.EXPIRED
+                detail = "worker_tls_expired"
+            elif serve.abort.is_set():
+                termination = HttpsConnectionTermination.REVOKED
+                detail = "worker_tls_aborted"
+            else:
+                detail = f"worker_tls_{outcome.code.value}"
+            return
+        channel = outcome.channel
+        assert channel is not None
+        runtime.set_channel(channel)
+
+        stage = HttpsConnectionStage.HTTP
+        parser = StrictHttpParser(serve.grant.purpose.http_policy())
+        origin: _OriginLeg | None = None
+        origin_eof = False
+        http_done = False
+        while not http_done:
+            if serve.expired():
+                termination, detail = (
+                    HttpsConnectionTermination.EXPIRED,
+                    "expired",
+                )
+                break
+            if serve.abort.is_set():
+                termination, detail = (
+                    HttpsConnectionTermination.REVOKED,
+                    "aborted",
+                )
+                break
+            budget = serve.accountant.read_budget()
+            if budget <= 0:
+                termination, detail = (
+                    HttpsConnectionTermination.BYTE_LIMIT,
+                    "byte_limit",
+                )
+                serve.byte_limit_reached = True
+                break
+            try:
+                data = channel.read(
+                    min(RELAY_CHUNK_BYTES, budget),
+                    timeout=HTTPS_STAGE_SLICE_SECONDS,
+                )
+            except ntls.ChannelTimeoutError:
+                continue
+            except ntls.ChannelError:
+                if serve.expired():
+                    termination, detail = (
+                        HttpsConnectionTermination.EXPIRED,
+                        "expired",
+                    )
+                elif serve.abort.is_set():
+                    termination, detail = (
+                        HttpsConnectionTermination.REVOKED,
+                        "aborted",
+                    )
+                else:
+                    termination, detail = (
+                        HttpsConnectionTermination.PEER_ERROR,
+                        "channel_error",
+                    )
+                break
+            if data == b"":
+                termination, detail = (
+                    HttpsConnectionTermination.COMPLETED,
+                    "worker_closed",
+                )
+                break
+            serve.accountant.commit_read(len(data))
+            counters["read_from_worker"] += len(data)
+            feed = parser.feed(data)
+            completed_wires = list(parser.pop_completed_wire())
+            denial: str | None = None
+            denial_stage: HttpsConnectionStage | None = None
+            for event in feed.events:
+                if denial is not None:
+                    break
+                if isinstance(event, RequestHead):
+                    try:
+                        head_host = normalize_https_authority(event.host)
+                    except NormalizationError:
+                        denial = "http_host_rejected"
+                        break
+                    if http_host is None:
+                        http_host = head_host
+                    if head_host != serve.approved_hostname:
+                        denial = "http_host_mismatch"
+                        break
+                    reauthorization = authorize_grant(
+                        serve.network_policy,
+                        head_host,
+                        at_monotonic_ns=time.monotonic_ns(),
+                    )
+                    if not reauthorization.authorized:
+                        denial = f"reauthorization_{reauthorization.code.value}"
+                        break
+                elif isinstance(event, RequestComplete):
+                    if not completed_wires:
+                        denial = "http_internal_wire_accounting"
+                        break
+                    wire = completed_wires.pop(0)
+                    if origin is None:
+                        leg, leg_stage, leg_detail = _establish_origin(
+                            serve, runtime
+                        )
+                        if leg is None:
+                            denial = leg_detail
+                            denial_stage = leg_stage
+                            break
+                        origin = leg
+                        origin_tls_name = serve.approved_hostname
+                        origin_tls_version = leg.tls_version
+                        origin_alpn = leg.alpn
+                        origin_peer_address = leg.peer_address
+                        origin_peer_port = leg.peer_port
+                        address_policy_version = leg.address_policy_version
+                    if origin_eof:
+                        termination = HttpsConnectionTermination.COMPLETED
+                        detail = "origin_closed"
+                        http_done = True
+                        break
+                    stage = HttpsConnectionStage.REQUEST_FORWARD
+                    try:
+                        origin.sock.settimeout(HTTPS_STAGE_SLICE_SECONDS)
+                        origin.sock.sendall(wire)
+                    except OSError:
+                        if serve.expired():
+                            termination = HttpsConnectionTermination.EXPIRED
+                            detail = "expired"
+                        elif serve.abort.is_set():
+                            termination = HttpsConnectionTermination.REVOKED
+                            detail = "aborted"
+                        else:
+                            termination = HttpsConnectionTermination.PEER_ERROR
+                            detail = "origin_write_failed"
+                        http_done = True
+                        break
+                    serve.accountant.commit_worker_to_origin(len(wire))
+                    counters["worker_to_origin"] += len(wire)
+                    requests_completed += 1
+                    stage = HttpsConnectionStage.RESPONSE_RELAY
+                    relay_status, relay_detail = _relay_origin_response(
+                        serve, runtime, channel, origin, counters
+                    )
+                    stage = HttpsConnectionStage.HTTP
+                    if relay_status == "done":
+                        continue
+                    if relay_status == "done_eof":
+                        origin_eof = True
+                        continue
+                    if relay_status == "peer_error" and relay_detail == (
+                        "origin_truncated_response"
+                    ):
+                        termination = HttpsConnectionTermination.PEER_ERROR
+                        detail = relay_detail
+                        http_done = True
+                        break
+                    if relay_status == "revoked":
+                        termination = HttpsConnectionTermination.REVOKED
+                    elif relay_status == "expired":
+                        termination = HttpsConnectionTermination.EXPIRED
+                    elif relay_status == "byte_limit":
+                        termination = HttpsConnectionTermination.BYTE_LIMIT
+                        serve.byte_limit_reached = True
+                    else:
+                        termination = HttpsConnectionTermination.PEER_ERROR
+                    detail = relay_detail
+                    http_done = True
+                    break
+            if http_done:
+                break
+            if denial is not None:
+                if denial_stage is not None:
+                    stage = denial_stage
+                detail = denial
+                termination = HttpsConnectionTermination.DENIED
+                break
+            if feed.rejection is not None:
+                detail = f"http_{feed.rejection.code.value}"
+                termination = HttpsConnectionTermination.DENIED
+                break
+    except BaseException as exc:  # noqa: BLE001 — fail closed per connection
+        termination = HttpsConnectionTermination.PEER_ERROR
+        detail = f"internal_{type(exc).__name__}"
+    finally:
+        finish()
+
+
+def _build_https_terminal(
+    serve: _HttpsServeState, reason: TransportTermination
+) -> HttpsTransportTerminal:
+    observed_at = time.monotonic_ns()
+    if observed_at >= serve.policy.expires_at_monotonic_ns:
+        reason = TransportTermination.EXPIRED
+    accounted, worker_to_origin, origin_to_worker = serve.accountant.snapshot()
+    total = worker_to_origin + origin_to_worker
+    if accounted < total or accounted > serve.accountant.limit:
+        raise BrokerBoundaryError("https serve accounting exceeded its authority")
+    if serve.records_emitted > serve.connection_limit:
+        raise BrokerBoundaryError("https serve exceeded its connection authority")
+    return HttpsTransportTerminal(
+        version=HTTPS_EVIDENCE_VERSION,
+        event=HTTPS_TERMINAL_EVENT,
+        task_id=serve.policy.task_id,
+        task_generation=serve.policy.task_generation,
+        launch_nonce=serve.policy.launch_nonce,
+        policy_digest=transport_policy_digest(serve.policy),
+        network_policy_digest=serve.https_state.network_policy_digest,
+        observed_at_monotonic_ns=observed_at,
+        connection_count=serve.records_emitted,
+        accounted_bytes=accounted,
+        worker_to_origin_bytes=worker_to_origin,
+        origin_to_worker_bytes=origin_to_worker,
+        total_bytes=total,
+        discarded_unsent_bytes=accounted - total,
+        terminal_reason=reason,
+        synthetic_origin=serve.fixture is not None,
+    )
+
+
+def _serve_https(
+    policy: TransportPolicy,
+    https_state: _HttpsMaterialState,
+    listener: socket.socket,
+    control: socket.socket,
+) -> HttpsTransportTerminal:
+    """Bounded accept loop: listener + control on the main selector thread."""
+    serve = _HttpsServeState(policy, https_state, control.fileno())
+    selector = selectors.DefaultSelector()
+    reason: TransportTermination | None = None
+    try:
+        listener.setblocking(False)
+        control.setblocking(False)
+        selector.register(listener, selectors.EVENT_READ, "listener")
+        selector.register(control, selectors.EVENT_READ, "control")
+        while True:
+            now = time.monotonic_ns()
+            if now >= policy.expires_at_monotonic_ns:
+                reason = TransportTermination.EXPIRED
+                break
+            timeout = min(
+                SELECTOR_SLICE_SECONDS,
+                (policy.expires_at_monotonic_ns - now) / 1_000_000_000,
+            )
+            events = selector.select(timeout)
+            if time.monotonic_ns() >= policy.expires_at_monotonic_ns:
+                reason = TransportTermination.EXPIRED
+                break
+            for key, _mask in events:
+                if key.data != "control":
+                    continue
+                outcome = _read_https_control(control, serve)
+                if outcome is not None:
+                    reason = outcome
+                    break
+            if reason is not None:
+                break
+            for key, _mask in events:
+                if key.data != "listener":
+                    continue
+                try:
+                    accepted, _address = listener.accept()
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    reason = TransportTermination.PEER_ERROR
+                    break
+                if serve.connections_accepted >= serve.connection_limit:
+                    _abort_socket(accepted)
+                    reason = TransportTermination.CONNECTION_LIMIT
+                    break
+                serve.connections_accepted += 1
+                runtime = _HttpsConnectionRuntime(accepted)
+                serve.runtimes.append(runtime)
+                thread = threading.Thread(
+                    target=_serve_https_connection,
+                    args=(serve, runtime, serve.connections_accepted),
+                    name=f"m4b2-https-conn-{serve.connections_accepted}",
+                    daemon=True,
+                )
+                serve.threads.append(thread)
+                thread.start()
+            if reason is not None:
+                break
+            if serve.byte_limit_reached:
+                reason = TransportTermination.BYTE_LIMIT
+                break
+        serve.abort_connections()
+        for thread in serve.threads:
+            thread.join(timeout=HTTPS_THREAD_JOIN_GRACE_SECONDS)
+        if serve.thread_errors:
+            raise serve.thread_errors[0]
+        if reason is None:
+            reason = TransportTermination.PEER_ERROR
+        return _build_https_terminal(serve, reason)
+    finally:
+        selector.close()
+        serve.abort.set()
+        for runtime in tuple(serve.runtimes):
+            runtime.abort()
+
+
+def serve_https_transport(
+    policy: TransportPolicy,
+    https_state: _HttpsMaterialState,
+    *,
+    listener_fd: int,
+    control_fd: int,
+) -> HttpsTransportTerminal:
+    """Own and close the supplied capabilities while serving gated HTTPS."""
+    listener: socket.socket | None = None
+    control: socket.socket | None = None
+    owned_raw = {
+        fd for fd in (listener_fd, control_fd) if type(fd) is int and fd >= 0
+    }
+    try:
+        if type(policy) is not TransportPolicy:
+            raise BrokerBoundaryError("transport policy has the wrong type")
+        if type(https_state) is not _HttpsMaterialState:
+            raise BrokerBoundaryError("https material state has the wrong type")
+        if policy.mode is not TransportMode.DENY:
+            raise BrokerBoundaryError("https serve requires a DENY transport policy")
+        if len(https_state.network_policy.grants) != 1:
+            raise BrokerBoundaryError("https serve requires exactly one grant")
+        now = time.monotonic_ns()
+        if now < policy.activated_at_monotonic_ns:
+            raise BrokerBoundaryError("transport policy is not active")
+        if now >= policy.expires_at_monotonic_ns:
+            return _build_https_terminal_expired(policy, https_state)
+        fds = (listener_fd, control_fd)
+        if (
+            any(type(fd) is not int or fd < 0 for fd in fds)
+            or len(set(fds)) != len(fds)
+        ):
+            raise BrokerBoundaryError("https transport descriptor roles collide")
+        listener_evidence(listener_fd)
+        _validate_connected_unix_socket(
+            control_fd, socket.SOCK_SEQPACKET, "broker control"
+        )
+        listener = _wrap_owned_socket(listener_fd, "listener")
+        owned_raw.discard(listener_fd)
+        control = _wrap_owned_socket(control_fd, "control")
+        owned_raw.discard(control_fd)
+        return _serve_https(policy, https_state, listener, control)
+    finally:
+        _close_socket(listener)
+        # Closing this owned alias must not shutdown the shared socket
+        # description; a broker-held duplicate emits the terminal record.
+        _close_socket(control)
+        _close_owned(owned_raw)
+
+
+def _build_https_terminal_expired(
+    policy: TransportPolicy, https_state: _HttpsMaterialState
+) -> HttpsTransportTerminal:
+    return HttpsTransportTerminal(
+        version=HTTPS_EVIDENCE_VERSION,
+        event=HTTPS_TERMINAL_EVENT,
+        task_id=policy.task_id,
+        task_generation=policy.task_generation,
+        launch_nonce=policy.launch_nonce,
+        policy_digest=transport_policy_digest(policy),
+        network_policy_digest=https_state.network_policy_digest,
+        observed_at_monotonic_ns=time.monotonic_ns(),
+        connection_count=0,
+        accounted_bytes=0,
+        worker_to_origin_bytes=0,
+        origin_to_worker_bytes=0,
+        total_bytes=0,
+        discarded_unsent_bytes=0,
+        terminal_reason=TransportTermination.EXPIRED,
+        synthetic_origin=False,
+    )
+
+
 def _build_ready_record(
     sealed: VerifiedSealedPolicy,
     adopted_listener: ListenerEvidence,
@@ -2749,18 +4375,39 @@ def broker_main(contract: BrokerContract) -> NoReturn:
         relay_listener_fd = adopted_fd
         adopted_fd = None
         if sealed.policy.mode is TransportMode.DENY:
-            emit_transport_observation(
-                control_fd,
-                build_deny_transport_observation(
-                    sealed.policy, policy_digest=sealed.digest
-                ),
-            )
-            termination = serve_transport(
-                sealed.policy,
-                listener_fd=relay_listener_fd,
-                fixture_fd=fixture_fd,
-                control_fd=control_fd,
-            )
+            if https_state is not None:
+                terminal_control_fd = _duplicate_cloexec(control_fd)
+                try:
+                    terminal = serve_https_transport(
+                        sealed.policy,
+                        https_state,
+                        listener_fd=relay_listener_fd,
+                        control_fd=control_fd,
+                    )
+                    if type(terminal) is not HttpsTransportTerminal:
+                        raise BrokerBoundaryError(
+                            "https transport did not return terminal evidence"
+                        )
+                    _emit_https_packet(
+                        terminal_control_fd, terminal.to_bytes(), final=True
+                    )
+                    termination = terminal.terminal_reason
+                finally:
+                    if terminal_control_fd >= 0:
+                        os.close(terminal_control_fd)
+            else:
+                emit_transport_observation(
+                    control_fd,
+                    build_deny_transport_observation(
+                        sealed.policy, policy_digest=sealed.digest
+                    ),
+                )
+                termination = serve_transport(
+                    sealed.policy,
+                    listener_fd=relay_listener_fd,
+                    fixture_fd=fixture_fd,
+                    control_fd=control_fd,
+                )
         else:
             terminal_control_fd = _duplicate_cloexec(control_fd)
             try:
@@ -2839,8 +4486,18 @@ __all__ = [
     "BrokerBoundaryError",
     "BrokerBoundaryEvidence",
     "BrokerContract",
+    "CONTROL_HTTPS_FIXTURE",
     "EnvironmentEvidence",
+    "HTTPS_CONNECTION_EVENT",
+    "HTTPS_EVIDENCE_VERSION",
+    "HTTPS_FIXTURE_VERSION",
+    "HTTPS_TERMINAL_EVENT",
+    "HttpsConnectionRecord",
+    "HttpsConnectionStage",
+    "HttpsConnectionTermination",
     "HttpsMaterialContract",
+    "HttpsTransportTerminal",
+    "MAX_HTTPS_EVIDENCE_BYTES",
     "MAX_READY_BYTES",
     "MAX_TRANSPORT_OBSERVATION_BYTES",
     "NetworkBrokerReadyRecord",
@@ -2860,6 +4517,7 @@ __all__ = [
     "parse_proc_status",
     "require_minimal_proc_status",
     "restore_contract_cloexec",
+    "serve_https_transport",
     "serve_transport",
     "validate_broker_environment",
     "validate_fixture_fd",

@@ -25,6 +25,7 @@ import os
 import re
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -1229,6 +1230,200 @@ def scenario_m4b_transport(
         )
 
 
+def _m4b2_read_http_response(tls: ssl.SSLSocket, budget: float) -> dict[str, Any]:
+    """Read one HTTP/1.1 response from the tunneled TLS socket (test-only)."""
+    deadline = time.monotonic() + budget
+    head = b""
+    while b"\r\n\r\n" not in head:
+        if len(head) > 16384 or time.monotonic() >= deadline:
+            return {"error": "response_head_incomplete", "head_hex": head.hex()}
+        try:
+            chunk = tls.recv(4096)
+        except (ssl.SSLError, OSError) as exc:
+            return {"error": f"{type(exc).__name__}", "head_hex": head.hex()}
+        if chunk == b"":
+            return {"error": "eof_before_head", "head_hex": head.hex()}
+        head += chunk
+    raw_head, _, rest = head.partition(b"\r\n\r\n")
+    lines = raw_head.decode("ascii", errors="replace").split("\r\n")
+    try:
+        status = int(lines[0].split(" ")[1])
+    except (IndexError, ValueError):
+        return {"error": "status_line_malformed", "head": lines[0] if lines else ""}
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    length = headers.get("content-length")
+    body = rest
+    if length is not None:
+        want = int(length)
+        while len(body) < want and time.monotonic() < deadline:
+            try:
+                chunk = tls.recv(min(65536, want - len(body)))
+            except (ssl.SSLError, OSError) as exc:
+                return {"error": f"{type(exc).__name__}", "status": status}
+            if chunk == b"":
+                break
+            body += chunk
+    else:
+        while time.monotonic() < deadline:
+            try:
+                chunk = tls.recv(65536)
+            except (ssl.SSLError, OSError):
+                break
+            if chunk == b"":
+                break
+            body += chunk
+            if len(body) > 1 << 20:
+                break
+    return {
+        "status": status,
+        "headers": headers,
+        "body_hex": body.hex(),
+        "body_length": len(body),
+    }
+
+
+def scenario_m4b2_https_client(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Drive CONNECT + TLS + HTTP/1.1 through the fixed 127.0.0.1:18080 proxy.
+
+    ``--target`` is the CONNECT authority; ``--canary`` carries a JSON option
+    object (sni, alpn, requests, pipeline, raw_connect_hex, raw_tls_hex,
+    raw_request_hex).  All endpoints are fixture-controlled; the worker only
+    ever trusts /opt/agenticos/network-ca.pem.
+    """
+    started = utc_now_iso()
+    details: dict[str, Any] = {}
+    authority = args.target
+    try:
+        options = json.loads(args.canary) if args.canary else {}
+    except ValueError as exc:
+        return make_result(
+            scenario_id, authority, started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+        )
+    host = authority.rpartition(":")[0] if ":" in authority else authority
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", 18080), timeout=args.timeout
+        ) as stream:
+            stream.settimeout(args.timeout)
+            if "raw_connect_hex" in options:
+                connect_head = bytes.fromhex(options["raw_connect_hex"])
+            else:
+                connect_head = (
+                    f"CONNECT {authority} HTTP/1.1\r\n\r\n"
+                ).encode("ascii")
+            stream.sendall(connect_head)
+            reply = b""
+            while b"\r\n\r\n" not in reply and len(reply) <= 4096:
+                try:
+                    chunk = stream.recv(4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                reply += chunk
+            details["connect_reply"] = reply.decode("ascii", errors="replace")
+            if not reply.startswith(b"HTTP/1.1 200"):
+                return make_result(
+                    scenario_id, authority, started, succeeded=False,
+                    error_type="ConnectDenied", details=details,
+                )
+            if "raw_tls_hex" in options:
+                stream.sendall(bytes.fromhex(options["raw_tls_hex"]))
+                received = b""
+                try:
+                    while len(received) <= 65536:
+                        chunk = stream.recv(65536)
+                        if not chunk:
+                            break
+                        received += chunk
+                except OSError as exc:
+                    details["raw_read_error"] = type(exc).__name__
+                details["raw_received_length"] = len(received)
+                details["raw_received_hex"] = received[:256].hex()
+                return make_result(
+                    scenario_id, authority, started, succeeded=True,
+                    details=details,
+                )
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.load_verify_locations(cafile="/opt/agenticos/network-ca.pem")
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.check_hostname = True
+            context.set_alpn_protocols(options.get("alpn", ["http/1.1"]))
+            tls = context.wrap_socket(
+                stream, server_hostname=options.get("sni", host)
+            )
+            details["tls_version"] = tls.version()
+            details["alpn"] = tls.selected_alpn_protocol()
+            if "raw_request_hex" in options:
+                payloads = [bytes.fromhex(options["raw_request_hex"])]
+            else:
+                requests = options.get(
+                    "requests", [{"method": "GET", "path": "/"}]
+                )
+                payloads = []
+                for req in requests:
+                    body = req.get("body", "").encode("ascii")
+                    lines = [
+                        f"{req.get('method', 'GET')} {req.get('path', '/')} HTTP/1.1",
+                        f"Host: {req.get('host', host)}",
+                    ]
+                    if body or req.get("method") == "POST":
+                        lines.append(f"Content-Length: {len(body)}")
+                    for extra in req.get("extra_headers", []):
+                        lines.append(f"{extra[0]}: {extra[1]}")
+                    payloads.append(
+                        ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body
+                    )
+            pipeline = bool(options.get("pipeline"))
+            if pipeline:
+                tls.sendall(b"".join(payloads))
+            responses = []
+            for payload in payloads:
+                if not pipeline:
+                    tls.sendall(payload)
+                responses.append(
+                    _m4b2_read_http_response(tls, args.timeout)
+                )
+                if "error" in responses[-1]:
+                    break
+            details["responses"] = responses
+            details["requests_sent"] = len(payloads)
+            try:
+                tls.settimeout(1.0)
+                tls.unwrap()
+            except (ssl.SSLError, OSError):
+                pass
+            try:
+                tls.close()
+            except OSError:
+                pass
+            # Let the broker record the clean connection completion before
+            # this process exits (the broker is reaped at worker exit).
+            time.sleep(0.3)
+            post_sleep = float(options.get("post_sleep", 0.0))
+            if post_sleep > 0:
+                time.sleep(post_sleep)
+            succeeded = bool(responses) and all(
+                "status" in response for response in responses
+            )
+            return make_result(
+                scenario_id, authority, started, succeeded=succeeded,
+                details=details,
+            )
+    except Exception as exc:  # noqa: BLE001
+        return make_result(
+            scenario_id, authority, started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+            details=details,
+        )
+
+
 def _fd_is_open(fd: int) -> bool:
     try:
         os.fstat(fd)
@@ -1433,6 +1628,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "M4B-03": {"handler": scenario_m4b_descendant_authority,
                 "needs": ("target", "base"),
                 "description": "Probe fixed proxy/direct denial from a descendant shape."},
+    "M4B2-01": {"handler": scenario_m4b2_https_client,
+                "needs": ("target",),
+                "description": "Drive CONNECT+TLS+HTTP/1.1 through the fixed proxy."},
     "FS-16": {"handler": scenario_m4a_runtime_view, "needs": (),
                 "description": "Inspect the fixed M4A /workspace and runtime ABI."},
     "PROC-09": {"handler": scenario_m4a_security_state, "needs": (),
