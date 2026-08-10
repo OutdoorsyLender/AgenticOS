@@ -7,10 +7,13 @@ M4B-1 does not authorize Connected Build.
 
 ## P0 next
 
-1. **M4B-2 Connected Build policy** — unavailable until its pinned dependency
-   report and ECH gate pass, followed by separate architecture approval. Future
-   scope includes explicit destination allowlists, protocol/host/port approval,
-   DNS/IP policy, TLS verification, redirects, and auditable package access.
+1. **M4B-2 Connected Build policy** — the narrow task-scoped HTTPS broker
+   policy has landed ([phase-zero/https-broker-policy.md](phase-zero/https-broker-policy.md)):
+   one approved exact hostname per task on the qualified host, with an
+   authenticated startup probe gating broker readiness. It deliberately earns
+   NO Connected Build claim; build-ecosystem qualification (package managers,
+   registries, provider endpoints) remains M4B-3 scope, pending separate
+   architecture approval.
 2. **Git worktree manager** — identity-bound assignment, lifecycle, cleanup,
    and the `/workspace` mapping contract.
 3. **Provider adapters** — Codex, Claude, Kimi ACP, then Antigravity in a

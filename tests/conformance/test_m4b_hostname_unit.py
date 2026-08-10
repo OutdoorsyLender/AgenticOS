@@ -38,6 +38,7 @@ from agenticos.sandbox.network_https import (
 APPROVED = "example.com"
 NONCE = "a" * 32
 CA_DIGEST = "b" * 64
+OPENSSL_IDENTITY = "OpenSSL 3.5.5 27 Jan 2026"
 TASK_ID = "task-0001"
 
 # monotonic window in which the standard grant is active
@@ -72,6 +73,7 @@ def _policy(grants=(_grant(),), **kw) -> NetworkPolicy:
         task_generation=1,
         launch_nonce=NONCE,
         task_ca_certificate_digest=CA_DIGEST,
+        openssl_runtime_identity=OPENSSL_IDENTITY,
         grants=tuple(grants),
     )
     fields.update(kw)
@@ -292,7 +294,10 @@ def test_policy_digest_is_grant_order_independent():
 
 def test_policy_digest_is_compact_sorted_ascii_json():
     payload = canonical_network_policy_bytes(_policy())
-    assert b" " not in payload
+    # Compact separators: no whitespace after "," or ":" — field VALUES such
+    # as the OpenSSL identity legitimately contain spaces.
+    assert b'", "' not in payload
+    assert b'": ' not in payload
     assert payload.isascii()
     assert b'"task_ca_certificate_digest":"' + CA_DIGEST.encode() + b'"' in payload
 

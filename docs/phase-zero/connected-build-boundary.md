@@ -15,8 +15,10 @@ scope is stopped and confirmed inactive.
 This is M4B-1 capability-transport evidence. It earns **no Connected Build
 claim**. No DNS, hostname/IP policy, HTTP CONNECT, TLS, certificate validation,
 redirect handling, package-manager qualification, public download, or provider
-access is implemented. M4B-2 is unavailable until its dependency and ECH gate
-passes and is separately approved.
+access is implemented here. M4B-2's task-scoped HTTPS broker policy is a
+separate, narrow milestone documented in
+[https-broker-policy.md](https-broker-policy.md); it still earns no Connected
+Build claim.
 
 ## Recorded host and transport
 
@@ -162,9 +164,10 @@ domain-separated digests plus exact equality/membership booleans.
   managers, Git smart-HTTPS, DNS, TLS, ECH, redirects, and content provenance
   remain out of scope.
 
-M4B-2 remains unavailable. Before implementation it requires an approved,
-pinned dependency report and an ECH policy gate capable of proving that the
-authorized authority remains observable and enforceable. Only a separately
-reviewed later milestone may earn a Connected Build claim.
+M4B-2's pinned dependency report and ECH policy gate have passed review, and
+its narrow task-scoped HTTPS broker policy is documented in
+[https-broker-policy.md](https-broker-policy.md). That milestone deliberately
+earns no Connected Build claim either; only a separately reviewed later
+milestone (M4B-3) may earn one.
 
 Models reason. AgenticOS guarantees.

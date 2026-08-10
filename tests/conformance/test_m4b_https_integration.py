@@ -347,6 +347,7 @@ def test_tampered_network_policy_hostname_fails_closed_before_exec(
                 task_generation=policy.task_generation,
                 launch_nonce=policy.launch_nonce,
                 task_ca_certificate_digest=material.binding.ca_cert_sha256,
+                openssl_runtime_identity=ssl.OPENSSL_VERSION,
                 grants=(_grant_for(hostname),),
             )
 
@@ -882,4 +883,116 @@ def test_https_expiry_tears_down_connections(m4b2_runner_factory, tmp_path):
             env={},
         )
     origin.close()
+    _assert_no_m4b_residue(runner)
+
+
+# -- Slice 9c: startup probe gating readiness -----------------------------------------
+
+
+def test_startup_probe_passes_in_real_launch(m4b2_runner_factory):
+    runner = m4b2_runner_factory()
+    process = runner.run(["/usr/bin/true"], cwd="/workspace", env={})
+    assert process.exit_code == 0, process.stderr
+    # Readiness was achieved, which now PROVES the broker's fail-closed
+    # startup probe passed: the sealed NetworkPolicy carried the host
+    # manifest's OpenSSL identity and the broker verified it against its
+    # own runtime before emitting its ready record.
+    assert (
+        runner.last_https_network_policy.openssl_runtime_identity
+        == ssl.OPENSSL_VERSION
+    )
+    _assert_no_m4b_residue(runner)
+
+
+def test_tampered_openssl_identity_fails_closed_before_exec(
+    m4b2_runner_factory,
+):
+    runner = m4b2_runner_factory()
+    policy = runner.transport_policy
+    material = generate_task_material(
+        task_id=policy.task_id,
+        task_generation=policy.task_generation,
+        launch_nonce=policy.launch_nonce,
+        hostname=APPROVED_HOSTNAME,
+        policy_digest=policy_digest(policy),
+    )
+    sealed_fd = None
+    try:
+        # The SEALED NetworkPolicy commits a well-formed but WRONG expected
+        # OpenSSL identity.  Controller-side assembly checks (task context,
+        # grant, CA commit) all pass; the broker's startup probe — comparing
+        # the sealed expectation against its OWN ssl.OPENSSL_VERSION — is
+        # what must fail closed before readiness (and before hostile exec).
+        now_wall = time.time_ns()
+        tampered_policy = NetworkPolicy(
+            version="AOSHTTPS/1",
+            task_id=policy.task_id,
+            task_generation=policy.task_generation,
+            launch_nonce=policy.launch_nonce,
+            task_ca_certificate_digest=material.binding.ca_cert_sha256,
+            openssl_runtime_identity="OpenSSL 9.9.9 tampered",
+            grants=(
+                NetworkGrant(
+                    grant_id="g-tampered",
+                    hostname=APPROVED_HOSTNAME,
+                    purpose=GrantPurpose.GENERAL_DOWNLOAD,
+                    approval_source="m4b2-integration",
+                    approval_reference="slice-9c",
+                    granted_at_wall_ns=now_wall,
+                    expires_at_wall_ns=now_wall + 3_600_000_000_000,
+                    activated_at_monotonic_ns=policy.activated_at_monotonic_ns,
+                    expires_at_monotonic_ns=policy.expires_at_monotonic_ns,
+                    connection_limit=1,
+                    byte_limit=64 * 1024,
+                ),
+            ),
+        )
+        sealed_fd = create_sealed_network_policy_fd(tampered_policy)
+        worker_ca_dir, worker_ca_path = runner_module._stage_worker_ca_pem(material)
+        # The material was built OUTSIDE the fixed-fd window; pin every
+        # descriptor above the window's range before the launch vacates them.
+        import fcntl as _fcntl
+
+        for _name in ("ca_cert_fd", "leaf_cert_fd", "leaf_key_fd", "binding_fd"):
+            _fd = getattr(material, _name)
+            _pinned = _fcntl.fcntl(_fd, _fcntl.F_DUPFD_CLOEXEC, 300)
+            os.close(_fd)
+            setattr(material, _name, _pinned)
+        _pinned_policy = _fcntl.fcntl(sealed_fd, _fcntl.F_DUPFD_CLOEXEC, 300)
+        os.close(sealed_fd)
+        sealed_fd = _pinned_policy
+        prepared = runner_module._PreparedHttpsMaterial(
+            network_policy=tampered_policy,
+            sealed_network_policy_fd=sealed_fd,
+            material=material,
+            worker_ca_path=worker_ca_path,
+            worker_ca_dir=worker_ca_dir,
+        )
+        sealed_fd = None
+        try:
+            with pytest.raises(
+                runner_module.CapabilityTransportError
+            ) as excinfo:
+                runner.run(
+                    ["/usr/bin/true"],
+                    cwd="/workspace",
+                    env={},
+                    _prepared_material=prepared,
+                )
+        finally:
+            import shutil
+
+            shutil.rmtree(worker_ca_dir, ignore_errors=True)
+    finally:
+        if sealed_fd is not None:
+            os.close(sealed_fd)
+        material.close()
+    # The launch died AT the readiness gate: the broker's startup probe
+    # rejected the sealed OpenSSL identity and exited without a ready record,
+    # so the readiness channel closed before any record arrived.
+    assert "readiness" in str(excinfo.value), excinfo.value
+    # The probe failure denied readiness, so the final exec gate was never
+    # released: no hostile exec happened.
+    outcome = runner.last_launch_outcome
+    assert outcome is not None and outcome["exec_succeeded"] is False, outcome
     _assert_no_m4b_residue(runner)

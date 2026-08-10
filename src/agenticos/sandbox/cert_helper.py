@@ -347,17 +347,21 @@ def verify_task_material(
     task_id: str,
     task_generation: int,
     launch_nonce: str,
-    hostname: str,
+    hostname: str | None,
     policy_digest: str,
 ) -> VerifiedTaskMaterial:
     """Fail closed unless the sealed fds carry material for exactly this task.
 
     Rejects stale or mismatched material: wrong task, generation, nonce,
     hostname, or policy digest, and any payload whose digest diverges from the
-    sealed binding record.
+    sealed binding record.  ``hostname=None`` is the zero-grant deny-all
+    posture: the binding's own committed hostname is adopted after the task
+    context and payload digests authenticate, because no connection can ever
+    be authorized against an empty grant set.
     """
     _require_task_context(task_id, task_generation, launch_nonce, policy_digest)
-    _require_hostname(hostname)
+    if hostname is not None:
+        _require_hostname(hostname)
     ca_cert_pem = _read_sealed_fd_payload(ca_cert_fd, "ca certificate", _MAX_CERT_BYTES)
     leaf_cert_pem = _read_sealed_fd_payload(
         leaf_cert_fd, "leaf certificate", _MAX_CERT_BYTES
@@ -373,7 +377,7 @@ def verify_task_material(
         binding.task_id != task_id
         or binding.task_generation != task_generation
         or binding.launch_nonce != launch_nonce
-        or binding.hostname != hostname
+        or (hostname is not None and binding.hostname != hostname)
         or binding.policy_digest != policy_digest
     ):
         raise CertHelperError("certificate material context did not authenticate")
@@ -483,7 +487,7 @@ def load_leaf_ssl_context(
     task_id: str,
     task_generation: int,
     launch_nonce: str,
-    hostname: str,
+    hostname: str | None,
     policy_digest: str,
 ) -> ssl.SSLContext:
     """Build a server SSLContext from the sealed FDs, retaining none of them.
@@ -492,7 +496,9 @@ def load_leaf_ssl_context(
     from short-lived CLOEXEC duplicates; ``load_cert_chain`` itself fails
     unless the leaf private key corresponds to the leaf certificate public
     key. A self-audit handshake then proves the leaf chains to the sealed
-    task CA and that its SAN set is exactly the approved hostname. Once this
+    task CA and that its SAN set is exactly the approved hostname (with
+    ``hostname=None`` — the zero-grant deny-all posture — the sealed
+    binding's committed hostname is the audit expectation). Once this
     function returns, the caller may close every source fd; the context
     holds the material in OpenSSL memory only.
     """
@@ -527,7 +533,11 @@ def load_leaf_ssl_context(
         os.close(cert_duplicate)
         if key_duplicate is not None:
             os.close(key_duplicate)
-    _audit_handshake(context, verified.ca_cert_pem, hostname)
+    _audit_handshake(
+        context,
+        verified.ca_cert_pem,
+        hostname if hostname is not None else verified.binding.hostname,
+    )
     return context
 
 

@@ -65,6 +65,7 @@ _MAX_UNSIGNED_64 = (1 << 64) - 1
 _MAX_HOSTNAME_OCTETS = 253
 _MAX_LABEL_OCTETS = 63
 _MAX_APPROVAL_TEXT = 256
+_MAX_OPENSSL_IDENTITY = 128
 _TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _LOWER_HEX_32_RE = re.compile(r"[0-9a-f]{32}\Z")
 _LOWER_HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -368,8 +369,13 @@ class NetworkPolicy:
 
     ``task_ca_certificate_digest`` is the SHA-256 of the exact per-task CA
     certificate from the cert_helper binding (``CertBinding.ca_cert_sha256``),
-    so the policy commits to the exact CA.  Grants serialize sorted by
-    (hostname, grant_id), so the digest is independent of input order.
+    so the policy commits to the exact CA.  ``openssl_runtime_identity`` is
+    the expected ``ssl.OPENSSL_VERSION`` string from the host qualification
+    manifest the controller gated on at launch; sealed with the policy, it
+    gives the broker an AUTHENTICATED expected value for its own independent
+    startup-probe comparison (the broker never trusts an argv string).
+    Grants serialize sorted by (hostname, grant_id), so the digest is
+    independent of input order.
     """
 
     version: str
@@ -377,6 +383,7 @@ class NetworkPolicy:
     task_generation: int
     launch_nonce: str
     task_ca_certificate_digest: str
+    openssl_runtime_identity: str
     grants: tuple
 
     def __post_init__(self) -> None:
@@ -391,6 +398,18 @@ class NetworkPolicy:
             raise ValueError(
                 "task_ca_certificate_digest must be exactly 64 lowercase "
                 "hexadecimal characters"
+            )
+        if (
+            type(self.openssl_runtime_identity) is not str
+            or not 0 < len(self.openssl_runtime_identity) <= _MAX_OPENSSL_IDENTITY
+            or not self.openssl_runtime_identity.isascii()
+            or any(
+                ord(c) < 0x20 or ord(c) > 0x7E
+                for c in self.openssl_runtime_identity
+            )
+        ):
+            raise ValueError(
+                "openssl_runtime_identity must be bounded visible ASCII"
             )
         grants = tuple(self.grants)
         if len(grants) > _MAX_GRANTS:
@@ -414,6 +433,7 @@ def canonical_network_policy_bytes(policy: NetworkPolicy) -> bytes:
         "task_generation": policy.task_generation,
         "launch_nonce": policy.launch_nonce,
         "task_ca_certificate_digest": policy.task_ca_certificate_digest,
+        "openssl_runtime_identity": policy.openssl_runtime_identity,
         "grants": [
             grant._canonical_fields()
             for grant in sorted(policy.grants, key=lambda g: (g.hostname, g.grant_id))
@@ -661,6 +681,7 @@ def _network_policy_from_bytes(payload: bytes) -> NetworkPolicy:
         "task_generation",
         "launch_nonce",
         "task_ca_certificate_digest",
+        "openssl_runtime_identity",
         "grants",
     }:
         raise NetworkPolicySealError(
@@ -731,6 +752,7 @@ def _network_policy_from_bytes(payload: bytes) -> NetworkPolicy:
             task_generation=decoded["task_generation"],
             launch_nonce=decoded["launch_nonce"],
             task_ca_certificate_digest=decoded["task_ca_certificate_digest"],
+            openssl_runtime_identity=decoded["openssl_runtime_identity"],
             grants=tuple(grants),
         )
     except NetworkPolicySealError:

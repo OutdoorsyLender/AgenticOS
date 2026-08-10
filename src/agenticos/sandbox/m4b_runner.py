@@ -336,9 +336,15 @@ def _load_recorded_host_manifest(state_dir: Path) -> Mapping[str, object]:
     return document["manifest"]
 
 
-def verify_https_host(state_dir: Path) -> None:
-    """Fail closed unless the live host matches the recorded manifest."""
-    verify_current_host(_load_recorded_host_manifest(state_dir))
+def verify_https_host(state_dir: Path) -> Mapping[str, object]:
+    """Fail closed unless the live host matches the recorded manifest.
+
+    Returns the verified manifest (live state, proven equal to the record)
+    so callers can commit its pinned values into task-scoped authority —
+    e.g. the OpenSSL runtime identity the broker's startup probe must
+    independently verify.
+    """
+    return verify_current_host(_load_recorded_host_manifest(state_dir))
 
 
 class CapabilityTransportError(RuntimeError):
@@ -3729,7 +3735,14 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
 
     def _assemble_https_material(self) -> _PreparedHttpsMaterial:
         """Host-gate, run the helper to EXIT, and seal the NetworkPolicy."""
-        verify_https_host(self._host_state_dir)
+        verified_manifest = verify_https_host(self._host_state_dir)
+        # Commit the host manifest's pinned OpenSSL runtime identity into the
+        # sealed NetworkPolicy: the broker's startup probe compares it
+        # against its OWN ssl.OPENSSL_VERSION — an authenticated expectation
+        # delivered over the sealed channel, never an argv string.
+        openssl_identity = verified_manifest["components"]["python_ssl"][
+            "upstream_version"
+        ]
         policy = self.transport_policy
         material = generate_task_material(
             task_id=policy.task_id,
@@ -3767,6 +3780,7 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
                 task_generation=policy.task_generation,
                 launch_nonce=policy.launch_nonce,
                 task_ca_certificate_digest=material.binding.ca_cert_sha256,
+                openssl_runtime_identity=openssl_identity,
                 grants=(grant,),
             )
             sealed_fd = create_sealed_network_policy_fd(network_policy)

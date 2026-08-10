@@ -191,6 +191,22 @@ read-only: no system modification, no package installation, no network
 mutation (the curl ECH probe targets `127.0.0.1:1` and is refused during
 option parsing; the resolver probe uses only the local `localhost.` name).
 
+**Launch-time gating and the broker startup probe.** The recorded manifest is
+not trusted once and forgotten: `qualify_host_for_https(state_dir)` writes the
+recorded record, and EVERY HTTPS-flavor launch re-runs
+`verify_https_host(state_dir)`, which recomputes the live manifest and fails
+closed on any divergence before the cert helper is spawned. The verified
+manifest's pinned OpenSSL runtime identity
+(`components.python_ssl.upstream_version`) is then committed into the sealed
+`AOSHTTPS/1` NetworkPolicy, so the broker independently re-verifies it against
+its own `ssl.OPENSSL_VERSION` inside its fail-closed startup probe (gate
+self-test, OP_NO_RENEGOTIATION, ALPN behavior, and a repeat of the libssl
+ECH-machinery-absence probe in the broker process) AFTER material adoption
+and BEFORE emitting readiness. A host that diverged between qualification and
+launch, or a broker process whose runtime does not match the pinned identity,
+fails the launch closed before hostile exec. See
+[https-broker-policy.md](https-broker-policy.md).
+
 ## 11. M4B-2 frozen IANA special-address registry provenance
 
 Slice 7 (`agenticos.sandbox.special_addresses`) freezes an explicit,

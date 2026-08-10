@@ -3187,14 +3187,25 @@ class _HttpsServeState:
         self.policy = policy
         self.https_state = https_state
         self.network_policy = https_state.network_policy
-        self.grant = self.network_policy.grants[0]
-        self.approved_hostname = self.grant.hostname
+        # Zero grants is the deny-all posture: no approved hostname exists,
+        # authority comes from the transport policy alone, and every CONNECT
+        # is denied by authorize_grant before any trust stage is reached.
+        self.grant = (
+            self.network_policy.grants[0] if self.network_policy.grants else None
+        )
+        self.approved_hostname = (
+            self.grant.hostname if self.grant is not None else None
+        )
         self.control_fd = control_fd
-        self.connection_limit = min(
-            policy.connection_limit, self.grant.connection_limit
+        self.connection_limit = (
+            min(policy.connection_limit, self.grant.connection_limit)
+            if self.grant is not None
+            else policy.connection_limit
         )
         self.accountant = _HttpsByteAccountant(
             min(policy.byte_limit, self.grant.byte_limit)
+            if self.grant is not None
+            else policy.byte_limit
         )
         self.guard = BoundedGateGuard()
         self.tls_configure_lock = threading.Lock()
@@ -3672,17 +3683,22 @@ def _serve_https_connection(
 
         total = counters["worker_to_origin"] + counters["origin_to_worker"]
         accounted = counters["read_from_worker"] + counters["read_from_origin"]
-        chain = verify_identity_chain(
-            serve.grant,
-            connect_authority=connect_authority,
-            worker_sni=worker_sni_raw,
-            http_host=http_host,
-            origin_tls_name=origin_tls_name,
-            evidence_name=serve.approved_hostname,
-        )
-        identity = chain.code.value
-        if not chain.verified and chain.stage is not None:
-            identity = f"{chain.code.value}:{chain.stage.value}"
+        if serve.grant is None:
+            # Deny-all posture: no grant exists to verify an identity chain
+            # against; every connection was denied before any trust stage.
+            identity = "no_grant"
+        else:
+            chain = verify_identity_chain(
+                serve.grant,
+                connect_authority=connect_authority,
+                worker_sni=worker_sni_raw,
+                http_host=http_host,
+                origin_tls_name=origin_tls_name,
+                evidence_name=serve.approved_hostname,
+            )
+            identity = chain.code.value
+            if not chain.verified and chain.stage is not None:
+                identity = f"{chain.code.value}:{chain.stage.value}"
         record = HttpsConnectionRecord(
             version=HTTPS_EVIDENCE_VERSION,
             event=HTTPS_CONNECTION_EVENT,
@@ -4102,8 +4118,8 @@ def serve_https_transport(
             raise BrokerBoundaryError("https material state has the wrong type")
         if policy.mode is not TransportMode.DENY:
             raise BrokerBoundaryError("https serve requires a DENY transport policy")
-        if len(https_state.network_policy.grants) != 1:
-            raise BrokerBoundaryError("https serve requires exactly one grant")
+        if len(https_state.network_policy.grants) > 1:
+            raise BrokerBoundaryError("https serve permits at most one grant")
         now = time.monotonic_ns()
         if now < policy.activated_at_monotonic_ns:
             raise BrokerBoundaryError("transport policy is not active")
@@ -4213,6 +4229,68 @@ class _HttpsMaterialState:
     network_policy_digest: str
     binding: Any
     server_context: Any
+    network_policy_seals: int = 0
+    material_seals_verified: bool = False
+    leaf_self_audit_passed: bool = False
+
+
+def _run_https_startup_probe(https_state: _HttpsMaterialState) -> None:
+    """Fail-closed security startup probe for the HTTPS-flavor broker.
+
+    Runs AFTER sealed-material adoption and BEFORE the ready record is
+    emitted.  Any failure raises :class:`BrokerBoundaryError`, so the broker
+    exits non-zero WITHOUT readiness and the controller's liveness/ordering
+    gates fail the launch closed before hostile exec.
+
+    Legs (all TLS posture lives in :mod:`agenticos.sandbox.network_tls`;
+    this module keeps its no-ssl-import boundary):
+
+    1. ClientHello gate self-test, OpenSSL identity, OP_NO_RENEGOTIATION
+       settable, host behavior probes, and libssl ECH-machinery absence —
+       delegated to ``network_tls.run_tls_startup_self_test`` (never
+       duplicated here).  The expected OpenSSL identity is the value SEALED
+       into the NetworkPolicy by the controller from the host qualification
+       manifest it gated on — an authenticated channel, not an argv string.
+    2. Worker context posture — delegated to
+       ``network_tls.run_worker_context_startup_probe``: the adopted context
+       hardens (fresh exact-hostname SNI policy, TLS>=1.2),
+       OP_NO_RENEGOTIATION is in its effective options, and its ALPN
+       behavior is exactly http/1.1 (a real handshake offering http/1.1
+       selects it; an h2-only offer selects nothing).
+    3. Adoption proofs held in the material state: the leaf loading
+       self-audit ran, every material source passed the functional
+       sealed-memfd check, and the recorded network-policy seals are complete.
+    """
+    from . import network_tls as ntls
+
+    if type(https_state) is not _HttpsMaterialState:
+        raise BrokerBoundaryError("https startup probe requires adopted material")
+    network_policy = https_state.network_policy
+    if https_state.binding is None:
+        raise BrokerBoundaryError("https startup probe requires a verified binding")
+    try:
+        ntls.run_tls_startup_self_test(
+            recorded_openssl_version=network_policy.openssl_runtime_identity
+        )
+        ntls.run_worker_context_startup_probe(
+            https_state.server_context, https_state.binding.hostname
+        )
+    except ntls.StartupSelfTestError as exc:
+        raise BrokerBoundaryError("https startup probe self-test failed") from exc
+
+    if not https_state.leaf_self_audit_passed:
+        raise BrokerBoundaryError("leaf loading self-audit did not run at adoption")
+    if not https_state.material_seals_verified:
+        raise BrokerBoundaryError(
+            "material sealed-memfd functional check did not run at adoption"
+        )
+    required = (
+        fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    )
+    if https_state.network_policy_seals & required != required:
+        raise BrokerBoundaryError(
+            "recorded network policy seals are incomplete at probe time"
+        )
 
 
 def _adopt_https_material(
@@ -4223,9 +4301,12 @@ def _adopt_https_material(
     Fail closed anywhere: a stale or mismatched sealed NetworkPolicy, a
     binding that disagrees with the transport authority, or a leaf that does
     not authenticate under the sealed task CA means no readiness record is
-    ever emitted.  On success every material source descriptor is closed and
-    PROVEN closed (EBADF), so the post-readiness descriptor census contains
-    no certificate, key, or policy source.
+    ever emitted.  Before closure every material source descriptor must also
+    pass the FUNCTIONAL sealed-memfd check (verify_memfd_sealed: all four
+    immutable seals present and writes denied).  On success every material
+    source descriptor is closed and PROVEN closed (EBADF), so the
+    post-readiness descriptor census contains no certificate, key, or
+    policy source.
     """
     if type(contract) is not BrokerContract or contract.https is None:
         raise BrokerBoundaryError("https material adoption requires the https contract")
@@ -4259,11 +4340,16 @@ def _adopt_https_material(
         raise BrokerBoundaryError(
             "network policy task context does not match transport authority"
         )
-    if len(network_policy.grants) != 1:
+    if len(network_policy.grants) > 1:
         raise BrokerBoundaryError(
-            "https flavor requires exactly one network grant"
+            "https flavor permits at most one network grant"
         )
-    hostname = network_policy.grants[0].hostname
+    # Zero grants is the deny-all posture: adoption still authenticates the
+    # sealed material (the binding's own committed hostname is adopted), the
+    # broker becomes ready, and every CONNECT is denied by authorize_grant.
+    hostname = (
+        network_policy.grants[0].hostname if network_policy.grants else None
+    )
     try:
         verified = verify_task_material(
             ca_cert_fd=https.ca_cert_fd,
@@ -4298,6 +4384,20 @@ def _adopt_https_material(
         )
     except CertHelperError as exc:
         raise BrokerBoundaryError("leaf TLS context could not be loaded") from exc
+    # Functional sealed-memfd check on every adopted source descriptor
+    # BEFORE closure: all four immutable seals present AND writes denied
+    # (the structural seal-bit verification already ran inside
+    # read_sealed_network_policy_fd / verify_task_material; this proves the
+    # kernel actually enforces them on these objects).
+    from .host_qualification import HostQualificationError, verify_memfd_sealed
+
+    for fd in https.material_fds:
+        try:
+            verify_memfd_sealed(fd)
+        except HostQualificationError as exc:
+            raise BrokerBoundaryError(
+                "https material object failed the functional seal check"
+            ) from exc
     for fd in https.material_fds:
         os.close(fd)
     for fd in https.material_fds:
@@ -4315,6 +4415,9 @@ def _adopt_https_material(
         network_policy_digest=net_sealed.digest,
         binding=verified.binding,
         server_context=context,
+        network_policy_seals=net_sealed.seals,
+        material_seals_verified=True,
+        leaf_self_audit_passed=True,
     )
 
 
@@ -4335,6 +4438,11 @@ def broker_main(contract: BrokerContract) -> NoReturn:
             https_state = _adopt_https_material(contract, sealed)
             for fd in contract.https.material_fds:
                 owned.discard(fd)
+            # Fail-closed security startup probe: after adoption, before any
+            # readiness signal.  A failure here raises BrokerBoundaryError,
+            # so no ready record is ever emitted and the controller fails
+            # the launch closed before hostile exec.
+            _run_https_startup_probe(https_state)
         _validate_policy_contract(sealed.policy, contract)
         observation = assert_minimal_process_boundary(contract, sealed.policy)
 

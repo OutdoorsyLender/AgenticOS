@@ -108,6 +108,7 @@ def _network_policy(policy, hostname, ca_digest, **changes):
         "task_generation": policy.task_generation,
         "launch_nonce": policy.launch_nonce,
         "task_ca_certificate_digest": ca_digest,
+        "openssl_runtime_identity": ssl.OPENSSL_VERSION,
         "grants": (_grant(hostname, policy),),
     }
     values.update(changes)
@@ -937,6 +938,7 @@ def _serve_network_policy(
         task_generation=policy.task_generation,
         launch_nonce=policy.launch_nonce,
         task_ca_certificate_digest="ab" * 32,
+        openssl_runtime_identity=ssl.OPENSSL_VERSION,
         grants=(grant,),
     )
 
@@ -2016,6 +2018,8 @@ def test_https_fixture_control_message_arming_and_validation(
         {"version": "AOSHTTPSFIX/1", "ca_certs_pem": "x", "addresses": []},
         {"version": "AOSHTTPSFIX/1", "ca_certs_pem": "x",
          "addresses": ["999.1.1.1"]},
+        {"version": "AOSHTTPSFIX/1", "ca_certs_pem": "x" * 8193,
+         "addresses": ["93.184.216.34"]},
         {"version": "AOSHTTPSFIX/1", "ca_certs_pem": "x",
          "addresses": ["93.184.216.34"], "extra": 1},
     ],
@@ -2211,3 +2215,364 @@ def test_https_evidence_reader_rejects_record_after_terminal(tmp_path):
         )
     control_broker.close()
     control_peer.close()
+
+
+# -- Slice 9c: fail-closed startup probe -------------------------------------------
+
+import dataclasses
+
+
+def test_startup_probe_passes_on_adopted_material(tmp_path):
+    policy, material, network_policy, contract, installed = _adoption_fixture(
+        tmp_path
+    )
+    try:
+        sealed = read_sealed_policy_fd(30)
+        state = broker._adopt_https_material(contract, sealed)
+        assert state.material_seals_verified
+        assert state.leaf_self_audit_passed
+        required = (
+            fcntl.F_SEAL_WRITE
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_SEAL
+        )
+        assert state.network_policy_seals & required == required
+        # The full probe — gate self-test, sealed OpenSSL identity, hardened
+        # worker context, functional ALPN legs, adoption proofs — passes.
+        broker._run_https_startup_probe(state)
+    finally:
+        _cleanup_installed(installed)
+
+
+def test_startup_probe_rejects_tampered_openssl_identity(tmp_path):
+    # The sealed NetworkPolicy carries a well-formed but WRONG expected
+    # OpenSSL identity: the broker's independent comparison against its own
+    # ssl.OPENSSL_VERSION must fail closed.
+    policy, material, network_policy, contract, installed = _adoption_fixture(
+        tmp_path,
+        network_policy_changes={
+            "openssl_runtime_identity": "OpenSSL 9.9.9 tampered"
+        },
+    )
+    try:
+        sealed = read_sealed_policy_fd(30)
+        state = broker._adopt_https_material(contract, sealed)
+        with pytest.raises(broker.BrokerBoundaryError, match="self-test"):
+            broker._run_https_startup_probe(state)
+    finally:
+        _cleanup_installed(installed)
+
+
+def test_startup_probe_fails_closed_when_self_test_fails(tmp_path, monkeypatch):
+    policy, material, network_policy, contract, installed = _adoption_fixture(
+        tmp_path
+    )
+    try:
+        sealed = read_sealed_policy_fd(30)
+        state = broker._adopt_https_material(contract, sealed)
+
+        def _boom(**_kwargs):
+            raise tls_module.StartupSelfTestError("injected self-test failure")
+
+        monkeypatch.setattr(
+            tls_module, "run_tls_startup_self_test", _boom
+        )
+        with pytest.raises(broker.BrokerBoundaryError, match="self-test"):
+            broker._run_https_startup_probe(state)
+    finally:
+        _cleanup_installed(installed)
+
+
+def test_startup_probe_requires_binding_and_adoption_proofs(tmp_path):
+    policy, material, network_policy, contract, installed = _adoption_fixture(
+        tmp_path
+    )
+    try:
+        sealed = read_sealed_policy_fd(30)
+        state = broker._adopt_https_material(contract, sealed)
+        with pytest.raises(broker.BrokerBoundaryError, match="binding"):
+            broker._run_https_startup_probe(
+                dataclasses.replace(state, binding=None)
+            )
+        with pytest.raises(broker.BrokerBoundaryError, match="self-audit"):
+            broker._run_https_startup_probe(
+                dataclasses.replace(state, leaf_self_audit_passed=False)
+            )
+        with pytest.raises(
+            broker.BrokerBoundaryError, match="functional check"
+        ):
+            broker._run_https_startup_probe(
+                dataclasses.replace(state, material_seals_verified=False)
+            )
+        with pytest.raises(broker.BrokerBoundaryError, match="seals"):
+            broker._run_https_startup_probe(
+                dataclasses.replace(state, network_policy_seals=0)
+            )
+    finally:
+        _cleanup_installed(installed)
+
+
+# -- Slice 9c: zero-grant deny-all posture -----------------------------------------
+
+
+def _zero_grant_network_policy(policy):
+    base = _serve_network_policy(policy)
+    return NetworkPolicy(
+        version="AOSHTTPS/1",
+        task_id=policy.task_id,
+        task_generation=policy.task_generation,
+        launch_nonce=policy.launch_nonce,
+        task_ca_certificate_digest=base.task_ca_certificate_digest,
+        openssl_runtime_identity=base.openssl_runtime_identity,
+        grants=(),
+    )
+
+
+def test_broker_adopts_zero_grant_policy_as_deny_all(tmp_path):
+    policy, material, network_policy, contract, installed = _adoption_fixture(
+        tmp_path, network_policy_changes={"grants": ()}
+    )
+    try:
+        sealed = read_sealed_policy_fd(30)
+        state = broker._adopt_https_material(contract, sealed)
+        assert state.network_policy.grants == ()
+        # With no grant to commit a hostname, the sealed binding's own
+        # committed hostname is adopted after task-context authentication.
+        assert state.binding.hostname == "cdn.example.com"
+        assert state.material_seals_verified
+        # The startup probe also holds in the deny-all posture.
+        broker._run_https_startup_probe(state)
+        for fd in (36, 37, 38, 39, 43):
+            assert _fd_closed(fd)
+    finally:
+        _cleanup_installed(installed)
+
+
+def test_serve_zero_grants_denies_every_connect(tmp_path, serve_leaf_material):
+    policy = _serve_policy()
+    network_policy = _zero_grant_network_policy(policy)
+    https_state = _serve_https_state(
+        network_policy, serve_leaf_material["context"]
+    )
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    serve = broker._HttpsServeState(policy, https_state, control_broker.fileno())
+    assert serve.grant is None
+    assert serve.approved_hostname is None
+    worker_broker, worker_client = socket.socketpair()
+    runtime = broker._HttpsConnectionRuntime(worker_broker)
+    serve.runtimes.append(runtime)
+    thread = threading.Thread(
+        target=broker._serve_https_connection,
+        args=(serve, runtime, 1),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        reply = _worker_connect(worker_client)
+        assert reply.startswith(b"HTTP/1.1 403")
+        thread.join(15.0)
+        assert not thread.is_alive(), "deny-all connection thread stuck"
+        assert not serve.thread_errors
+        control_peer.settimeout(5.0)
+        record = broker.HttpsConnectionRecord.from_bytes(
+            control_peer.recv(broker.MAX_HTTPS_EVIDENCE_BYTES + 1)
+        )
+        assert record.stage_reached is broker.HttpsConnectionStage.AUTHORIZATION
+        assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+        assert record.detail == "authorization_no_match"
+        assert record.identity_chain == "no_grant"
+        assert record.approved_hostname is None
+        assert record.requests_completed == 0
+    finally:
+        runtime.abort()
+        worker_client.close()
+        control_peer.close()
+        control_broker.close()
+
+
+# -- Slice 9c: lifecycle gaps --------------------------------------------------------
+
+
+def test_https_fixture_rejected_after_first_connection(
+    tmp_path, serve_leaf_material
+):
+    serve, control_broker, control_peer = _fixture_control_serve(
+        tmp_path, serve_leaf_material
+    )
+    # A connection was already accepted: a fixture message arriving now is
+    # LATE and must be refused as malformed control.
+    serve.connections_accepted = 1
+    pems = _origin_pems()
+    good_fd, keep = socket.socketpair()
+    payload = broker.CONTROL_HTTPS_FIXTURE + json.dumps(
+        {
+            "version": broker.HTTPS_FIXTURE_VERSION,
+            "ca_certs_pem": pems["ca"].decode("ascii"),
+            "addresses": ["93.184.216.34"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    _send_fixture_message(control_peer, payload, fds=(good_fd.fileno(),))
+    assert broker._read_https_control(control_broker, serve) is (
+        broker.TransportTermination.MALFORMED_CONTROL
+    )
+    assert serve.fixture is None
+    keep.close()
+    good_fd.close()
+    control_broker.close()
+    control_peer.close()
+
+
+def test_https_fixture_rejects_multi_fd_message(tmp_path, serve_leaf_material):
+    serve, control_broker, control_peer = _fixture_control_serve(
+        tmp_path, serve_leaf_material
+    )
+    pems = _origin_pems()
+    first, keep_first = socket.socketpair()
+    second, keep_second = socket.socketpair()
+    payload = broker.CONTROL_HTTPS_FIXTURE + json.dumps(
+        {
+            "version": broker.HTTPS_FIXTURE_VERSION,
+            "ca_certs_pem": pems["ca"].decode("ascii"),
+            "addresses": ["93.184.216.34"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    _send_fixture_message(
+        control_peer, payload, fds=(first.fileno(), second.fileno())
+    )
+    assert broker._read_https_control(control_broker, serve) is (
+        broker.TransportTermination.MALFORMED_CONTROL
+    )
+    assert serve.fixture is None
+    for sock in (first, keep_first, second, keep_second):
+        sock.close()
+    control_broker.close()
+    control_peer.close()
+
+
+def test_https_fixture_rejects_oversized_message(tmp_path, serve_leaf_material):
+    serve, control_broker, control_peer = _fixture_control_serve(
+        tmp_path, serve_leaf_material
+    )
+    good_fd, keep = socket.socketpair()
+    payload = broker.CONTROL_HTTPS_FIXTURE + b"x" * (
+        broker.MAX_HTTPS_CONTROL_BYTES + 64
+    )
+    _send_fixture_message(control_peer, payload, fds=(good_fd.fileno(),))
+    # The datagram exceeds the bounded read: MSG_TRUNC -> malformed control.
+    assert broker._read_https_control(control_broker, serve) is (
+        broker.TransportTermination.MALFORMED_CONTROL
+    )
+    assert serve.fixture is None
+    keep.close()
+    good_fd.close()
+    control_broker.close()
+    control_peer.close()
+
+
+def test_serve_worker_disconnect_mid_handshake(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    reply = _worker_connect(run.worker_client)
+    assert reply.startswith(b"HTTP/1.1 200")
+    # A COMPLETE ClientHello (gate accepts) then immediate EOF: the TLS
+    # handshake drive hits "EOF mid-handshake" — a typed denial, never a
+    # bare exception.
+    hello = chgen.make_client_hello(SERVE_HOSTNAME.encode("ascii"))
+    run.worker_client.sendall(hello)
+    run.worker_client.shutdown(socket.SHUT_WR)
+    record = _finish_serve_run(run)
+    assert record.stage_reached is broker.HttpsConnectionStage.WORKER_TLS
+    assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+    assert record.detail == "worker_tls_handshake_failed"
+    assert record.requests_completed == 0
+
+
+def test_serve_worker_disconnect_mid_request(tmp_path, serve_leaf_material):
+    run = _start_serve_connection(tmp_path, serve_leaf_material)
+    reply = _worker_connect(run.worker_client)
+    assert reply.startswith(b"HTTP/1.1 200")
+    tls = _worker_tls(run.worker_client, serve_leaf_material["ca_pem"])
+    # A partial request head, then a clean close_notify: the connection
+    # completes with no request ever forwarded.
+    tls.sendall(b"GET /partial")
+    _close_tls(tls)
+    record = _finish_serve_run(run)
+    assert record.terminal_reason is broker.HttpsConnectionTermination.COMPLETED
+    assert record.detail == "worker_closed"
+    assert record.requests_completed == 0
+
+
+def test_serve_origin_tls_stall_fails_closed_bounded(
+    tmp_path, serve_leaf_material, monkeypatch
+):
+    from agenticos.sandbox import network_origin as origin_module
+
+    real_open = origin_module.open_origin_tls
+
+    def _bounded_open(sock, hostname, **kwargs):
+        # Bound the test: the production default is 10 s; the mechanism
+        # under test (stall -> typed denial) is identical at 0.5 s.
+        kwargs["handshake_timeout"] = 0.5
+        return real_open(sock, hostname, **kwargs)
+
+    monkeypatch.setattr(origin_module, "open_origin_tls", _bounded_open)
+    policy = _serve_policy()
+    network_policy = _serve_network_policy(policy)
+    https_state = _serve_https_state(
+        network_policy, serve_leaf_material["context"]
+    )
+    control_broker, control_peer = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    serve = broker._HttpsServeState(policy, https_state, control_broker.fileno())
+    pems = _origin_pems()
+    # The fixture origin accepts TCP (already-connected socketpair) but the
+    # peer NEVER speaks TLS: the handshake stalls past its deadline.
+    fixture_broker, fixture_silent = socket.socketpair()
+    serve.fixture = broker._HttpsFixtureState(
+        fixture_broker.fileno(),
+        pems["ca"].decode("ascii"),
+        ("93.184.216.34",),
+    )
+    worker_broker, worker_client = socket.socketpair()
+    runtime = broker._HttpsConnectionRuntime(worker_broker)
+    serve.runtimes.append(runtime)
+    thread = threading.Thread(
+        target=broker._serve_https_connection,
+        args=(serve, runtime, 1),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        started = time.monotonic()
+        reply = _worker_connect(worker_client)
+        assert reply.startswith(b"HTTP/1.1 200")
+        tls = _worker_tls(worker_client, serve_leaf_material["ca_pem"])
+        tls.sendall(b"GET / HTTP/1.1\r\nHost: cdn.example.com\r\n\r\n")
+        control_peer.settimeout(10.0)
+        record = broker.HttpsConnectionRecord.from_bytes(
+            control_peer.recv(broker.MAX_HTTPS_EVIDENCE_BYTES + 1)
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 8.0, f"stalled origin was not bounded: {elapsed:.1f}s"
+        assert record.stage_reached is broker.HttpsConnectionStage.ORIGIN_TLS
+        assert record.terminal_reason is broker.HttpsConnectionTermination.DENIED
+        assert record.detail == "origin_tls_failed"
+        assert record.requests_completed == 0
+        thread.join(15.0)
+        assert not thread.is_alive(), "connection thread stuck after stall"
+        assert not serve.thread_errors
+        _close_tls(tls)
+    finally:
+        runtime.abort()
+        fixture_silent.close()
+        fixture_broker.close()
+        worker_client.close()
+        control_peer.close()
+        control_broker.close()

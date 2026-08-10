@@ -674,3 +674,105 @@ def run_tls_startup_self_test(
         "python_ssl_behavior": behavior,
         "ech_machinery": "absent",
     }
+
+
+def _drain_probe_bio(bio: ssl.MemoryBIO) -> bytes:
+    parts: list[bytes] = []
+    while True:
+        chunk = bio.read()
+        if not chunk:
+            break
+        parts.append(chunk)
+    return b"".join(parts)
+
+
+def _alpn_probe_leg(
+    prepared: PreparedWorkerTlsContext,
+    client_alpn: list[str],
+    approved_hostname: str,
+) -> str | None:
+    """Drive one real MemoryBIO TLS handshake against the worker context.
+
+    The client trusts nothing and verifies nothing (certificate
+    authentication is the adoption self-audit's proof, not this leg's);
+    the leg measures ONLY which ALPN the built worker context selects.
+    """
+    client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_context.minimum_version = ssl.TLSVersion.TLSv1_2
+    client_context.check_hostname = False
+    client_context.verify_mode = ssl.CERT_NONE
+    client_context.set_alpn_protocols(client_alpn)
+    server_in, server_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    client_in, client_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    server = prepared.context.wrap_bio(server_in, server_out, server_side=True)
+    client = client_context.wrap_bio(
+        client_in, client_out, server_side=False, server_hostname=approved_hostname
+    )
+    server_done = client_done = False
+    for _ in range(64):
+        if server_done and client_done:
+            return client.selected_alpn_protocol()
+        for obj, is_server in ((server, True), (client, False)):
+            if (is_server and server_done) or (not is_server and client_done):
+                continue
+            try:
+                obj.do_handshake()
+            except ssl.SSLWantReadError:
+                pass
+            else:
+                if is_server:
+                    server_done = True
+                else:
+                    client_done = True
+        moved = False
+        flight = _drain_probe_bio(server_out)
+        if flight:
+            client_in.write(flight)
+            moved = True
+        flight = _drain_probe_bio(client_out)
+        if flight:
+            server_in.write(flight)
+            moved = True
+        if not moved:
+            break
+    raise StartupSelfTestError("startup probe ALPN handshake did not complete")
+
+
+def run_worker_context_startup_probe(
+    context: ssl.SSLContext, approved_hostname: str
+) -> None:
+    """Fail-closed startup probe legs for the ADOPTED worker TLS context.
+
+    Complements :func:`run_tls_startup_self_test` (process/host posture)
+    with legs against the exact context built from the sealed task
+    material: hardening succeeds (fresh exact-hostname SNI policy,
+    TLS>=1.2), ``OP_NO_RENEGOTIATION`` is present in the effective options,
+    and the ALPN behavior is exactly ``http/1.1`` — a real handshake
+    offering ``http/1.1`` must select it, an h2-only offer must select
+    nothing.  Raises :class:`StartupSelfTestError` on any failure.
+    """
+    if not isinstance(context, ssl.SSLContext):
+        raise StartupSelfTestError("worker context is not an ssl.SSLContext")
+    try:
+        prepared = configure_worker_server_context(context, approved_hostname)
+    except (WorkerTlsConfigurationError, ValueError) as exc:
+        raise StartupSelfTestError(
+            "worker context could not be hardened at startup"
+        ) from exc
+    if not (prepared.context.options & ssl.OP_NO_RENEGOTIATION):
+        raise StartupSelfTestError(
+            "OP_NO_RENEGOTIATION absent from the built worker context"
+        )
+    if tuple(WORKER_ALPN_PROTOCOLS) != ("http/1.1",):
+        raise StartupSelfTestError("worker ALPN offer is not exactly http/1.1")
+    if _alpn_probe_leg(prepared, ["http/1.1"], approved_hostname) != "http/1.1":
+        raise StartupSelfTestError(
+            "worker context did not select http/1.1 for an http/1.1 offer"
+        )
+    # A second leg re-prepares: each SNI policy instance authorizes exactly
+    # one firing, by design.
+    prepared = configure_worker_server_context(context, approved_hostname)
+    if _alpn_probe_leg(prepared, ["h2"], approved_hostname) is not None:
+        raise StartupSelfTestError(
+            "worker context selected an ALPN for an h2-only offer"
+        )
