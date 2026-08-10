@@ -10,6 +10,13 @@ Linux-only: sealed memfds and fixed descriptors require it.
 
 from __future__ import annotations
 
+import sys
+
+import pytest
+
+if not sys.platform.startswith("linux"):
+    pytest.skip("M4B-2 HTTPS plumbing requires Linux sealed memfds", allow_module_level=True)
+
 import errno
 import fcntl
 import json
@@ -18,14 +25,8 @@ from pathlib import Path
 import socket
 import stat
 import subprocess
-import sys
 import time
 import uuid
-
-import pytest
-
-if not sys.platform.startswith("linux"):
-    pytest.skip("M4B-2 HTTPS plumbing requires Linux sealed memfds", allow_module_level=True)
 
 from agenticos.sandbox import host_qualification as hq
 from agenticos.sandbox import m4b_runner as runner_module
