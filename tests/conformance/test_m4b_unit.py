@@ -5941,6 +5941,7 @@ instance.worker_path = root / "worker"
 instance.task_tmp = root / "task-tmp"
 instance.synthetic_home = root / "home"
 instance.supervisor_path = root / "supervisor"
+instance._extra_worker_env = None
 now = time.monotonic_ns()
 instance._transport_policy = TransportPolicy(
     version="AOSNET/1", task_id="task-live", task_generation=1,

@@ -535,7 +535,7 @@ def _adoption_fixture(tmp_path, *, policy=None, hostname="cdn.example.com",
         task_id=policy.task_id,
         task_generation=policy.task_generation,
         launch_nonce=policy.launch_nonce,
-        hostname=hostname,
+        hostnames=(hostname,),
         policy_digest=policy_digest(policy),
     )
     changes = dict(network_policy_changes or {})
@@ -673,7 +673,7 @@ def test_verify_task_material_context_matrix(tmp_path):
         task_id=policy.task_id,
         task_generation=policy.task_generation,
         launch_nonce=policy.launch_nonce,
-        hostname="cdn.example.com",
+        hostnames=("cdn.example.com",),
         policy_digest=policy_digest(policy),
     )
     try:
@@ -685,7 +685,7 @@ def test_verify_task_material_context_matrix(tmp_path):
             "task_id": policy.task_id,
             "task_generation": policy.task_generation,
             "launch_nonce": policy.launch_nonce,
-            "hostname": "cdn.example.com",
+            "hostnames": ("cdn.example.com",),
             "policy_digest": policy_digest(policy),
         }
         verified = verify_task_material(**base)
@@ -694,7 +694,7 @@ def test_verify_task_material_context_matrix(tmp_path):
             ("task_id", "task-other"),
             ("task_generation", policy.task_generation + 1),
             ("launch_nonce", "ef" * 16),
-            ("hostname", "other.example.com"),
+            ("hostnames", ("other.example.com",)),
             ("policy_digest", "00" * 32),
         ):
             with pytest.raises(CertHelperError):
@@ -873,7 +873,7 @@ SERVE_TASK = {
     "task_id": "task-https-serve",
     "task_generation": 9,
     "launch_nonce": "cd" * 16,
-    "hostname": SERVE_HOSTNAME,
+    "hostnames": (SERVE_HOSTNAME,),
     "policy_digest": "ab" * 32,
 }
 
@@ -1988,16 +1988,27 @@ def test_https_fixture_control_message_arming_and_validation(
     assert broker._read_https_control(control_broker, serve) is (
         broker.TransportTermination.MALFORMED_CONTROL
     )
-    # A valid message arms the fixture exactly once.
+    # A valid message arms the first synthetic origin.
     _send_fixture_message(control_peer, payload, fds=(good_fd.fileno(),))
     assert broker._read_https_control(control_broker, serve) is None
     assert serve.fixture is not None
     assert serve.fixture.addresses == ("93.184.216.34",)
-    # A second fixture message is malformed.
+    # Further arms queue, up to the bounded M4B-3 origin set.
+    for _ in range(broker.HTTPS_FIXTURE_MAX_ORIGINS - 1):
+        _send_fixture_message(control_peer, payload, fds=(good_fd.fileno(),))
+        assert broker._read_https_control(control_broker, serve) is None
+    assert len(serve.fixture_queue) == broker.HTTPS_FIXTURE_MAX_ORIGINS - 1
+    # An arm beyond the bounded origin set is malformed.
     _send_fixture_message(control_peer, payload, fds=(good_fd.fileno(),))
     assert broker._read_https_control(control_broker, serve) is (
         broker.TransportTermination.MALFORMED_CONTROL
     )
+    # The extra queued fixture descriptors must not leak into the later
+    # fixed-descriptor adoption fixtures (the first armed fixture follows
+    # the pre-existing single-arm lifecycle below).
+    for queued in serve.fixture_queue:
+        os.close(queued.fd)
+    serve.fixture_queue.clear()
     # REVOKE remains intact on the extended control reader.
     control_peer.send(broker.CONTROL_REVOKE)
     assert broker._read_https_control(control_broker, serve) is (
@@ -2340,8 +2351,8 @@ def test_broker_adopts_zero_grant_policy_as_deny_all(tmp_path):
         state = broker._adopt_https_material(contract, sealed)
         assert state.network_policy.grants == ()
         # With no grant to commit a hostname, the sealed binding's own
-        # committed hostname is adopted after task-context authentication.
-        assert state.binding.hostname == "cdn.example.com"
+        # committed hostname set is adopted after task-context authentication.
+        assert state.binding.hostnames == ("cdn.example.com",)
         assert state.material_seals_verified
         # The startup probe also holds in the deny-all posture.
         broker._run_https_startup_probe(state)
@@ -2361,8 +2372,8 @@ def test_serve_zero_grants_denies_every_connect(tmp_path, serve_leaf_material):
         socket.AF_UNIX, socket.SOCK_SEQPACKET
     )
     serve = broker._HttpsServeState(policy, https_state, control_broker.fileno())
-    assert serve.grant is None
-    assert serve.approved_hostname is None
+    assert serve.sole_grant is None
+    assert serve.grant_accounting == {}
     worker_broker, worker_client = socket.socketpair()
     runtime = broker._HttpsConnectionRuntime(worker_broker)
     serve.runtimes.append(runtime)

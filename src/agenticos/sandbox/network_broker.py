@@ -26,7 +26,12 @@ import struct
 import sys
 import threading
 import time
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
+
+if TYPE_CHECKING:
+    # Annotation-only: network_https is otherwise imported lazily inside the
+    # functions that use it, keeping this module's import graph unchanged.
+    from .network_https import NetworkGrant
 
 from .network_identity import (
     NetworkIdentityError,
@@ -2576,6 +2581,11 @@ CONTROL_HTTPS_FIXTURE = b"AOSBROKERCTL/1 HTTPS-FIXTURE\n"
 HTTPS_FIXTURE_VERSION = "AOSHTTPSFIX/1"
 HTTPS_FIXTURE_MAX_PEM_BYTES = 8192
 HTTPS_FIXTURE_MAX_ADDRESSES = 8
+# Bound on pre-armed synthetic origins per launch (M4B-3): one origin
+# connection per granted hostname covers the Connected Build grant set.
+# Every arm arrives as its own validated control message before the first
+# accepted connection; each is spent exactly once, in arming order.
+HTTPS_FIXTURE_MAX_ORIGINS = 4
 CONNECT_HEAD_MAX_BYTES = 16384
 CONNECT_MAX_HEADER_LINES = 32
 CONNECT_STAGE_TIMEOUT_SECONDS = 5.0
@@ -3102,7 +3112,9 @@ class _HttpsFixtureState:
     input): exactly one already-connected socket plus its explicit trust roots
     and declared numeric resolution arrive as one authenticated control
     message before the first connection.  It supplies exactly ONE origin
-    connection per launch; every record produced under it is marked
+    connection; a launch may pre-arm a bounded queue of them
+    (``HTTPS_FIXTURE_MAX_ORIGINS``) so each granted hostname can reach its
+    own synthetic origin.  Every record produced under it is marked
     ``synthetic_origin=True`` (non-production).
     """
 
@@ -3185,6 +3197,33 @@ class _HttpsConnectionRuntime:
         _abort_socket(worker_sock)
 
 
+class _HttpsGrantAccounting:
+    """Bounded per-grant connection/byte authority for one canonical hostname.
+
+    Complements the policy-aggregate ``_HttpsByteAccountant``: each granted
+    hostname independently enforces its own ``connection_limit`` (cumulative
+    authorized connections) and ``byte_limit`` (accounted read bytes), so one
+    grant's traffic can never consume another grant's authority.  Byte
+    authority is RESERVED before each bounded read and refunded on a short or
+    failed read, atomically under the owning serve state's ``grant_lock``
+    (reserve-by-decrement): the reservation IS the commit, so concurrent
+    same-grant connections can never observe overlapping budget and
+    ``accounted`` can never exceed ``byte_limit`` even transiently.  Any
+    residual accounting inconsistency (reserve overflow, refund underflow —
+    both structurally unreachable) fails the serve LOUD via
+    ``BrokerBoundaryError``, mirroring the aggregate accountant's
+    post-commit tripwire posture rather than passing silently.
+    """
+
+    __slots__ = ("connection_limit", "byte_limit", "connections", "accounted")
+
+    def __init__(self, *, connection_limit: int, byte_limit: int) -> None:
+        self.connection_limit = connection_limit
+        self.byte_limit = byte_limit
+        self.connections = 0
+        self.accounted = 0
+
+
 class _HttpsServeState:
     """Shared broker-owned state for one HTTPS serve run."""
 
@@ -3202,34 +3241,74 @@ class _HttpsServeState:
         # Zero grants is the deny-all posture: no approved hostname exists,
         # authority comes from the transport policy alone, and every CONNECT
         # is denied by authorize_grant before any trust stage is reached.
-        self.grant = (
-            self.network_policy.grants[0] if self.network_policy.grants else None
-        )
-        self.approved_hostname = (
-            self.grant.hostname if self.grant is not None else None
+        # With exactly one grant, the sole grant remains the evidence
+        # fallback for connections denied before per-connection grant
+        # selection; with several grants there is no such fallback.
+        self.sole_grant = (
+            self.network_policy.grants[0]
+            if len(self.network_policy.grants) == 1
+            else None
         )
         self.control_fd = control_fd
-        self.connection_limit = (
-            min(policy.connection_limit, self.grant.connection_limit)
-            if self.grant is not None
-            else policy.connection_limit
-        )
-        self.accountant = _HttpsByteAccountant(
-            min(policy.byte_limit, self.grant.byte_limit)
-            if self.grant is not None
-            else policy.byte_limit
-        )
+        self.connection_limit = policy.connection_limit
+        self.accountant = _HttpsByteAccountant(policy.byte_limit)
+        self.grant_lock = threading.Lock()
+        self.grant_accounting = {
+            grant.hostname: _HttpsGrantAccounting(
+                connection_limit=grant.connection_limit,
+                byte_limit=grant.byte_limit,
+            )
+            for grant in self.network_policy.grants
+        }
         self.guard = BoundedGateGuard()
         self.tls_configure_lock = threading.Lock()
         self.emit_lock = threading.Lock()
         self.abort = threading.Event()
         self.fixture: _HttpsFixtureState | None = None
+        # Additional pre-armed synthetic origins (M4B-3 multi-grant
+        # conformance launches): the ACTIVE fixture stays in ``fixture``
+        # exactly as before; once it is spent the next origin establishment
+        # rotates the queue head in.  Total armed origins are bounded by
+        # HTTPS_FIXTURE_MAX_ORIGINS at the control verb.
+        self.fixture_queue: list[_HttpsFixtureState] = []
         self.connections_accepted = 0
         self.records_emitted = 0
         self.byte_limit_reached = False
         self.runtimes: list[_HttpsConnectionRuntime] = []
         self.threads: list[threading.Thread] = []
         self.thread_errors: list[BaseException] = []
+
+    def grant_reserve(
+        self, grant_state: _HttpsGrantAccounting, max_bytes: int
+    ) -> int:
+        """Reserve up to ``max_bytes`` of one grant's byte authority.
+
+        Atomic under ``grant_lock``: the reservation is debited BEFORE the
+        bounded read so two concurrent same-grant connections can never both
+        observe the same budget.  Returns 0 when the grant is exhausted.
+        """
+        with self.grant_lock:
+            remaining = grant_state.byte_limit - grant_state.accounted
+            granted = min(remaining, max_bytes)
+            grant_state.accounted += granted
+            if grant_state.accounted > grant_state.byte_limit:
+                raise BrokerBoundaryError(
+                    "https grant byte accounting exceeded its limit"
+                )
+            return granted
+
+    def grant_refund(
+        self, grant_state: _HttpsGrantAccounting, unused: int
+    ) -> None:
+        """Refund unread reserved bytes; any underflow fails loud."""
+        if unused <= 0:
+            return
+        with self.grant_lock:
+            grant_state.accounted -= unused
+            if grant_state.accounted < 0:
+                raise BrokerBoundaryError(
+                    "https grant byte accounting underflowed its reservation"
+                )
 
     def expired(self) -> bool:
         return time.monotonic_ns() >= self.policy.expires_at_monotonic_ns
@@ -3296,8 +3375,10 @@ def _read_https_control(
     """HTTPS-flavor control read: REVOKE/EOF plus the conformance fixture.
 
     M4B-1's ``_read_control`` is deliberately untouched; the fixture verb is
-    recognized only here, on the HTTPS serve loop, and is accepted at most
-    once and only before the first accepted connection.
+    recognized only here, on the HTTPS serve loop, and is accepted only
+    before the first accepted connection, up to the bounded
+    HTTPS_FIXTURE_MAX_ORIGINS pre-armed synthetic origins (one per granted
+    hostname covers the Connected Build grant set).
     """
     try:
         payload, ancillary, flags, _address = channel.recvmsg(
@@ -3327,17 +3408,18 @@ def _read_https_control(
         received_fds.clear()
 
     if payload.startswith(CONTROL_HTTPS_FIXTURE):
+        armed = len(serve.fixture_queue) + (1 if serve.fixture is not None else 0)
         if (
             len(received_fds) != 1
             or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
-            or serve.fixture is not None
+            or armed >= HTTPS_FIXTURE_MAX_ORIGINS
             or serve.connections_accepted
         ):
             close_received()
             return TransportTermination.MALFORMED_CONTROL
         fixture_fd = received_fds.pop()
         try:
-            serve.fixture = _parse_https_fixture(
+            parsed = _parse_https_fixture(
                 payload[len(CONTROL_HTTPS_FIXTURE):], fixture_fd
             )
         except BrokerBoundaryError:
@@ -3346,6 +3428,10 @@ def _read_https_control(
             except OSError:
                 pass
             return TransportTermination.MALFORMED_CONTROL
+        if serve.fixture is None:
+            serve.fixture = parsed
+        else:
+            serve.fixture_queue.append(parsed)
         return None
     close_received()
     if ancillary or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
@@ -3471,6 +3557,7 @@ class _OriginLeg:
 def _establish_fixture_origin(
     serve: _HttpsServeState,
     runtime: _HttpsConnectionRuntime,
+    grant: NetworkGrant,
 ) -> tuple[_OriginLeg | None, HttpsConnectionStage, str]:
     """Synthetic origin: validated declared set + TLS over the armed socket."""
     import ipaddress
@@ -3487,7 +3574,12 @@ def _establish_fixture_origin(
     if fixture is None:
         return None, HttpsConnectionStage.ORIGIN_CONNECT, "origin_fixture_absent"
     if fixture.spent:
-        return None, HttpsConnectionStage.ORIGIN_CONNECT, "origin_fixture_spent"
+        if not serve.fixture_queue:
+            return None, HttpsConnectionStage.ORIGIN_CONNECT, "origin_fixture_spent"
+        # M4B-3 multi-origin conformance launches: the next pre-armed
+        # synthetic origin rotates in, in arming order, each spent once.
+        fixture = serve.fixture_queue.pop(0)
+        serve.fixture = fixture
     resolved: list[ResolvedAddress] = []
     prohibited = 0
     for text in fixture.addresses:
@@ -3513,7 +3605,7 @@ def _establish_fixture_origin(
     runtime.set_origin(sock)
     outcome = open_origin_tls(
         sock,
-        serve.approved_hostname,
+        grant.hostname,
         trust_roots=OriginTrustRoots(fixture.ca_certs_pem),
     )
     if not outcome.established:
@@ -3544,15 +3636,16 @@ def _establish_fixture_origin(
 def _establish_origin(
     serve: _HttpsServeState,
     runtime: _HttpsConnectionRuntime,
+    grant: NetworkGrant,
 ) -> tuple[_OriginLeg | None, HttpsConnectionStage, str]:
     """Resolve once, connect numeric, authenticate origin TLS (or fixture)."""
     from .network_origin import OriginHTTPSCode, open_origin_https
     from .network_resolution import resolve_all_once
 
     if serve.fixture is not None:
-        return _establish_fixture_origin(serve, runtime)
-    resolution = resolve_all_once(serve.approved_hostname)
-    outcome = open_origin_https(resolution, serve.grant)
+        return _establish_fixture_origin(serve, runtime, grant)
+    resolution = resolve_all_once(grant.hostname)
+    outcome = open_origin_https(resolution, grant)
     if not outcome.established:
         stage = {
             OriginHTTPSCode.RESOLUTION_DENIED: HttpsConnectionStage.RESOLUTION,
@@ -3582,6 +3675,7 @@ def _establish_origin(
 def _relay_origin_response(
     serve: _HttpsServeState,
     runtime: _HttpsConnectionRuntime,
+    grant_state: _HttpsGrantAccounting,
     channel: Any,
     origin: _OriginLeg,
     method: str,
@@ -3633,19 +3727,32 @@ def _relay_origin_response(
         budget = serve.accountant.read_budget()
         if budget <= 0:
             return "byte_limit", "byte_limit"
+        # Per-grant authority is RESERVED before the read, atomically under
+        # grant_lock and independently of the policy aggregate: this grant's
+        # own byte limit bounds the read too, and its exhaustion denies this
+        # connection without tripping the serve-wide byte-limit posture
+        # other grants still live under.
+        reserved = serve.grant_reserve(
+            grant_state, min(RELAY_CHUNK_BYTES, budget)
+        )
+        if reserved <= 0:
+            return "grant_byte_limit", "grant_byte_limit"
         sock.settimeout(HTTPS_STAGE_SLICE_SECONDS)
         try:
-            chunk = sock.recv(min(RELAY_CHUNK_BYTES, budget))
+            chunk = sock.recv(reserved)
         except socket.timeout:
+            serve.grant_refund(grant_state, reserved)
             if time.monotonic() >= idle_deadline:
                 return "peer_error", "origin_response_timeout"
             continue
         except OSError:
+            serve.grant_refund(grant_state, reserved)
             if serve.expired():
                 return "expired", "expired"
             if serve.abort.is_set():
                 return "revoked", "aborted"
             return "peer_error", "origin_read_failed"
+        serve.grant_refund(grant_state, reserved - len(chunk))
         serve.accountant.commit_read(len(chunk))
         counters["read_from_origin"] += len(chunk)
         if chunk:
@@ -3710,6 +3817,12 @@ def _serve_https_connection(
     worker = runtime._worker_sock
     assert worker is not None
     stage = HttpsConnectionStage.CONNECT
+    # The connection's grant is selected ONCE, at CONNECT authorization;
+    # every later trust stage (worker SNI policy, HTTP method policy, Host
+    # re-verification, origin establishment, identity chain, evidence) binds
+    # to exactly this grant.  ``grant_state`` is its per-grant accounting.
+    authorized_grant: Any = None
+    grant_state: _HttpsGrantAccounting | None = None
     connect_authority: str | None = None
     worker_sni_raw: str | None = None
     http_host: str | None = None
@@ -3739,18 +3852,26 @@ def _serve_https_connection(
 
         total = counters["worker_to_origin"] + counters["origin_to_worker"]
         accounted = counters["read_from_worker"] + counters["read_from_origin"]
-        if serve.grant is None:
+        # Evidence binds to the connection's authorized grant; a connection
+        # denied before grant selection falls back to the sole grant when
+        # exactly one exists (the single-grant posture), and otherwise to
+        # the deny-all "no_grant" identity (zero grants, or several grants
+        # with no per-connection selection to verify a chain against).
+        evidence_grant = (
+            authorized_grant if authorized_grant is not None else serve.sole_grant
+        )
+        if evidence_grant is None:
             # Deny-all posture: no grant exists to verify an identity chain
             # against; every connection was denied before any trust stage.
             identity = "no_grant"
         else:
             chain = verify_identity_chain(
-                serve.grant,
+                evidence_grant,
                 connect_authority=connect_authority,
                 worker_sni=worker_sni_raw,
                 http_host=http_host,
                 origin_tls_name=origin_tls_name,
-                evidence_name=serve.approved_hostname,
+                evidence_name=evidence_grant.hostname,
             )
             identity = chain.code.value
             if not chain.verified and chain.stage is not None:
@@ -3775,7 +3896,11 @@ def _serve_https_connection(
                 stage_reached=stage,
                 terminal_reason=termination,
                 detail=detail,
-                approved_hostname=serve.approved_hostname,
+                approved_hostname=(
+                    evidence_grant.hostname
+                    if evidence_grant is not None
+                    else None
+                ),
                 connect_authority=_evidence_hostname(connect_authority),
                 worker_sni=_evidence_hostname(worker_sni_raw),
                 http_host=_evidence_hostname(http_host),
@@ -3826,6 +3951,24 @@ def _serve_https_connection(
             detail = f"authorization_{authorization.code.value}"
             _best_effort_plain_send(worker, HTTPS_CONNECT_RESPONSE_DENIED)
             return
+        authorized_grant = authorization.grant
+        assert authorized_grant is not None
+        # Per-grant connection authority: the selected grant's own
+        # connection_limit bounds its cumulative authorized connections,
+        # independently of the policy-aggregate accept limit.  Exhaustion
+        # denies THIS connection fail-closed; the serve run continues for
+        # the remaining grants.
+        with serve.grant_lock:
+            candidate = serve.grant_accounting[authorized_grant.hostname]
+            if candidate.connections >= candidate.connection_limit:
+                candidate = None
+            else:
+                candidate.connections += 1
+        if candidate is None:
+            detail = "grant_connection_limit"
+            _best_effort_plain_send(worker, HTTPS_CONNECT_RESPONSE_DENIED)
+            return
+        grant_state = candidate
         # The 200 response is sent ONLY after policy permits the TLS attempt.
         if not _best_effort_plain_send(worker, HTTPS_CONNECT_RESPONSE_OK):
             termination = HttpsConnectionTermination.PEER_ERROR
@@ -3848,9 +3991,10 @@ def _serve_https_connection(
         stage = HttpsConnectionStage.WORKER_TLS
         # The per-connection SNI policy installs on the shared task-leaf
         # context, so configuration + handshake are serialized broker-wide.
+        # The policy authorizes exactly the connection's granted hostname.
         with serve.tls_configure_lock:
             prepared = ntls.configure_worker_server_context(
-                serve.https_state.server_context, serve.approved_hostname
+                serve.https_state.server_context, authorized_grant.hostname
             )
             outcome = ntls.terminate_worker_tls(worker, gate, prepared)
         worker_sni_raw = outcome.sni_seen[0] if outcome.sni_seen else None
@@ -3871,7 +4015,7 @@ def _serve_https_connection(
         runtime.set_channel(channel)
 
         stage = HttpsConnectionStage.HTTP
-        parser = StrictHttpParser(serve.grant.purpose.http_policy())
+        parser = StrictHttpParser(authorized_grant.purpose.http_policy())
         origin: _OriginLeg | None = None
         origin_eof = False
         http_done = False
@@ -3899,14 +4043,31 @@ def _serve_https_connection(
                 )
                 serve.byte_limit_reached = True
                 break
+            # The connection's grant enforces its own byte limit too, by
+            # RESERVATION before the read (reserve-by-decrement under
+            # grant_lock), so concurrent same-grant connections can never
+            # observe overlapping budget.  Exhaustion terminates this
+            # connection fail-closed WITHOUT tripping the serve-wide
+            # byte-limit posture.
+            reserved = serve.grant_reserve(
+                grant_state, min(RELAY_CHUNK_BYTES, budget)
+            )
+            if reserved <= 0:
+                termination, detail = (
+                    HttpsConnectionTermination.BYTE_LIMIT,
+                    "grant_byte_limit",
+                )
+                break
             try:
                 data = channel.read(
-                    min(RELAY_CHUNK_BYTES, budget),
+                    reserved,
                     timeout=HTTPS_STAGE_SLICE_SECONDS,
                 )
             except ntls.ChannelTimeoutError:
+                serve.grant_refund(grant_state, reserved)
                 continue
             except ntls.ChannelError:
+                serve.grant_refund(grant_state, reserved)
                 if serve.expired():
                     termination, detail = (
                         HttpsConnectionTermination.EXPIRED,
@@ -3923,6 +4084,7 @@ def _serve_https_connection(
                         "channel_error",
                     )
                 break
+            serve.grant_refund(grant_state, reserved - len(data))
             if data == b"":
                 termination, detail = (
                     HttpsConnectionTermination.COMPLETED,
@@ -3955,7 +4117,7 @@ def _serve_https_connection(
                         break
                     if http_host is None:
                         http_host = head_host
-                    if head_host != serve.approved_hostname:
+                    if head_host != authorized_grant.hostname:
                         denial = "http_host_mismatch"
                         break
                     reauthorization = authorize_grant(
@@ -3974,7 +4136,7 @@ def _serve_https_connection(
                     method = request_methods.pop(0)
                     if origin is None:
                         leg, leg_stage, leg_detail = _establish_origin(
-                            serve, runtime
+                            serve, runtime, authorized_grant
                         )
                         if leg is None:
                             denial = leg_detail
@@ -4017,7 +4179,7 @@ def _serve_https_connection(
                     requests_completed += 1
                     stage = HttpsConnectionStage.RESPONSE_RELAY
                     relay_status, relay_detail = _relay_origin_response(
-                        serve, runtime, channel, origin, method, counters
+                        serve, runtime, grant_state, channel, origin, method, counters
                     )
                     stage = HttpsConnectionStage.HTTP
                     if relay_status == "done":
@@ -4039,6 +4201,10 @@ def _serve_https_connection(
                     elif relay_status == "byte_limit":
                         termination = HttpsConnectionTermination.BYTE_LIMIT
                         serve.byte_limit_reached = True
+                    elif relay_status == "grant_byte_limit":
+                        # Per-grant exhaustion terminates this connection
+                        # only; the policy-aggregate byte posture stands.
+                        termination = HttpsConnectionTermination.BYTE_LIMIT
                     else:
                         termination = HttpsConnectionTermination.PEER_ERROR
                     detail = relay_detail
@@ -4193,8 +4359,14 @@ def serve_https_transport(
             raise BrokerBoundaryError("https material state has the wrong type")
         if policy.mode is not TransportMode.DENY:
             raise BrokerBoundaryError("https serve requires a DENY transport policy")
-        if len(https_state.network_policy.grants) > 1:
-            raise BrokerBoundaryError("https serve permits at most one grant")
+        from .network_https import validate_grant_set
+
+        try:
+            validate_grant_set(https_state.network_policy.grants)
+        except ValueError as exc:
+            raise BrokerBoundaryError(
+                "https serve grant set exceeds the Connected Build bound"
+            ) from exc
         now = time.monotonic_ns()
         if now < policy.activated_at_monotonic_ns:
             raise BrokerBoundaryError("transport policy is not active")
@@ -4348,7 +4520,7 @@ def _run_https_startup_probe(https_state: _HttpsMaterialState) -> None:
             recorded_openssl_version=network_policy.openssl_runtime_identity
         )
         ntls.run_worker_context_startup_probe(
-            https_state.server_context, https_state.binding.hostname
+            https_state.server_context, https_state.binding.hostnames[0]
         )
     except ntls.StartupSelfTestError as exc:
         raise BrokerBoundaryError("https startup probe self-test failed") from exc
@@ -4395,6 +4567,7 @@ def _adopt_https_material(
     from .network_https import (
         NetworkPolicySealError,
         read_sealed_network_policy_fd,
+        validate_grant_set,
     )
 
     https = contract.https
@@ -4415,16 +4588,21 @@ def _adopt_https_material(
         raise BrokerBoundaryError(
             "network policy task context does not match transport authority"
         )
-    if len(network_policy.grants) > 1:
+    try:
+        validate_grant_set(network_policy.grants)
+    except ValueError as exc:
         raise BrokerBoundaryError(
-            "https flavor permits at most one network grant"
-        )
+            "network policy grant set exceeds the Connected Build bound"
+        ) from exc
     # Zero grants is the deny-all posture: adoption still authenticates the
-    # sealed material (the binding's own committed hostname is adopted), the
-    # broker becomes ready, and every CONNECT is denied by authorize_grant.
-    hostname = (
-        network_policy.grants[0].hostname if network_policy.grants else None
+    # sealed material (the binding's own committed hostname set is adopted),
+    # the broker becomes ready, and every CONNECT is denied by
+    # authorize_grant.  Otherwise the binding's committed hostname set must
+    # equal the policy grant hostname set exactly (sorted byte equality).
+    grant_hostnames = tuple(
+        sorted(grant.hostname for grant in network_policy.grants)
     )
+    hostnames = grant_hostnames if grant_hostnames else None
     try:
         verified = verify_task_material(
             ca_cert_fd=https.ca_cert_fd,
@@ -4434,7 +4612,7 @@ def _adopt_https_material(
             task_id=policy.task_id,
             task_generation=policy.task_generation,
             launch_nonce=policy.launch_nonce,
-            hostname=hostname,
+            hostnames=hostnames,
             policy_digest=sealed.digest,
         )
     except CertHelperError as exc:
@@ -4454,7 +4632,7 @@ def _adopt_https_material(
             task_id=policy.task_id,
             task_generation=policy.task_generation,
             launch_nonce=policy.launch_nonce,
-            hostname=hostname,
+            hostnames=hostnames,
             policy_digest=sealed.digest,
         )
     except CertHelperError as exc:
@@ -4673,6 +4851,7 @@ __all__ = [
     "EnvironmentEvidence",
     "HTTPS_CONNECTION_EVENT",
     "HTTPS_EVIDENCE_VERSION",
+    "HTTPS_FIXTURE_MAX_ORIGINS",
     "HTTPS_FIXTURE_VERSION",
     "HTTPS_TERMINAL_EVENT",
     "HttpsConnectionRecord",

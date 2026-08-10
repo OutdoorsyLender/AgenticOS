@@ -36,7 +36,7 @@ TASK_CONTEXT = {
     "task_id": "task-cert-regression",
     "task_generation": 3,
     "launch_nonce": "ab" * 16,
-    "hostname": "approved.example.test",
+    "hostnames": ("approved.example.test",),
     "policy_digest": "cd" * 32,
 }
 
@@ -96,7 +96,7 @@ def test_helper_ignores_poisoned_pythonpath_and_cwd(tmp_path, monkeypatch):
             "cwd-shadowed agenticos package executed in helper"
         )
         verified = _verify(generated)
-        assert verified.binding.hostname == TASK_CONTEXT["hostname"]
+        assert verified.binding.hostnames == TASK_CONTEXT["hostnames"]
     finally:
         generated.close()
 
@@ -223,7 +223,7 @@ def test_cert_binding_rejects_noncanonical_hostname():
             task_id=TASK_CONTEXT["task_id"],
             task_generation=TASK_CONTEXT["task_generation"],
             launch_nonce=TASK_CONTEXT["launch_nonce"],
-            hostname="xn--nxasmq6b.example",
+            hostnames=("xn--nxasmq6b.example",),
             policy_digest=TASK_CONTEXT["policy_digest"],
             ca_cert_sha256="ab" * 32,
             leaf_cert_sha256="ab" * 32,

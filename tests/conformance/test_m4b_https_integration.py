@@ -313,7 +313,7 @@ def test_tampered_network_policy_hostname_fails_closed_before_exec(
         task_id=policy.task_id,
         task_generation=policy.task_generation,
         launch_nonce=policy.launch_nonce,
-        hostname=APPROVED_HOSTNAME,
+        hostnames=(APPROVED_HOSTNAME,),
         policy_digest=policy_digest(policy),
     )
     sealed_fd = None
@@ -913,7 +913,7 @@ def test_tampered_openssl_identity_fails_closed_before_exec(
         task_id=policy.task_id,
         task_generation=policy.task_generation,
         launch_nonce=policy.launch_nonce,
-        hostname=APPROVED_HOSTNAME,
+        hostnames=(APPROVED_HOSTNAME,),
         policy_digest=policy_digest(policy),
     )
     sealed_fd = None

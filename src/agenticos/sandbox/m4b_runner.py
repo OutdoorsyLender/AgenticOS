@@ -128,6 +128,7 @@ from .host_qualification import (
     verify_current_host,
 )
 from .network_https import (
+    CONNECTED_BUILD_MAX_GRANTS,
     GrantPurpose,
     NetworkGrant,
     NetworkPolicy,
@@ -595,6 +596,10 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             if broker_vendor_dir is None
             else Path(broker_vendor_dir)
         )
+        # Flavors may extend the fixed worker environment with an additional
+        # validated tuple (the HTTPS flavor's Connected Build profile);
+        # None keeps the runtime plan byte-identical to the base posture.
+        self._extra_worker_env: tuple[tuple[str, str], ...] | None = None
         self.last_transport_observation: NetworkTransportObservation | None = None
 
     def _claim_transport_authority(
@@ -782,8 +787,14 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 or binding.policy_digest != policy_digest(policy)
                 or network_policy.task_ca_certificate_digest
                 != binding.ca_cert_sha256
-                or len(network_policy.grants) != 1
-                or network_policy.grants[0].hostname != binding.hostname
+                or not 1 <= len(network_policy.grants) <= (
+                    CONNECTED_BUILD_MAX_GRANTS
+                )
+                or len({g.hostname for g in network_policy.grants}) != len(
+                    network_policy.grants
+                )
+                or tuple(sorted(g.hostname for g in network_policy.grants))
+                != binding.hostnames
             ):
                 raise CapabilityTransportError(
                     "https launch material does not match controller authority"
@@ -1055,6 +1066,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 task_tmp=task_tmp,
                 synthetic_home=synthetic_home,
                 network_ca=worker_network_ca,
+                extra_worker_env=self._extra_worker_env,
             )
 
             policy_fd = _move_exact_fd(
@@ -3587,8 +3599,43 @@ def _coordinate_operations(
     return _CoordinatorResult(ready=ready, launcher_outcome=outcome)
 
 
+# The Connected Build worker environment profile: deterministic,
+# AgenticOS-controlled per-tool proxy/CA variables only.  The proxy ABI
+# mirrors the fixed network_models proxy listener (127.0.0.1:18080) and the
+# CA path is the fixed runtime_boundary network-CA mount destination.
+# Lowercase https_proxy is deliberate; HTTPS_PROXY, HTTP_PROXY, ALL_PROXY,
+# and no_proxy/NO_PROXY are absent by construction because the worker
+# environment is exactly WORKER_ENVIRONMENT plus this tuple — ambient proxy
+# variables are stripped structurally, never filtered.
+CONNECTED_BUILD_WORKER_EXTRA_ENV = (
+    ("https_proxy", "http://127.0.0.1:18080"),
+    ("SSL_CERT_FILE", "/opt/agenticos/network-ca.pem"),
+    ("CURL_CA_BUNDLE", "/opt/agenticos/network-ca.pem"),
+    ("GIT_SSL_CAINFO", "/opt/agenticos/network-ca.pem"),
+    ("REQUESTS_CA_BUNDLE", "/opt/agenticos/network-ca.pem"),
+)
+
+
+@dataclass(frozen=True)
+class HostGrantSpec:
+    """Controller-side specification of one exact-host grant (M4B-3).
+
+    ``connection_limit``/``byte_limit`` default to the TransportPolicy
+    limits when omitted; the broker enforces each grant's own limits AND
+    the policy aggregate, so an explicit per-grant limit can only tighten
+    that grant's authority, never widen it.
+    """
+
+    hostname: str
+    purpose: GrantPurpose
+    approval_source: str
+    approval_reference: str
+    connection_limit: int | None = None
+    byte_limit: int | None = None
+
+
 class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
-    """M4B-2 HTTPS flavor: sealed task TLS material through the broker boundary.
+    """M4B-2/M4B-3 HTTPS flavor: sealed task TLS material through the broker boundary.
 
     The controller qualifies the host against its recorded manifest, runs the
     SHORT-LIVED certificate helper to completion (it exits before any launch
@@ -3600,9 +3647,16 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
     worker TLS termination -> strict HTTP/1.1 prevalidation -> validated
     resolution -> numeric connect -> authenticated origin TLS -> bounded
     relay), emitting parallel AOSHTTPEV/1 evidence on the control channel.
+    Grants come from exactly one of two forms: the single-host keyword
+    arguments (M4B-2, unchanged) or an ``approved_grants`` tuple of
+    ``HostGrantSpec`` naming a bounded explicit exact-host grant set of
+    1..4 hostnames (M4B-3 Connected Build).  ``connected_build_profile``
+    adds the deterministic AgenticOS-controlled per-tool proxy/CA variables
+    (``CONNECTED_BUILD_WORKER_EXTRA_ENV``) to the fixed worker environment.
     The private ``_fixture_connector`` selects the conformance-only synthetic
-    origin (never selectable by policy or worker input; always recorded as
-    non-production synthetic evidence).
+    origin (a single connector, or a bounded tuple of them so each granted
+    hostname reaches its own scripted origin; never selectable by policy or
+    worker input; always recorded as non-production synthetic evidence).
     """
 
     name = "bubblewrap-landlock-capability-transport-https"
@@ -3611,14 +3665,18 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
         self,
         worker_path,
         *,
-        approved_hostname: str,
-        grant_purpose: GrantPurpose,
-        approval_source: str,
-        approval_reference: str,
+        approved_hostname: str | None = None,
+        grant_purpose: GrantPurpose | None = None,
+        approval_source: str | None = None,
+        approval_reference: str | None = None,
+        approved_grants: tuple[HostGrantSpec, ...] | None = None,
+        connected_build_profile: bool = False,
         host_state_dir,
         helper_timeout: float = 15.0,
         grant_wall_lifetime_ns: int = 12 * 3600 * 1_000_000_000,
-        _fixture_connector: FixtureFdConnector | None = None,
+        _fixture_connector: (
+            FixtureFdConnector | tuple[FixtureFdConnector, ...] | None
+        ) = None,
         **kwargs,
     ) -> None:
         super().__init__(worker_path, **kwargs)
@@ -3627,19 +3685,36 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
             raise CapabilityTransportError(
                 "https flavor requires a DENY transport policy"
             )
-        if type(grant_purpose) is not GrantPurpose:
-            raise CapabilityTransportError("grant_purpose must be a GrantPurpose")
-        if _fixture_connector is not None and type(_fixture_connector) is not (
-            FixtureFdConnector
-        ):
+        self._grant_specs = self._validate_grant_specs(
+            approved_hostname=approved_hostname,
+            grant_purpose=grant_purpose,
+            approval_source=approval_source,
+            approval_reference=approval_reference,
+            approved_grants=approved_grants,
+        )
+        if type(connected_build_profile) is not bool:
             raise CapabilityTransportError(
-                "the synthetic origin connector is conformance-runner private API"
+                "connected_build_profile must be a bool"
             )
-        self._fixture_connector = _fixture_connector
-        self._approved_hostname = canonicalize_hostname(approved_hostname)
-        self._grant_purpose = grant_purpose
-        self._approval_source = approval_source
-        self._approval_reference = approval_reference
+        self._connected_build_profile = connected_build_profile
+        self._extra_worker_env = (
+            CONNECTED_BUILD_WORKER_EXTRA_ENV if connected_build_profile else None
+        )
+        if _fixture_connector is not None:
+            connectors = (
+                _fixture_connector
+                if type(_fixture_connector) is tuple
+                else (_fixture_connector,)
+            )
+            if not 1 <= len(connectors) <= 4 or any(
+                type(connector) is not FixtureFdConnector for connector in connectors
+            ):
+                raise CapabilityTransportError(
+                    "the synthetic origin connector is conformance-runner private API"
+                )
+            self._fixture_connectors = connectors
+        else:
+            self._fixture_connectors = ()
         self._host_state_dir = Path(host_state_dir)
         if (
             type(helper_timeout) not in (int, float)
@@ -3663,19 +3738,117 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
         self.last_https_terminal_source: str | None = None
         self.last_https_fixture_used = False
 
-    def _deliver_broker_fixture(self, prepared: _PreparedLiveLaunch) -> None:
-        """Arm the conformance synthetic origin on the authenticated channel."""
-        connector = self._fixture_connector
-        if connector is None:
-            return None
-        _deliver_fixture_connector(prepared.broker_control_w, connector)
-        self.last_https_fixture_used = True
-        self._emit(
-            "HTTPS_SYNTHETIC_ORIGIN_ARMED",
-            synthetic_origin=True,
-            non_production=True,
-            declared_addresses=list(connector.addresses),
+    @staticmethod
+    def _validate_grant_specs(
+        *,
+        approved_hostname: str | None,
+        grant_purpose: GrantPurpose | None,
+        approval_source: str | None,
+        approval_reference: str | None,
+        approved_grants: tuple[HostGrantSpec, ...] | None,
+    ) -> tuple[HostGrantSpec, ...]:
+        """Resolve the two mutually-exclusive grant specification forms.
+
+        The single-host keyword form (M4B-2) behaves exactly as before; the
+        ``approved_grants`` tuple form (M4B-3 Connected Build) admits 1..4
+        exact-host specifications.  Hostnames are canonicalized through the
+        ONE normalization point and must be unique across the set: two
+        grants naming one canonical hostname would be AMBIGUOUS_GRANTS at
+        authorize time, so the ambiguity rejects here, before any launch.
+        """
+        single_form = (
+            approved_hostname,
+            grant_purpose,
+            approval_source,
+            approval_reference,
         )
+        if approved_grants is not None:
+            if any(part is not None for part in single_form):
+                raise CapabilityTransportError(
+                    "approved_grants is mutually exclusive with the "
+                    "single-host grant arguments"
+                )
+            if type(approved_grants) is not tuple or not 1 <= len(
+                approved_grants
+            ) <= CONNECTED_BUILD_MAX_GRANTS:
+                raise CapabilityTransportError(
+                    "approved_grants must name 1.."
+                    f"{CONNECTED_BUILD_MAX_GRANTS} exact-host grant "
+                    "specifications"
+                )
+            specs = approved_grants
+        else:
+            if any(part is None for part in single_form):
+                raise CapabilityTransportError(
+                    "the single-host grant form requires approved_hostname, "
+                    "grant_purpose, approval_source, and approval_reference"
+                )
+            specs = (
+                HostGrantSpec(
+                    hostname=approved_hostname,
+                    purpose=grant_purpose,
+                    approval_source=approval_source,
+                    approval_reference=approval_reference,
+                ),
+            )
+        canonical_specs: list[HostGrantSpec] = []
+        for spec in specs:
+            if type(spec) is not HostGrantSpec:
+                raise CapabilityTransportError(
+                    "grant specifications must be HostGrantSpec instances"
+                )
+            if type(spec.purpose) is not GrantPurpose:
+                raise CapabilityTransportError(
+                    "grant_purpose must be a GrantPurpose"
+                )
+            if type(spec.approval_source) is not str or type(
+                spec.approval_reference
+            ) is not str:
+                raise CapabilityTransportError(
+                    "grant approval fields must be strings"
+                )
+            for label, value in (
+                ("connection_limit", spec.connection_limit),
+                ("byte_limit", spec.byte_limit),
+            ):
+                if value is not None and (type(value) is not int or value <= 0):
+                    raise CapabilityTransportError(
+                        f"grant {label} must be a positive integer"
+                    )
+            canonical_specs.append(
+                HostGrantSpec(
+                    hostname=canonicalize_hostname(spec.hostname),
+                    purpose=spec.purpose,
+                    approval_source=spec.approval_source,
+                    approval_reference=spec.approval_reference,
+                    connection_limit=spec.connection_limit,
+                    byte_limit=spec.byte_limit,
+                )
+            )
+        hostnames = [spec.hostname for spec in canonical_specs]
+        if len(set(hostnames)) != len(hostnames):
+            raise CapabilityTransportError(
+                "duplicate grant hostname is ambiguous; fail closed before launch"
+            )
+        return tuple(canonical_specs)
+
+    def _deliver_broker_fixture(self, prepared: _PreparedLiveLaunch) -> None:
+        """Arm the conformance synthetic origin(s) on the authenticated channel."""
+        if not self._fixture_connectors:
+            return None
+        # Each connector rides its own validated control message, in order;
+        # the broker bounds the armed set (HTTPS_FIXTURE_MAX_ORIGINS) and
+        # spends each origin exactly once, in arming order.
+        for connector in self._fixture_connectors:
+            _deliver_fixture_connector(prepared.broker_control_w, connector)
+        self.last_https_fixture_used = True
+        for connector in self._fixture_connectors:
+            self._emit(
+                "HTTPS_SYNTHETIC_ORIGIN_ARMED",
+                synthetic_origin=True,
+                non_production=True,
+                declared_addresses=list(connector.addresses),
+            )
         return None
 
     def _read_terminal_transport_observation(
@@ -3698,7 +3871,7 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
                 expected_network_policy_digest=network_policy_digest(
                     network_policy
                 ),
-                expect_synthetic=self._fixture_connector is not None,
+                expect_synthetic=bool(self._fixture_connectors),
                 budget=budget,
             )
         )
@@ -3756,11 +3929,13 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
             "upstream_version"
         ]
         policy = self.transport_policy
+        # The leaf's SAN set commits exactly the granted hostname set
+        # (sorted ascending, byte-exact), one SAN per granted hostname.
         material = generate_task_material(
             task_id=policy.task_id,
             task_generation=policy.task_generation,
             launch_nonce=policy.launch_nonce,
-            hostname=self._approved_hostname,
+            hostnames=tuple(sorted(spec.hostname for spec in self._grant_specs)),
             policy_digest=policy_digest(policy),
             timeout_seconds=self._helper_timeout,
         )
@@ -3773,18 +3948,34 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
         try:
             worker_ca_dir, worker_ca_path = _stage_worker_ca_pem(material)
             granted_at = time.time_ns()
-            grant = NetworkGrant(
-                grant_id=f"g{policy.launch_nonce[:16]}",
-                hostname=self._approved_hostname,
-                purpose=self._grant_purpose,
-                approval_source=self._approval_source,
-                approval_reference=self._approval_reference,
-                granted_at_wall_ns=granted_at,
-                expires_at_wall_ns=granted_at + self._grant_wall_lifetime_ns,
-                activated_at_monotonic_ns=policy.activated_at_monotonic_ns,
-                expires_at_monotonic_ns=policy.expires_at_monotonic_ns,
-                connection_limit=policy.connection_limit,
-                byte_limit=policy.byte_limit,
+            # One NetworkGrant per granted hostname; grant_id is unique per
+            # launch and deterministic in specification order.  Per-grant
+            # limits default to the TransportPolicy limits; the broker
+            # enforces min(policy, grant) per grant through its two-level
+            # (policy aggregate + per-grant) accounting.
+            grants = tuple(
+                NetworkGrant(
+                    grant_id=f"g{policy.launch_nonce[:12]}x{index:02d}",
+                    hostname=spec.hostname,
+                    purpose=spec.purpose,
+                    approval_source=spec.approval_source,
+                    approval_reference=spec.approval_reference,
+                    granted_at_wall_ns=granted_at,
+                    expires_at_wall_ns=granted_at + self._grant_wall_lifetime_ns,
+                    activated_at_monotonic_ns=policy.activated_at_monotonic_ns,
+                    expires_at_monotonic_ns=policy.expires_at_monotonic_ns,
+                    connection_limit=(
+                        policy.connection_limit
+                        if spec.connection_limit is None
+                        else spec.connection_limit
+                    ),
+                    byte_limit=(
+                        policy.byte_limit
+                        if spec.byte_limit is None
+                        else spec.byte_limit
+                    ),
+                )
+                for index, spec in enumerate(self._grant_specs)
             )
             network_policy = NetworkPolicy(
                 version="AOSHTTPS/1",
@@ -3793,7 +3984,7 @@ class HttpsCapabilityTransportRunner(CapabilityTransportRunner):
                 launch_nonce=policy.launch_nonce,
                 task_ca_certificate_digest=material.binding.ca_cert_sha256,
                 openssl_runtime_identity=openssl_identity,
-                grants=(grant,),
+                grants=grants,
             )
             sealed_fd = create_sealed_network_policy_fd(network_policy)
             self.last_https_network_policy = network_policy

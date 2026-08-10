@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import select
 import stat
 import subprocess
@@ -144,6 +145,15 @@ WORKER_ENVIRONMENT = (
     ("TMPDIR", "/tmp"),
     ("PWD", "/workspace"),
 )
+
+# Bounds for build_runtime_plan's extra_worker_env extension (the M4B-3
+# Connected Build profile): names are bounded environment-variable
+# identifiers, values are bounded printable ASCII, no name may collide with
+# the fixed base environment, and the extension itself stays small.
+_EXTRA_WORKER_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_EXTRA_WORKER_ENV_MAX_NAME = 128
+_EXTRA_WORKER_ENV_MAX_ENTRIES = 16
+_EXTRA_WORKER_ENV_MAX_VALUE = 512
 
 EXPLICIT_NAMESPACE_FLAGS = (
     "--unshare-user",
@@ -595,6 +605,46 @@ def _canonical_digest(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_extra_worker_env(
+    extra_worker_env: tuple[tuple[str, str], ...],
+) -> None:
+    """Fail closed unless an extra worker-env tuple stays inside its bounds.
+
+    Names are environment-variable identifiers that collide with neither
+    the fixed ``WORKER_ENVIRONMENT`` names nor each other; values are
+    bounded printable ASCII (no NUL/CR/LF or control bytes), so the
+    extension can never smuggle ambient proxy/locale/state variables past
+    the fixed-environment posture or inject a second assignment.
+    """
+    if (
+        type(extra_worker_env) is not tuple
+        or len(extra_worker_env) > _EXTRA_WORKER_ENV_MAX_ENTRIES
+    ):
+        raise ValueError("extra_worker_env must be a bounded tuple of pairs")
+    base_names = {name for name, _value in WORKER_ENVIRONMENT}
+    seen: set[str] = set()
+    for item in extra_worker_env:
+        if type(item) is not tuple or len(item) != 2:
+            raise ValueError("extra_worker_env entries must be (name, value) pairs")
+        name, value = item
+        if (
+            type(name) is not str
+            or len(name) > _EXTRA_WORKER_ENV_MAX_NAME
+            or not _EXTRA_WORKER_ENV_NAME_RE.fullmatch(name)
+        ):
+            raise ValueError("extra_worker_env names must be env identifiers")
+        if name in base_names or name in seen:
+            raise ValueError("extra_worker_env names must not collide")
+        seen.add(name)
+        if (
+            type(value) is not str
+            or len(value) > _EXTRA_WORKER_ENV_MAX_VALUE
+            or not value.isascii()
+            or any(ord(char) < 0x20 or ord(char) > 0x7E for char in value)
+        ):
+            raise ValueError("extra_worker_env values must be bounded printable ASCII")
+
+
 def build_runtime_plan(
     *,
     profile: M4AProfile,
@@ -605,17 +655,29 @@ def build_runtime_plan(
     task_tmp: AuthorizedSource,
     synthetic_home: AuthorizedSource,
     network_ca: AuthorizedSource | None = None,
+    extra_worker_env: tuple[tuple[str, str], ...] | None = None,
 ) -> RuntimeBoundaryPlan:
     """Build the fixed M4A source-to-synthetic-destination policy.
 
     ``network_ca`` is the M4B-2 HTTPS flavor's read-only task CA
     certificate (the sealed memfd, never the key); it is the ONLY
-    additive mount and existing flavors pass none.
+    additive mount and existing flavors pass none.  ``extra_worker_env``
+    is the M4B-3 Connected Build profile's deterministic environment
+    extension; appended after the fixed base tuple, it feeds the same
+    environment/combined digests, and passing None keeps the plan
+    byte-identical to the base posture.
     """
     if not isinstance(profile, M4AProfile):
         raise ValueError(f"invalid M4A profile: {profile!r}")
     if network_ca is not None and not isinstance(network_ca, AuthorizedSource):
         raise TypeError("network_ca must be an AuthorizedSource")
+    if extra_worker_env is not None:
+        _validate_extra_worker_env(extra_worker_env)
+    worker_environment = (
+        WORKER_ENVIRONMENT
+        if extra_worker_env is None
+        else (*WORKER_ENVIRONMENT, *extra_worker_env)
+    )
     workspace_bind = "--ro-bind-fd" if profile is M4AProfile.INSPECT else "--bind-fd"
     workspace_mode = "r" if profile is M4AProfile.INSPECT else "w"
     mounts = (
@@ -704,7 +766,7 @@ def build_runtime_plan(
         "dev": "synthetic",
         "run": "empty",
     }
-    environment = dict(WORKER_ENVIRONMENT)
+    environment = dict(worker_environment)
     environment_digest = _canonical_digest(environment)
     fs_digest = _canonical_digest(fs_payload)
     combined_payload = {
@@ -724,7 +786,7 @@ def build_runtime_plan(
         profile=profile,
         mounts=mounts,
         cwd="/workspace",
-        worker_environment=WORKER_ENVIRONMENT,
+        worker_environment=worker_environment,
         namespace_flags=EXPLICIT_NAMESPACE_FLAGS,
         network_policy="DENY",
         filesystem_view_digest=fs_digest,

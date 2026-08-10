@@ -63,14 +63,14 @@ TASK_CONTEXT_A = {
     "task_id": "task-origin-a",
     "task_generation": 5,
     "launch_nonce": "a0" * 16,
-    "hostname": APPROVED,
+    "hostnames": (APPROVED,),
     "policy_digest": "aa" * 32,
 }
 TASK_CONTEXT_B = {
     "task_id": "task-origin-b",
     "task_generation": 6,
     "launch_nonce": "b0" * 16,
-    "hostname": OTHER,
+    "hostnames": (OTHER,),
     "policy_digest": "bb" * 32,
 }
 

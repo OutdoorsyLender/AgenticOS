@@ -74,7 +74,7 @@ TASK_CONTEXT = {
     "task_id": "task-net-regression",
     "task_generation": 7,
     "launch_nonce": "ee" * 16,
-    "hostname": APPROVED,
+    "hostnames": (APPROVED,),
     "policy_digest": "cc" * 32,
 }
 

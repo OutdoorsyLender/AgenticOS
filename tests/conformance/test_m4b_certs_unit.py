@@ -37,7 +37,7 @@ TASK_CONTEXT = {
     "task_id": "task-certs",
     "task_generation": 3,
     "launch_nonce": "ab" * 16,
-    "hostname": "approved.example.test",
+    "hostnames": ("approved.example.test",),
     "policy_digest": "cd" * 32,
 }
 
@@ -45,7 +45,7 @@ _OTHER_CONTEXT = {
     "task_id": "task-other",
     "task_generation": 9,
     "launch_nonce": "ef" * 16,
-    "hostname": "other.example.test",
+    "hostnames": ("other.example.test",),
     "policy_digest": "01" * 32,
 }
 
@@ -190,9 +190,9 @@ def test_leaf_san_is_exactly_approved_hostname(verified):
     )
     entries = list(san_extension.value)
     assert len(entries) == 1
-    assert san_extension.value.get_values_for_type(x509.DNSName) == [
-        TASK_CONTEXT["hostname"]
-    ]
+    assert san_extension.value.get_values_for_type(x509.DNSName) == list(
+        TASK_CONTEXT["hostnames"]
+    )
     assert "*" not in entries[0].value
 
 
@@ -236,7 +236,7 @@ def test_binding_digest_is_canonical(material):
 
 def test_verify_accepts_genuine_material(material, verified):
     assert verified.binding == material.binding
-    assert verified.binding.hostname == TASK_CONTEXT["hostname"]
+    assert verified.binding.hostnames == TASK_CONTEXT["hostnames"]
 
 
 @pytest.mark.parametrize(
@@ -256,7 +256,7 @@ def test_stale_context_is_denied(material, field, value):
 
 
 def test_wrong_hostname_is_denied(material):
-    context = dict(TASK_CONTEXT, hostname="evil.example.test")
+    context = dict(TASK_CONTEXT, hostnames=("evil.example.test",))
     with pytest.raises(ch.CertHelperError):
         ch.verify_task_material(**_material_fds(material), **context)
 
@@ -387,7 +387,7 @@ def test_loader_builds_ssl_context_from_sealed_fds(material):
 
 
 def test_loader_fails_closed_with_wrong_expected_hostname(material):
-    context = dict(TASK_CONTEXT, hostname="evil.example.test")
+    context = dict(TASK_CONTEXT, hostnames=("evil.example.test",))
     with pytest.raises(ch.CertHelperError):
         ch.load_leaf_ssl_context(**_material_fds(material), **context)
 
@@ -404,7 +404,7 @@ def test_loader_rejects_mismatched_leaf_key_even_with_consistent_binding(
         task_id=TASK_CONTEXT["task_id"],
         task_generation=TASK_CONTEXT["task_generation"],
         launch_nonce=TASK_CONTEXT["launch_nonce"],
-        hostname=TASK_CONTEXT["hostname"],
+        hostnames=TASK_CONTEXT["hostnames"],
         policy_digest=TASK_CONTEXT["policy_digest"],
         ca_cert_sha256=hashlib.sha256(ca_cert).hexdigest(),
         leaf_cert_sha256=hashlib.sha256(leaf_cert).hexdigest(),
@@ -436,7 +436,7 @@ def test_loader_rejects_wrong_ca_even_with_consistent_binding(
         task_id=TASK_CONTEXT["task_id"],
         task_generation=TASK_CONTEXT["task_generation"],
         launch_nonce=TASK_CONTEXT["launch_nonce"],
-        hostname=TASK_CONTEXT["hostname"],
+        hostnames=TASK_CONTEXT["hostnames"],
         policy_digest=TASK_CONTEXT["policy_digest"],
         ca_cert_sha256=hashlib.sha256(wrong_ca).hexdigest(),
         leaf_cert_sha256=hashlib.sha256(leaf_cert).hexdigest(),
@@ -466,7 +466,7 @@ def test_loaded_context_does_not_retain_source_fds():
         with pytest.raises(OSError):
             os.fstat(fd)
     client, error, server_errors = _handshake(
-        context, _client_context(ca_pem), TASK_CONTEXT["hostname"]
+        context, _client_context(ca_pem), TASK_CONTEXT["hostnames"][0]
     )
     assert error is None, error
     assert not server_errors
@@ -482,12 +482,14 @@ def test_end_to_end_exact_hostname_handshake(material, verified):
     )
     trusting_only_task_ca = _client_context(verified.ca_cert_pem)
     client, error, server_errors = _handshake(
-        server_context, trusting_only_task_ca, TASK_CONTEXT["hostname"]
+        server_context, trusting_only_task_ca, TASK_CONTEXT["hostnames"][0]
     )
     assert error is None, error
     assert not server_errors
     peer = client.getpeercert()
-    assert tuple(peer["subjectAltName"]) == (("DNS", TASK_CONTEXT["hostname"]),)
+    assert tuple(peer["subjectAltName"]) == (
+        ("DNS", TASK_CONTEXT["hostnames"][0]),
+    )
     client.close()
 
 
@@ -512,7 +514,7 @@ def test_end_to_end_client_trusting_wrong_ca_fails(material, other_material):
         **_material_fds(other_material), **_OTHER_CONTEXT
     ).ca_cert_pem
     client, error, _server_errors = _handshake(
-        server_context, _client_context(other_ca), TASK_CONTEXT["hostname"]
+        server_context, _client_context(other_ca), TASK_CONTEXT["hostnames"][0]
     )
     assert client is None
     assert isinstance(error, ssl.SSLError)

@@ -1,8 +1,10 @@
-"""M4B-2 immutable HTTPS grant policy: hostname grammar and identity chain.
+"""M4B-2/M4B-3 immutable HTTPS grant policy: hostname grammar and identity chain.
 
-This module owns the ONE hostname canonicalization function for the M4B-2
-authenticated-HTTPS path.  Exactly one canonical approved hostname flows
-through every stage of a task's network authority:
+This module owns the ONE hostname canonicalization function for the
+authenticated-HTTPS path.  A bounded explicit exact-host grant set (zero
+grants is the deny-all posture; the Connected Build profile admits at most
+``CONNECTED_BUILD_MAX_GRANTS``) flows through every stage of a task's
+network authority, each granted hostname independently:
 
     sealed task grant -> CONNECT authority -> worker TLS SNI ->
     HTTP Host authority -> origin TLS SNI -> origin certificate hostname ->
@@ -11,10 +13,12 @@ through every stage of a task's network authority:
 Authorization at every comparison boundary is canonical BYTE EQUALITY.  No
 layer may independently "helpfully normalize" a mismatch into acceptance:
 ``canonicalize_hostname`` is the single normalization point, applied exactly
-once per input at a defined boundary (grant construction for the approved
+once per input at a defined boundary (grant construction for each approved
 hostname; ``normalize_https_authority`` for CONNECT authority and Host
 header bytes).  Every later comparison sees only canonical lowercase ASCII
-and compares bytes.
+and compares bytes.  Grants are exact-host only: no wildcard or suffix
+forms exist in the grammar, so no grant can widen authority beyond its own
+canonical hostname.
 
 Hostname grammar — narrow ASCII profile (NO IDNA in the MVP):
 
@@ -61,6 +65,12 @@ from .network_http import HttpPolicy
 _POLICY_VERSION = "AOSHTTPS/1"
 _HTTPS_PORT = 443
 _MAX_GRANTS = 64
+# The Connected Build worker profile admits a bounded explicit exact-host
+# grant set of at most this many grants (1..4; zero stays the legal deny-all
+# posture).  This is the PRODUCTION bound enforced at controller validation,
+# broker adoption, and broker serve; _MAX_GRANTS remains the type-level
+# representation cap for the NetworkPolicy container itself.
+CONNECTED_BUILD_MAX_GRANTS = 4
 _MAX_UNSIGNED_64 = (1 << 64) - 1
 _MAX_HOSTNAME_OCTETS = 253
 _MAX_LABEL_OCTETS = 63
@@ -421,6 +431,31 @@ class NetworkPolicy:
         if len(set(grant_ids)) != len(grant_ids):
             raise ValueError("duplicate grant_id is not buildable policy")
         object.__setattr__(self, "grants", grants)
+
+
+def validate_grant_set(grants: tuple) -> None:
+    """Fail closed unless ``grants`` is a bounded explicit exact-host grant set.
+
+    The Connected Build profile admits at most ``CONNECTED_BUILD_MAX_GRANTS``
+    grants; zero grants remains the legal deny-all posture and is accepted
+    here (authorization still denies every hostname against an empty set).
+    Hostnames must be unique across the set: two grants naming one canonical
+    hostname would be an AMBIGUOUS_GRANTS fail-closed at authorize time, so
+    the ambiguity rejects here, before any launch or adoption.  Raises
+    :class:`ValueError` on any violation.
+    """
+    items = tuple(grants)
+    if len(items) > CONNECTED_BUILD_MAX_GRANTS:
+        raise ValueError(
+            f"more than {CONNECTED_BUILD_MAX_GRANTS} grants exceeds the "
+            "Connected Build bound"
+        )
+    for grant in items:
+        if type(grant) is not NetworkGrant:
+            raise ValueError("grants must be NetworkGrant instances")
+    hostnames = [grant.hostname for grant in items]
+    if len(set(hostnames)) != len(hostnames):
+        raise ValueError("duplicate grant hostname is not buildable policy")
 
 
 def canonical_network_policy_bytes(policy: NetworkPolicy) -> bytes:
@@ -909,6 +944,7 @@ def read_sealed_network_policy_fd(fd: int) -> VerifiedSealedNetworkPolicy:
 __all__ = [
     "AuthorityRejectionCode",
     "AuthorizationCode",
+    "CONNECTED_BUILD_MAX_GRANTS",
     "GrantAuthorization",
     "GrantPurpose",
     "HostnameRejectionCode",
@@ -927,5 +963,6 @@ __all__ = [
     "network_policy_digest",
     "normalize_https_authority",
     "read_sealed_network_policy_fd",
+    "validate_grant_set",
     "verify_identity_chain",
 ]

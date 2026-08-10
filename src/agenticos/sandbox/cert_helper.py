@@ -2,7 +2,8 @@
 
 A trusted controller invokes a SHORT-LIVED helper subprocess that generates a
 per-task CA keypair and a DISTINCT leaf keypair, issues a leaf certificate
-valid only for the exact approved hostname, and returns all material as fully
+valid only for the exact approved hostname set (one SAN per granted
+hostname, sorted ascending, byte-exact), and returns all material as fully
 sealed memfds. The CA private key is never serialized, never leaves the
 helper's address space, and the helper exits before any hostile worker
 execution. See docs/phase-zero/dependency-review-m4b2.md for the dependency
@@ -28,8 +29,9 @@ Transport contract (mirrors network_identity.py / host_qualification.py):
   F_SEAL_SHRINK | F_SEAL_SEAL and VERIFIES the seals and write denial.
 - A binding record (canonical JSON + SHA-256, following network_models.py)
   binds the material to task_id, task_generation, launch_nonce, the approved
-  hostname, the policy digest, and the payload digests; it is carried in its
-  own sealed memfd and re-verified against the payload memfds on every load.
+  hostname set, the policy digest, and the payload digests; it is carried in
+  its own sealed memfd and re-verified against the payload memfds on every
+  load.
 - Broker-side verification fails closed on any stale or mismatched material.
 """
 
@@ -87,13 +89,19 @@ class CertHelperError(RuntimeError):
 
 @dataclass(frozen=True)
 class CertBinding:
-    """Canonical binding between sealed certificate material and one task."""
+    """Canonical binding between sealed certificate material and one task.
+
+    ``hostnames`` is the committed approved hostname set: a non-empty tuple
+    of canonical hostnames, sorted ascending with no duplicates.  Any other
+    shape — unsorted, duplicated, or uncanonical — rejects at construction
+    so the canonical bytes are deterministic.
+    """
 
     version: str
     task_id: str
     task_generation: int
     launch_nonce: str
-    hostname: str
+    hostnames: tuple[str, ...]
     policy_digest: str
     ca_cert_sha256: str
     leaf_cert_sha256: str
@@ -108,7 +116,7 @@ class CertBinding:
             self.launch_nonce,
             self.policy_digest,
         )
-        _require_hostname(self.hostname)
+        _require_hostnames(self.hostnames)
         for name in ("ca_cert_sha256", "leaf_cert_sha256", "leaf_key_sha256"):
             value = getattr(self, name)
             if type(value) is not str or not _LOWER_HEX_64_RE.fullmatch(value):
@@ -120,7 +128,7 @@ class CertBinding:
             "task_id": self.task_id,
             "task_generation": self.task_generation,
             "launch_nonce": self.launch_nonce,
-            "hostname": self.hostname,
+            "hostnames": list(self.hostnames),
             "policy_digest": self.policy_digest,
             "ca_cert_sha256": self.ca_cert_sha256,
             "leaf_cert_sha256": self.leaf_cert_sha256,
@@ -142,7 +150,7 @@ class CertBinding:
                 "task_id",
                 "task_generation",
                 "launch_nonce",
-                "hostname",
+                "hostnames",
                 "policy_digest",
                 "ca_cert_sha256",
                 "leaf_cert_sha256",
@@ -150,13 +158,18 @@ class CertBinding:
             },
             "cert binding",
         )
+        hostnames = decoded["hostnames"]
+        if type(hostnames) is not list or any(
+            type(name) is not str for name in hostnames
+        ):
+            raise CertHelperError("cert binding hostnames are invalid")
         try:
             binding = cls(
                 version=decoded["version"],
                 task_id=decoded["task_id"],
                 task_generation=decoded["task_generation"],
                 launch_nonce=decoded["launch_nonce"],
-                hostname=decoded["hostname"],
+                hostnames=tuple(hostnames),
                 policy_digest=decoded["policy_digest"],
                 ca_cert_sha256=decoded["ca_cert_sha256"],
                 leaf_cert_sha256=decoded["leaf_cert_sha256"],
@@ -211,6 +224,27 @@ def _require_hostname(value: object) -> None:
         ) from exc
     if canonical != value:
         raise CertHelperError("hostname must already be in canonical form")
+
+
+def _require_hostnames(value: object) -> None:
+    """Fail closed unless ``value`` is the ONE canonical hostname-set form.
+
+    The committed set is a non-empty tuple of already-canonical hostnames
+    (each decided by :func:`_require_hostname`), sorted ascending with no
+    duplicates — the only shape whose canonical JSON encoding is
+    deterministic.  Unsorted or duplicated input rejects here rather than
+    being silently repaired into a different commitment.
+    """
+    if type(value) is not tuple or not value:
+        raise CertHelperError(
+            "hostnames must be a non-empty tuple of canonical hostnames"
+        )
+    for name in value:
+        _require_hostname(name)
+    if len(set(value)) != len(value):
+        raise CertHelperError("hostnames must not contain duplicates")
+    if tuple(sorted(value)) != value:
+        raise CertHelperError("hostnames must be sorted ascending")
 
 
 def _require_task_context(
@@ -375,21 +409,21 @@ def verify_task_material(
     task_id: str,
     task_generation: int,
     launch_nonce: str,
-    hostname: str | None,
+    hostnames: tuple[str, ...] | None,
     policy_digest: str,
 ) -> VerifiedTaskMaterial:
     """Fail closed unless the sealed fds carry material for exactly this task.
 
     Rejects stale or mismatched material: wrong task, generation, nonce,
-    hostname, or policy digest, and any payload whose digest diverges from the
-    sealed binding record.  ``hostname=None`` is the zero-grant deny-all
-    posture: the binding's own committed hostname is adopted after the task
-    context and payload digests authenticate, because no connection can ever
-    be authorized against an empty grant set.
+    hostname set, or policy digest, and any payload whose digest diverges
+    from the sealed binding record.  ``hostnames=None`` is the zero-grant
+    deny-all posture: the binding's own committed hostname set is adopted
+    after the task context and payload digests authenticate, because no
+    connection can ever be authorized against an empty grant set.
     """
     _require_task_context(task_id, task_generation, launch_nonce, policy_digest)
-    if hostname is not None:
-        _require_hostname(hostname)
+    if hostnames is not None:
+        _require_hostnames(hostnames)
     ca_cert_pem = _read_sealed_fd_payload(ca_cert_fd, "ca certificate", _MAX_CERT_BYTES)
     leaf_cert_pem = _read_sealed_fd_payload(
         leaf_cert_fd, "leaf certificate", _MAX_CERT_BYTES
@@ -405,7 +439,7 @@ def verify_task_material(
         binding.task_id != task_id
         or binding.task_generation != task_generation
         or binding.launch_nonce != launch_nonce
-        or (hostname is not None and binding.hostname != hostname)
+        or (hostnames is not None and binding.hostnames != hostnames)
         or binding.policy_digest != policy_digest
     ):
         raise CertHelperError("certificate material context did not authenticate")
@@ -444,15 +478,16 @@ def _run_server_handshake(
 
 
 def _audit_handshake(
-    server_context: ssl.SSLContext, ca_cert_pem: bytes, hostname: str
+    server_context: ssl.SSLContext, ca_cert_pem: bytes, hostnames: tuple[str, ...]
 ) -> None:
-    """Prove the loaded leaf serves the exact hostname under only the task CA.
+    """Prove the loaded leaf serves the exact hostname set under only the task CA.
 
     A standard-library client that trusts ONLY the CA certificate payload
     performs a real TLS handshake against ``server_context`` over a socket
-    pair, with hostname checking enabled for ``hostname``. Any failure —
-    wrong key, broken chain, SAN mismatch — fails closed. The peer's SAN set
-    must then be exactly the approved hostname (no wildcard, no extra SANs).
+    pair, with hostname checking enabled for the first committed hostname.
+    Any failure — wrong key, broken chain, SAN mismatch — fails closed. The
+    peer's SAN set must then be exactly the committed hostname set, in
+    committed (sorted ascending) order: no wildcard, no extra SANs.
     """
     client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     client_context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -474,14 +509,14 @@ def _audit_handshake(
     try:
         right.settimeout(_AUDIT_TIMEOUT_SECONDS)
         server.start()
-        client_socket = client_context.wrap_socket(right, server_hostname=hostname)
+        client_socket = client_context.wrap_socket(right, server_hostname=hostnames[0])
         peer = client_socket.getpeercert()
         if not peer:
             raise CertHelperError("audit handshake returned no peer certificate")
         san = peer.get("subjectAltName", ())
-        if tuple(san) != (("DNS", hostname),):
+        if tuple(san) != tuple(("DNS", name) for name in hostnames):
             raise CertHelperError(
-                "leaf SAN set is not exactly the approved hostname"
+                "leaf SAN set is not exactly the committed hostname set"
             )
     except CertHelperError:
         raise
@@ -515,7 +550,7 @@ def load_leaf_ssl_context(
     task_id: str,
     task_generation: int,
     launch_nonce: str,
-    hostname: str | None,
+    hostnames: tuple[str, ...] | None,
     policy_digest: str,
 ) -> ssl.SSLContext:
     """Build a server SSLContext from the sealed FDs, retaining none of them.
@@ -524,9 +559,9 @@ def load_leaf_ssl_context(
     from short-lived CLOEXEC duplicates; ``load_cert_chain`` itself fails
     unless the leaf private key corresponds to the leaf certificate public
     key. A self-audit handshake then proves the leaf chains to the sealed
-    task CA and that its SAN set is exactly the approved hostname (with
-    ``hostname=None`` — the zero-grant deny-all posture — the sealed
-    binding's committed hostname is the audit expectation). Once this
+    task CA and that its SAN set is exactly the committed hostname set (with
+    ``hostnames=None`` — the zero-grant deny-all posture — the sealed
+    binding's committed hostname set is the audit expectation). Once this
     function returns, the caller may close every source fd; the context
     holds the material in OpenSSL memory only.
     """
@@ -538,7 +573,7 @@ def load_leaf_ssl_context(
         task_id=task_id,
         task_generation=task_generation,
         launch_nonce=launch_nonce,
-        hostname=hostname,
+        hostnames=hostnames,
         policy_digest=policy_digest,
     )
     cert_duplicate = _duplicate_cloexec(leaf_cert_fd, "leaf certificate")
@@ -564,7 +599,7 @@ def load_leaf_ssl_context(
     _audit_handshake(
         context,
         verified.ca_cert_pem,
-        hostname if hostname is not None else verified.binding.hostname,
+        hostnames if hostnames is not None else verified.binding.hostnames,
     )
     return context
 
@@ -696,7 +731,7 @@ def generate_task_material(
     task_id: str,
     task_generation: int,
     launch_nonce: str,
-    hostname: str,
+    hostnames: tuple[str, ...],
     policy_digest: str,
     timeout_seconds: float = _DEFAULT_HELPER_TIMEOUT_SECONDS,
 ) -> SealedTaskMaterial:
@@ -705,10 +740,12 @@ def generate_task_material(
     The helper child generates the CA and leaf keypairs, seals every output
     memfd, destroys the CA private key in its own address space, and exits
     before this function returns. The controller then re-verifies seals,
-    binding, and payload digests before accepting the material.
+    binding, and payload digests before accepting the material.  The leaf's
+    SAN set is exactly ``hostnames`` — the committed approved hostname set,
+    sorted ascending with no duplicates.
     """
     _require_task_context(task_id, task_generation, launch_nonce, policy_digest)
-    _require_hostname(hostname)
+    _require_hostnames(hostnames)
     if (
         type(timeout_seconds) not in (int, float)
         or not 0 < timeout_seconds <= 120
@@ -724,7 +761,7 @@ def generate_task_material(
             "task_id": task_id,
             "task_generation": task_generation,
             "launch_nonce": launch_nonce,
-            "hostname": hostname,
+            "hostnames": list(hostnames),
             "policy_digest": policy_digest,
             "fds": {name: fds[name] for name in _MATERIAL_FD_NAMES},
         }
@@ -768,7 +805,7 @@ def generate_task_material(
             task_id=task_id,
             task_generation=task_generation,
             launch_nonce=launch_nonce,
-            hostname=hostname,
+            hostnames=hostnames,
             policy_digest=policy_digest,
         )
         return SealedTaskMaterial(
@@ -796,7 +833,7 @@ def _child_build_material(
     task_id: str,
     task_generation: int,
     launch_nonce: str,
-    hostname: str,
+    hostnames: tuple[str, ...],
     policy_digest: str,
 ) -> dict[str, bytes]:
     """Generate keys/certs and return the four sealed payload byte strings.
@@ -881,7 +918,10 @@ def _child_build_material(
             x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=True
         )
         .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=True
+            x509.SubjectAlternativeName(
+                [x509.DNSName(name) for name in hostnames]
+            ),
+            critical=True,
         )
         .add_extension(
             x509.SubjectKeyIdentifier.from_public_key(leaf_private_key.public_key()),
@@ -915,7 +955,7 @@ def _child_build_material(
         task_id=task_id,
         task_generation=task_generation,
         launch_nonce=launch_nonce,
-        hostname=hostname,
+        hostnames=hostnames,
         policy_digest=policy_digest,
         ca_cert_sha256=hashlib.sha256(ca_cert_pem).hexdigest(),
         leaf_cert_sha256=hashlib.sha256(leaf_cert_pem).hexdigest(),
@@ -957,7 +997,7 @@ def _run_helper_child() -> None:
             "task_id",
             "task_generation",
             "launch_nonce",
-            "hostname",
+            "hostnames",
             "policy_digest",
             "fds",
         },
@@ -971,7 +1011,13 @@ def _run_helper_child() -> None:
         request["launch_nonce"],
         request["policy_digest"],
     )
-    _require_hostname(request["hostname"])
+    raw_hostnames = request["hostnames"]
+    if type(raw_hostnames) is not list or any(
+        type(name) is not str for name in raw_hostnames
+    ):
+        raise CertHelperError("helper request hostnames are invalid")
+    hostnames = tuple(raw_hostnames)
+    _require_hostnames(hostnames)
     fds = _require_exact_fields(
         request["fds"], set(_MATERIAL_FD_NAMES), "helper request fds"
     )
@@ -985,7 +1031,7 @@ def _run_helper_child() -> None:
         task_id=request["task_id"],
         task_generation=request["task_generation"],
         launch_nonce=request["launch_nonce"],
-        hostname=request["hostname"],
+        hostnames=hostnames,
         policy_digest=request["policy_digest"],
     )
     for name in _MATERIAL_FD_NAMES:

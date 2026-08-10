@@ -63,7 +63,7 @@ TASK_CONTEXT = {
     "task_id": "task-tls-termination",
     "task_generation": 4,
     "launch_nonce": "cd" * 16,
-    "hostname": APPROVED,
+    "hostnames": (APPROVED,),
     "policy_digest": "ab" * 32,
 }
 

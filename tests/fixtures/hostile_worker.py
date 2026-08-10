@@ -1424,6 +1424,78 @@ def scenario_m4b2_https_client(
         )
 
 
+def scenario_m4b3_connected_build(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Drive a SEQUENCE of broker sessions (M4B-3 Connected Build grants).
+
+    ``--canary`` carries a JSON option object: ``sessions`` (1..8 entries;
+    each is an M4B2-01 option object plus an ``authority``) and
+    ``env_census`` (bool).  Every session is an independent CONNECT + TLS +
+    HTTP/1.1 round through the fixed 127.0.0.1:18080 proxy, delegated to
+    the M4B2-01 driver.  A denied session (CONNECT 403, TLS failure) is
+    recorded and the sequence CONTINUES, so cross-grant, redirect, and
+    per-grant-limit probes observe the broker's per-connection fail-closed
+    posture within one launch.  The worker only ever trusts
+    /opt/agenticos/network-ca.pem.
+    """
+    started = utc_now_iso()
+    try:
+        options = json.loads(args.canary) if args.canary else {}
+    except ValueError as exc:
+        return make_result(
+            scenario_id, args.target or "", started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+        )
+    sessions = options.get("sessions", []) if isinstance(options, dict) else None
+    if not isinstance(sessions, list) or len(sessions) > 8 or (
+        not sessions and not options.get("env_census")
+    ):
+        return make_result(
+            scenario_id, args.target or "", started, succeeded=False,
+            error_type="ValueError",
+            error_message="canary must carry 0..8 sessions and/or env_census",
+        )
+    details: dict[str, Any] = {}
+    results = []
+    for session in sessions:
+        if not isinstance(session, dict) or not isinstance(
+            session.get("authority"), str
+        ):
+            return make_result(
+                scenario_id, args.target or "", started, succeeded=False,
+                error_type="ValueError",
+                error_message="each session requires an authority string",
+            )
+        authority = session["authority"]
+        session_options = {
+            key: value for key, value in session.items() if key != "authority"
+        }
+        sub_args = argparse.Namespace(
+            target=authority,
+            canary=json.dumps(session_options, separators=(",", ":")),
+            timeout=args.timeout,
+        )
+        outcome = scenario_m4b2_https_client(scenario_id, sub_args)
+        results.append(
+            {
+                "authority": authority,
+                "succeeded": outcome["succeeded"],
+                "error_type": outcome["error_type"],
+                "details": outcome["details"],
+            }
+        )
+    details["sessions"] = results
+    if options.get("env_census"):
+        details["environment"] = dict(os.environ)
+    # The worker completed its scripted sequence: per-session denials are
+    # the probes' expected outcomes, never worker failures.
+    return make_result(
+        scenario_id, args.target or "connected-build", started,
+        succeeded=True, details=details,
+    )
+
+
 def _fd_is_open(fd: int) -> bool:
     try:
         os.fstat(fd)
@@ -1631,6 +1703,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "M4B2-01": {"handler": scenario_m4b2_https_client,
                 "needs": ("target",),
                 "description": "Drive CONNECT+TLS+HTTP/1.1 through the fixed proxy."},
+    "M4B3-01": {"handler": scenario_m4b3_connected_build,
+                "needs": (),
+                "description": "Drive a sequence of CONNECT+TLS+HTTP/1.1 sessions through the fixed proxy."},
     "FS-16": {"handler": scenario_m4a_runtime_view, "needs": (),
                 "description": "Inspect the fixed M4A /workspace and runtime ABI."},
     "PROC-09": {"handler": scenario_m4a_security_state, "needs": (),
