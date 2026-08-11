@@ -714,14 +714,17 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
         return support
 
     def _open_worker_sources_m4b(self) -> tuple[AuthorizedSource, ...]:
-        specs = (
+        specs: list[tuple[Path, int]] = [
             (self.workspace, stat.S_IFDIR),
             (Path("/usr"), stat.S_IFDIR),
             (self.launcher_path, stat.S_IFREG),
             (self.worker_path, stat.S_IFREG),
             (self.task_tmp, stat.S_IFDIR),
             (self.synthetic_home, stat.S_IFDIR),
-        )
+        ]
+        if getattr(self, "git_mask_path", None) is not None:
+            specs.append((self.git_mask_path, stat.S_IFREG))
+
         opened: list[AuthorizedSource] = []
         try:
             for index, (path, expected_type) in enumerate(specs):
@@ -1049,14 +1052,13 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
             worker_sources = self._open_worker_sources_m4b()
             sources.extend(worker_sources)
             owned.add(*(source.fd for source in worker_sources))
-            (
-                workspace,
-                runtime_usr,
-                launcher,
-                worker,
-                task_tmp,
-                synthetic_home,
-            ) = worker_sources
+            workspace = worker_sources[0]
+            runtime_usr = worker_sources[1]
+            launcher = worker_sources[2]
+            worker = worker_sources[3]
+            task_tmp = worker_sources[4]
+            synthetic_home = worker_sources[5]
+            git_mask = worker_sources[6] if len(worker_sources) > 6 else None
             runtime_plan = build_runtime_plan(
                 profile=self.profile,
                 workspace=workspace,
@@ -1066,6 +1068,7 @@ class CapabilityTransportRunner(NamespaceLandlockRunner):
                 task_tmp=task_tmp,
                 synthetic_home=synthetic_home,
                 network_ca=worker_network_ca,
+                git_mask=git_mask,
                 extra_worker_env=self._extra_worker_env,
             )
 

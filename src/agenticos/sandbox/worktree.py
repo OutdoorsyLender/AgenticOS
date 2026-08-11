@@ -1304,3 +1304,268 @@ class WorktreeManager:
             # 5. Remove task state directory
             shutil.rmtree(task_dir, ignore_errors=True)
             return True
+
+    def ensure_git_mask(self, repo_id: str, task_id: str, generation: int) -> Path:
+        """Create controller-owned inert Git mask file for sandbox /workspace/.git binding."""
+        task_dir = self._get_task_state_dir(repo_id, task_id, generation)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        mask_file = task_dir / "git_mask"
+        if not mask_file.exists():
+            payload = b"# AgenticOS Git metadata masked for sandbox\n"
+            tmp_file = mask_file.with_suffix(f".tmp.{os.getpid()}")
+            with open(tmp_file, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, mask_file)
+            try:
+                os.chmod(mask_file, 0o400)
+            except OSError:
+                pass
+        return mask_file
+
+    def verify_worktree_for_sandbox(
+        self, repo_path: str | Path, task_id: str, generation: int
+    ) -> tuple[Path, Path, WorktreeLifecycleState]:
+        """Verify task worktree identity and status before mounting into sandbox.
+
+        Re-verifies:
+        1. Repository identity
+        2. Trusted ownership record authenticity
+        3. Descriptor kernel identity (st_dev/st_ino)
+        4. Lifecycle status (READY or valid active status)
+        5. Task ref existence and SHA
+
+        Returns (worktree_path, git_mask_path, lifecycle_state).
+        Raises WorktreeValidationError if any check fails (FAIL CLOSED).
+        """
+        repo = RepositoryIdentity.from_path(repo_path)
+        lock_path = self._get_lock_path(repo.repository_id)
+        with acquire_repository_lock(lock_path, timeout=self.lock_timeout):
+            state = self.inspect(repo_path, task_id, generation)
+            if state.status not in {
+                WorktreeLifecycleStatus.READY,
+                WorktreeLifecycleStatus.CLEAN_BASELINE_DISPOSABLE,
+                WorktreeLifecycleStatus.COMMITTED_WORK_PRESERVED,
+                WorktreeLifecycleStatus.DIRTY_PRESERVED,
+            }:
+                raise WorktreeValidationError(
+                    f"Worktree status {state.status.value} is not ready or valid for sandbox mount (FAIL CLOSED)"
+                )
+            if not state.ownership_record or not verify_ownership_record_authenticity(state.ownership_record):
+                raise WorktreeValidationError("Ownership record failed verification (FAIL CLOSED)")
+
+            worktree_dir = state.worktree_path
+            if not worktree_dir.is_dir() or worktree_dir.is_symlink():
+                raise WorktreeValidationError(f"Worktree path {worktree_dir} is invalid or a symlink")
+
+            cur_dev, cur_ino = _stat_descriptor_identity(worktree_dir)
+            if state.worktree_device is not None and (cur_dev != state.worktree_device or cur_ino != state.worktree_inode):
+                raise WorktreeValidationError(
+                    f"Worktree filesystem identity changed! Expected ({state.worktree_device}, {state.worktree_inode}), observed ({cur_dev}, {cur_ino})"
+                )
+
+            res_ref = _run_git_plumbing(["git", "rev-parse", state.task_ref], cwd=repo.canonical_root)
+            if res_ref.returncode != 0:
+                raise WorktreeValidationError(f"Task ref {state.task_ref} missing in repository")
+
+            mask_file = self.ensure_git_mask(repo.repository_id, task_id, generation)
+            return worktree_dir, mask_file, state
+
+    def capture_result(
+        self,
+        repo_path: str | Path,
+        task_id: str,
+        generation: int,
+        *,
+        worker_exit_code: Optional[int] = None,
+        worker_signal: Optional[int] = None,
+        worker_timed_out: bool = False,
+        max_diff_bytes: int = 1_000_000,
+        max_paths_per_category: int = 1000,
+    ) -> TaskWorktreeResult:
+        """Capture post-worker result from trusted Git & filesystem inspection of task worktree."""
+        repo = RepositoryIdentity.from_path(repo_path)
+        lock_path = self._get_lock_path(repo.repository_id)
+        with acquire_repository_lock(lock_path, timeout=self.lock_timeout):
+            state = self.inspect(repo_path, task_id, generation)
+            worktree_dir = state.worktree_path
+
+            if not worktree_dir.is_dir():
+                raise WorktreeValidationError(f"Worktree path {worktree_dir} missing for result capture")
+
+            cur_dev, cur_ino = _stat_descriptor_identity(worktree_dir)
+
+            res_head = _run_git_plumbing(["git", "rev-parse", "HEAD"], cwd=worktree_dir)
+            if res_head.returncode != 0:
+                raise WorktreeValidationError("Failed to resolve worktree HEAD SHA")
+            current_head_sha = res_head.stdout.strip().lower()
+
+            res_st = _run_git_plumbing(["git", "status", "--porcelain=v1", "-z"], cwd=worktree_dir)
+            modified_set: set[str] = set()
+            added_set: set[str] = set()
+            deleted_set: set[str] = set()
+
+            if res_st.returncode == 0 and res_st.stdout:
+                raw_entries = res_st.stdout.split("\0")
+                idx = 0
+                while idx < len(raw_entries):
+                    entry = raw_entries[idx]
+                    if not entry:
+                        idx += 1
+                        continue
+                    if len(entry) >= 3:
+                        st_code = entry[:2]
+                        path_str = entry[3:]
+                        if st_code[0] in ("R", "C") or st_code[1] in ("R", "C"):
+                            if idx + 1 < len(raw_entries):
+                                path_str = raw_entries[idx + 1]
+                                idx += 1
+
+                        if st_code == "??" or "A" in st_code:
+                            added_set.add(path_str)
+                        elif "D" in st_code:
+                            deleted_set.add(path_str)
+                        else:
+                            modified_set.add(path_str)
+                    idx += 1
+
+            mod_paths = tuple(sorted(modified_set)[:max_paths_per_category])
+            add_paths = tuple(sorted(added_set)[:max_paths_per_category])
+            del_paths = tuple(sorted(deleted_set)[:max_paths_per_category])
+
+            res_diff = _run_git_plumbing(["git", "diff", "HEAD"], cwd=worktree_dir)
+            diff_bytes = res_diff.stdout.encode("utf-8") if res_diff.returncode == 0 else b""
+
+            if added_set:
+                extra_diffs = []
+                for rel_p in sorted(added_set):
+                    full_p = worktree_dir / rel_p
+                    if full_p.is_file() and not full_p.is_symlink():
+                        try:
+                            content = full_p.read_text(encoding="utf-8", errors="replace")
+                            lines = content.splitlines()
+                            extra_diffs.append(
+                                f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,{len(lines)} @@\n+"
+                                + "\n+".join(lines)
+                                + "\n"
+                            )
+                        except OSError:
+                            pass
+                if extra_diffs:
+                    diff_bytes += ("\n" + "".join(extra_diffs)).encode("utf-8")
+
+            diff_sha256 = hashlib.sha256(diff_bytes).hexdigest()
+            diff_byte_count = len(diff_bytes)
+
+            if diff_byte_count > max_diff_bytes:
+                is_diff_truncated = True
+                diff_content = diff_bytes[:max_diff_bytes].decode("utf-8", errors="replace") + f"\n... [TRUNCATED {diff_byte_count - max_diff_bytes} BYTES]"
+            else:
+                is_diff_truncated = False
+                diff_content = diff_bytes.decode("utf-8", errors="replace")
+
+            is_clean = (
+                len(modified_set) == 0
+                and len(added_set) == 0
+                and len(deleted_set) == 0
+                and current_head_sha == state.baseline_commit_sha.lower()
+            )
+
+            if is_clean:
+                preservation = WorktreeLifecycleStatus.CLEAN_BASELINE_DISPOSABLE.value
+            elif current_head_sha != state.baseline_commit_sha.lower():
+                preservation = WorktreeLifecycleStatus.COMMITTED_WORK_PRESERVED.value
+            else:
+                preservation = WorktreeLifecycleStatus.DIRTY_PRESERVED.value
+
+            result = TaskWorktreeResult(
+                repository_id=repo.repository_id,
+                task_id=task_id,
+                generation=generation,
+                task_ref=state.task_ref,
+                baseline_commit_sha=state.baseline_commit_sha,
+                current_head_sha=current_head_sha,
+                worktree_path=worktree_dir,
+                worktree_device=cur_dev,
+                worktree_inode=cur_ino,
+                worker_exit_code=worker_exit_code,
+                worker_signal=worker_signal,
+                worker_timed_out=worker_timed_out,
+                lifecycle_status=WorktreeLifecycleStatus(preservation),
+                is_clean=is_clean,
+                modified_paths=mod_paths,
+                added_untracked_paths=add_paths,
+                deleted_paths=del_paths,
+                diff_sha256=diff_sha256,
+                diff_byte_count=diff_byte_count,
+                diff_content=diff_content,
+                is_diff_truncated=is_diff_truncated,
+                preservation_classification=preservation,
+            )
+
+            task_dir = self._get_task_state_dir(repo.repository_id, task_id, generation)
+            state.status = WorktreeLifecycleStatus(preservation)
+            state.stage_reached = "RESULT_CAPTURED"
+            state.updated_at = str(int(time.time()))
+            self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+            self._atomic_write_json(task_dir / "result.json", result.to_dict())
+
+            return result
+
+
+@dataclass(frozen=True)
+class TaskWorktreeResult:
+    """Typed controller result captured from trusted Git & filesystem inspection after worker execution."""
+
+    repository_id: str
+    task_id: str
+    generation: int
+    task_ref: str
+    baseline_commit_sha: str
+    current_head_sha: str
+    worktree_path: Path
+    worktree_device: Optional[int]
+    worktree_inode: Optional[int]
+    worker_exit_code: Optional[int]
+    worker_signal: Optional[int]
+    worker_timed_out: bool
+    lifecycle_status: WorktreeLifecycleStatus
+    is_clean: bool
+    modified_paths: tuple[str, ...]
+    added_untracked_paths: tuple[str, ...]
+    deleted_paths: tuple[str, ...]
+    diff_sha256: str
+    diff_byte_count: int
+    diff_content: str
+    is_diff_truncated: bool
+    preservation_classification: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repository_id": self.repository_id,
+            "task_id": self.task_id,
+            "generation": self.generation,
+            "task_ref": self.task_ref,
+            "baseline_commit_sha": self.baseline_commit_sha,
+            "current_head_sha": self.current_head_sha,
+            "worktree_path": str(self.worktree_path),
+            "worktree_device": self.worktree_device,
+            "worktree_inode": self.worktree_inode,
+            "worker_exit_code": self.worker_exit_code,
+            "worker_signal": self.worker_signal,
+            "worker_timed_out": self.worker_timed_out,
+            "lifecycle_status": self.lifecycle_status.value,
+            "is_clean": self.is_clean,
+            "modified_paths": list(self.modified_paths),
+            "added_untracked_paths": list(self.added_untracked_paths),
+            "deleted_paths": list(self.deleted_paths),
+            "diff_sha256": self.diff_sha256,
+            "diff_byte_count": self.diff_byte_count,
+            "diff_content": self.diff_content,
+            "is_diff_truncated": self.is_diff_truncated,
+            "preservation_classification": self.preservation_classification,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, indent=2)

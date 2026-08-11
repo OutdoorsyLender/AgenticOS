@@ -103,6 +103,7 @@ class MountRole(str, Enum):
     TASK_TMP = "task_tmp"
     SYNTHETIC_HOME = "synthetic_home"
     NETWORK_CA = "network_ca"
+    GIT_MASK = "git_mask"
 
 
 @dataclass(frozen=True)
@@ -605,6 +606,15 @@ def _canonical_digest(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+FORBIDDEN_GIT_ENV_NAMES = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+
+
 def _validate_extra_worker_env(
     extra_worker_env: tuple[tuple[str, str], ...],
 ) -> None:
@@ -633,6 +643,8 @@ def _validate_extra_worker_env(
             or not _EXTRA_WORKER_ENV_NAME_RE.fullmatch(name)
         ):
             raise ValueError("extra_worker_env names must be env identifiers")
+        if name in FORBIDDEN_GIT_ENV_NAMES or name.startswith("GIT_"):
+            raise ValueError(f"extra_worker_env forbids Git authority environment variable: {name!r}")
         if name in base_names or name in seen:
             raise ValueError("extra_worker_env names must not collide")
         seen.add(name)
@@ -655,6 +667,7 @@ def build_runtime_plan(
     task_tmp: AuthorizedSource,
     synthetic_home: AuthorizedSource,
     network_ca: AuthorizedSource | None = None,
+    git_mask: AuthorizedSource | None = None,
     extra_worker_env: tuple[tuple[str, str], ...] | None = None,
 ) -> RuntimeBoundaryPlan:
     """Build the fixed M4A source-to-synthetic-destination policy.
@@ -671,6 +684,8 @@ def build_runtime_plan(
         raise ValueError(f"invalid M4A profile: {profile!r}")
     if network_ca is not None and not isinstance(network_ca, AuthorizedSource):
         raise TypeError("network_ca must be an AuthorizedSource")
+    if git_mask is not None and not isinstance(git_mask, AuthorizedSource):
+        raise TypeError("git_mask must be an AuthorizedSource")
     if extra_worker_env is not None:
         _validate_extra_worker_env(extra_worker_env)
     worker_environment = (
@@ -725,6 +740,17 @@ def build_runtime_plan(
             "w",
         ),
     )
+    if git_mask is not None:
+        mounts = (
+            *mounts,
+            AuthorizedMount(
+                git_mask,
+                "/workspace/.git",
+                MountRole.GIT_MASK,
+                "--ro-bind-fd",
+                "r",
+            ),
+        )
     if network_ca is not None:
         mounts = (
             *mounts,

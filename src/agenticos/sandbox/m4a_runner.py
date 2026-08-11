@@ -77,6 +77,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
         launcher_path: str | os.PathLike[str],
         task_tmp: str | os.PathLike[str],
         synthetic_home: str | os.PathLike[str],
+        git_mask_path: Optional[str | os.PathLike[str]] = None,
         setup_timeout: float = 10.0,
         **kwargs,
     ) -> None:
@@ -86,6 +87,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
         self.launcher_path = Path(launcher_path)
         self.task_tmp = Path(task_tmp)
         self.synthetic_home = Path(synthetic_home)
+        self.git_mask_path = Path(git_mask_path) if git_mask_path else None
         self.setup_timeout = float(setup_timeout)
         if self.setup_timeout <= 0:
             raise ValueError("setup_timeout must be positive")
@@ -158,14 +160,17 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
     def _open_runtime_sources(self) -> tuple[AuthorizedSource, ...]:
         import stat
 
-        specs = (
+        specs: list[tuple[Path, int]] = [
             (self.workspace, stat.S_IFDIR),
             (Path("/usr"), stat.S_IFDIR),
             (self.launcher_path, stat.S_IFREG),
             (self.worker_path, stat.S_IFREG),
             (self.task_tmp, stat.S_IFDIR),
             (self.synthetic_home, stat.S_IFDIR),
-        )
+        ]
+        if self.git_mask_path is not None:
+            specs.append((self.git_mask_path, stat.S_IFREG))
+
         opened: list[AuthorizedSource] = []
         try:
             for index, (path, expected_type) in enumerate(specs):
@@ -374,14 +379,13 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 open_verified_bwrap(self._bwrap_capability), 20
             )
             sources = self._open_runtime_sources()
-            (
-                workspace,
-                runtime_usr,
-                launcher,
-                worker,
-                task_tmp,
-                synthetic_home,
-            ) = sources
+            workspace = sources[0]
+            runtime_usr = sources[1]
+            launcher = sources[2]
+            worker = sources[3]
+            task_tmp = sources[4]
+            synthetic_home = sources[5]
+            git_mask = sources[6] if len(sources) > 6 else None
             plan = build_runtime_plan(
                 profile=self.profile,
                 workspace=workspace,
@@ -390,6 +394,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 worker=worker,
                 task_tmp=task_tmp,
                 synthetic_home=synthetic_home,
+                git_mask=git_mask,
             )
             workspace_mount = plan.mount_for("/workspace")
             authorized_root_records = [
