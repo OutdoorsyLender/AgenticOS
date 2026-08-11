@@ -30,6 +30,11 @@ Linux baseline test run (WSL, this session, on the baseline commit):
 M4B-2 final numbers. Windows regression baseline to be recorded before the
 first code-changing slice closure.
 
+Addendum at closure: Windows regression results are recorded in the
+closure doc (`connected-build-m4b3.md` §Tests) and the slice closure
+reports — Windows host: **777 passed**, skipped 164 (baseline) → **168**
+across slices (new Linux-gated tests).
+
 ## 3. Repository evidence reviewed
 
 - `docs/phase-zero/runtime-boundary.md` (M4A earned claim)

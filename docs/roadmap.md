@@ -1,19 +1,23 @@
 # AgenticOS Roadmap
 
-M4A closes the measured L1/L2 tool-execution boundary. M4B-1 now proves the
-fixed capability-transport and lifecycle substrate described in
-[phase-zero/connected-build-boundary.md](phase-zero/connected-build-boundary.md).
-M4B-1 does not authorize Connected Build.
+M4A closes the measured L1/L2 tool-execution boundary. M4B-1 proves the
+fixed capability-transport and lifecycle substrate. M4B-2 earns the
+task-scoped authenticated HTTPS broker policy
+([phase-zero/https-broker-policy.md](phase-zero/https-broker-policy.md)).
+M4B-3 earns Connected Build, scoped
+([phase-zero/connected-build-m4b3.md](phase-zero/connected-build-m4b3.md)).
 
 ## P0 next
 
-1. **M4B-2 Connected Build policy** — the narrow task-scoped HTTPS broker
-   policy has landed ([phase-zero/https-broker-policy.md](phase-zero/https-broker-policy.md)):
-   one approved exact hostname per task on the qualified host, with an
-   authenticated startup probe gating broker readiness. It deliberately earns
-   NO Connected Build claim; build-ecosystem qualification (package managers,
-   registries, provider endpoints) remains M4B-3 scope, pending separate
-   architecture approval.
+1. **M4B-3 Connected Build — earned as scoped.** On the qualified host,
+   git HTTPS (smart-HTTP v2+v0), pip hash-pinned binary wheels (two exact
+   hosts), and generic digest-gated artifact fetch run through the M4B
+   broker inside a bounded 1–4 exact-host grant set — fixture-qualified
+   (`synthetic_origin=true` evidence; the production origin path is the
+   unchanged M4B-2 code). Not earned: npm/Cargo/Go, LFS, HTTP/2/3,
+   credentials, sdists, live-Internet, Windows. Records:
+   [phase-zero/connected-build-m4b3.md](phase-zero/connected-build-m4b3.md)
+   and the per-slice docs linked there.
 2. **Git worktree manager** — identity-bound assignment, lifecycle, cleanup,
    and the `/workspace` mapping contract.
 3. **Provider adapters** — Codex, Claude, Kimi ACP, then Antigravity in a

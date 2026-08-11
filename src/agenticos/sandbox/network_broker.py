@@ -3570,37 +3570,46 @@ def _establish_fixture_origin(
         validate_address,
     )
 
-    fixture = serve.fixture
-    if fixture is None:
-        return None, HttpsConnectionStage.ORIGIN_CONNECT, "origin_fixture_absent"
-    if fixture.spent:
-        if not serve.fixture_queue:
+    # The fixture CLAIM decision is serialized under serve.grant_lock (the
+    # leaf accounting lock, never held across I/O and never held at this
+    # call site): spent-check + queue rotation + spent-marking are one
+    # atomic decision, so two concurrent connections can never pop the
+    # same queued entry (or one pop and one IndexError) and can never
+    # both observe an unspent head and dup the same fixture fd.  The
+    # address validation is CPU-only and stays inside the same critical
+    # section to preserve the exact prohibited-means-unspent semantics.
+    with serve.grant_lock:
+        fixture = serve.fixture
+        if fixture is not None and fixture.spent and serve.fixture_queue:
+            # M4B-3 multi-origin conformance launches: the next pre-armed
+            # synthetic origin rotates in, in arming order, each spent once.
+            fixture = serve.fixture_queue.pop(0)
+            serve.fixture = fixture
+        if fixture is None:
+            return None, HttpsConnectionStage.ORIGIN_CONNECT, "origin_fixture_absent"
+        if fixture.spent:
             return None, HttpsConnectionStage.ORIGIN_CONNECT, "origin_fixture_spent"
-        # M4B-3 multi-origin conformance launches: the next pre-armed
-        # synthetic origin rotates in, in arming order, each spent once.
-        fixture = serve.fixture_queue.pop(0)
-        serve.fixture = fixture
-    resolved: list[ResolvedAddress] = []
-    prohibited = 0
-    for text in fixture.addresses:
-        address = ipaddress.ip_address(text)
-        verdict = validate_address(address)
-        if verdict.decision is AddressDecision.ALLOWED:
-            family = (
-                socket.AF_INET
-                if isinstance(address, ipaddress.IPv4Address)
-                else socket.AF_INET6
-            )
-            resolved.append(
-                ResolvedAddress(
-                    address=address, family=family, port=443, verdict=verdict
+        resolved: list[ResolvedAddress] = []
+        prohibited = 0
+        for text in fixture.addresses:
+            address = ipaddress.ip_address(text)
+            verdict = validate_address(address)
+            if verdict.decision is AddressDecision.ALLOWED:
+                family = (
+                    socket.AF_INET
+                    if isinstance(address, ipaddress.IPv4Address)
+                    else socket.AF_INET6
                 )
-            )
-        else:
-            prohibited += 1
-    if prohibited or not resolved:
-        return None, HttpsConnectionStage.RESOLUTION, "origin_prohibited_address"
-    fixture.spent = True
+                resolved.append(
+                    ResolvedAddress(
+                        address=address, family=family, port=443, verdict=verdict
+                    )
+                )
+            else:
+                prohibited += 1
+        if prohibited or not resolved:
+            return None, HttpsConnectionStage.RESOLUTION, "origin_prohibited_address"
+        fixture.spent = True
     sock = _wrap_owned_socket(os.dup(fixture.fd), "https fixture origin")
     runtime.set_origin(sock)
     outcome = open_origin_tls(

@@ -78,7 +78,11 @@ carry none of these by schema; build-script truth carries none because
 the qualified flows use no credentials (proven by the credential-isolation
 censuses in Slices 2 and 4). The composed JSON also round-trips loss-free.
 
-## The §25/§27 distinction, in evidence terms
+## Transport authenticity, artifact identity, reproducibility (in evidence terms)
+
+(The three-way distinction the M4B-3 milestone task specification —
+session-governing prompt — draws between what the transport proves and
+what the artifact proves.)
 
 - **Transport authenticity** (broker): the bytes came from an
   authorized exact host through the verified identity chain

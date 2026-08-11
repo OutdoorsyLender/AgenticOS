@@ -1137,6 +1137,69 @@ def test_serve_four_grant_flow_rotates_fixture_queue(tmp_path, four_host_leaf):
         harness.close()
 
 
+@linux_only
+def test_serve_concurrent_fixture_rotation_is_serialized(tmp_path, two_host_leaf):
+    """Two concurrent connections hit a spent active fixture head with one
+    queued origin: exactly ONE claims it (the rotation/spent-marking
+    decision is atomic under grant_lock), the other fails closed
+    deterministically with origin_fixture_spent — no double-pop, no shared
+    fixture fd, no thread errors.  Conformance-only path; loud-failure
+    direction pinned."""
+    from test_m4b_https_unit import _ScriptedOrigin, _ok_responder, _origin_pems
+
+    policy = _deny_transport_policy()
+    harness = _harness(policy, _two_grants_serving(policy), two_host_leaf)
+    try:
+        pems_a = _origin_pems(HOST_A)
+        origin_a_dir = tmp_path / "a"
+        origin_a_dir.mkdir()
+        origin_a = _ScriptedOrigin(
+            origin_a_dir, pems_a, _ok_responder(body=b"m4b3-spent")
+        )
+        pems_b = _origin_pems(HOST_A)
+        origin_b_dir = tmp_path / "b"
+        origin_b_dir.mkdir()
+        origin_b = _ScriptedOrigin(
+            origin_b_dir, pems_b, _ok_responder(body=b"m4b3-queued")
+        )
+        broker = _broker()
+        spent = broker._HttpsFixtureState(
+            origin_a.fd, pems_a["ca"].decode("ascii"), ("93.184.216.34",)
+        )
+        spent.spent = True
+        harness.serve.fixture = spent
+        harness.serve.fixture_queue.append(
+            broker._HttpsFixtureState(
+                origin_b.fd, pems_b["ca"].decode("ascii"), ("93.184.216.34",)
+            )
+        )
+        harness.origins.extend([origin_a, origin_b])
+        request = f"GET / HTTP/1.1\r\nHost: {HOST_A}\r\n\r\n".encode("ascii")
+        records, responses = _drive_two_concurrent(
+            harness, two_host_leaf, HOST_A, request
+        )
+        # Exactly one connection claimed the queued origin and completed.
+        served = [r for r in responses if r is not None and b"m4b3-queued" in r]
+        assert len(served) == 1, responses
+        completed = [
+            r for r in records if r.terminal_reason.value == "completed"
+        ]
+        assert len(completed) == 1, records
+        # The other failed closed at the spent fixture, deterministically.
+        spent_denials = [
+            r for r in records if r.detail == "origin_fixture_spent"
+        ]
+        assert len(spent_denials) == 1, records
+        assert spent_denials[0].stage_reached.value == "origin_connect"
+        assert spent_denials[0].terminal_reason.value == "denied"
+        # The pre-spent origin was never used; the queued one served once.
+        assert origin_a.requests == []
+        assert len(origin_b.requests) == 1
+        assert not harness.serve.thread_errors
+    finally:
+        harness.close()
+
+
 # ---------------------------------------------------------------------------
 # Controller-side grant-spec validation (Linux: m4b_runner import)
 # ---------------------------------------------------------------------------

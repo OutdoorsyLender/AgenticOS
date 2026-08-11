@@ -111,6 +111,10 @@ Proof corpus: `tests/conformance/test_m4b3_git_integration.py` (19 tests,
 
 ## Measured connection/byte behavior (this libcurl stack, fixture repo, protocol v2)
 
+All figures in this section are **measured observations, not
+assertion-pinned contract values** — they characterize this exact
+toolchain and fixture and may shift with stack versions.
+
 - `ls-remote`: 1 broker connection, 2 requests
   (`GET /repo.git/info/refs?service=git-upload-pack` plus the v2 ls-refs
   `POST /repo.git/git-upload-pack` on the same reused tunnel).

@@ -1,7 +1,9 @@
 # M4B-3 Slice 5 — Connected Build: lifecycle matrix
 
-Status: closed against the milestone §39 lifecycle/cancellation matrix,
-2026-08-10. New proof corpus:
+Status: closed against the lifecycle/cancellation matrix of the M4B-3
+milestone task specification (session-governing prompt; the matrix is
+reproduced in full below so this document is self-contained), 2026-08-10.
+New proof corpus:
 `tests/conformance/test_m4b3_lifecycle_integration.py` (6 tests,
 `m4b_linux`, all passing). This document is the per-cell proof map the
 final report needs; it deliberately CITES grant-agnostic coverage instead
@@ -9,7 +11,7 @@ of duplicating it.
 
 ## Matrix
 
-| §39 cell | Status | Proof |
+| Lifecycle cell | Status | Proof |
 | --- | --- | --- |
 | Task cancellation mid-curl-download | PRE-EXISTING [^curl-partial] | `test_fetch_worker_cancellation_mid_download_no_artifact` (Slice 3) |
 | Task cancellation mid-git-clone (POST + pack stream) | NEW | `test_cancel_mid_git_clone_no_partial_clone` |

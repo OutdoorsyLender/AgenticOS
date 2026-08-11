@@ -154,4 +154,6 @@ conformance-only, no production impact).
   qualification (`docs/phase-zero/connected-build-pip.md`), Slice 5
   lifecycle matrix and acquisition evidence
   (`docs/phase-zero/connected-build-lifecycle.md`,
-  `docs/phase-zero/connected-build-evidence.md`).
+  `docs/phase-zero/connected-build-evidence.md`). The final record of
+  the milestone is the closure doc:
+  `docs/phase-zero/connected-build-m4b3.md`.
