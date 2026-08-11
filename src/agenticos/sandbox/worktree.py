@@ -1,4 +1,4 @@
-"""Milestone 5 Controlled Git Worktree — Controller-Owned Worktree Lifecycle Substrate.
+"""Milestone 5 Controlled Git Worktree — Controller-Owned Worktree Lifecycle & Filesystem Authority Substrate.
 
 This module provides trusted, controller-side primitives for:
 1. Repository Identity representation & kernel identity binding (SHA-1 / SHA-256 detection).
@@ -8,16 +8,17 @@ This module provides trusted, controller-side primitives for:
 5. Controller-owned durable worktree state root outside the authoritative checkout.
 6. Real linked Git worktree creation, post-creation verification, transaction tracking,
    concurrency locking, crash recovery classification, and safe preservation/removal.
+7. Descriptor-bound filesystem authority (openat2/fstat kernel identity) and identity-guarded ref deletion.
 
 GOVERNING PRINCIPLE: Models reason; AgenticOS guarantees.
 AUTHORITY BOUNDARY: The main .git directory is NEVER exposed to hostile workers.
 
-SLICE 2A SCOPE & BOUNDARIES:
-- Controller-only lifecycle management.
-- Host-side Git worktree creation and identity verification.
-- No hostile worker launched.
-- Main .git directory is NEVER mounted into Bubblewrap/worker.
-- No worker Git view / commands exposed in this slice.
+SLICE 2A.1 DISPOSAL & PRESERVATION INVARIANTS:
+- CLEAN WORKTREE != DISPOSABLE TASK.
+- A task worktree is DISPOSABLE ONLY IF it remains strictly at the original baseline commit.
+- Tasks containing task-produced commits beyond baseline are classified COMMITTED_WORK_PRESERVED and CANNOT be deleted.
+- Ref deletion uses git update-ref -d <ref> <expected_sha> to prevent ref deletion races.
+- Filesystem operations re-verify fstat kernel identity (st_dev/st_ino) before any lifecycle transition.
 """
 
 from __future__ import annotations
@@ -90,16 +91,20 @@ class WorktreeLifecycleStatus(str, enum.Enum):
     WORKTREE_VERIFIED = "WORKTREE_VERIFIED"
     READY = "READY"
 
+    # Disposal & Preservation Classifications
+    CLEAN_BASELINE_DISPOSABLE = "CLEAN_BASELINE_DISPOSABLE"
+    COMMITTED_WORK_PRESERVED = "COMMITTED_WORK_PRESERVED"
+    DIRTY_PRESERVED = "DIRTY_PRESERVED"
+    PARTIAL_PRESERVED = "PARTIAL_PRESERVED"
+    UNKNOWN_PRESERVED = "UNKNOWN_PRESERVED"
+
     # Recovery / Anomaly Classifications
     PARTIAL_STATE_ONLY = "PARTIAL_STATE_ONLY"
     PARTIAL_REF_ONLY = "PARTIAL_REF_ONLY"
     PARTIAL_WORKTREE = "PARTIAL_WORKTREE"
-    DIRTY_PRESERVED = "DIRTY_PRESERVED"
     OWNERSHIP_MISMATCH = "OWNERSHIP_MISMATCH"
     GIT_METADATA_MISMATCH = "GIT_METADATA_MISMATCH"
-    UNKNOWN_PRESERVED = "UNKNOWN_PRESERVED"
     MISSING = "MISSING"
-    CLEAN_DISPOSABLE = "CLEAN_DISPOSABLE"
 
 
 def _sanitize_git_env() -> dict[str, str]:
@@ -334,6 +339,7 @@ class WorktreeOwnershipRecord:
     worktree_name: str
     reservation_digest: str
     ownership_digest: str
+    is_trusted: bool = False
 
     @classmethod
     def create(
@@ -350,6 +356,7 @@ class WorktreeOwnershipRecord:
         worktree_name: str,
         reservation_digest: str,
         schema_version: str = OWNERSHIP_SCHEMA_VERSION,
+        is_trusted: bool = False,
     ) -> WorktreeOwnershipRecord:
         if schema_version != OWNERSHIP_SCHEMA_VERSION:
             raise WorktreeValidationError(
@@ -387,10 +394,11 @@ class WorktreeOwnershipRecord:
             worktree_name=worktree_name,
             reservation_digest=reservation_digest,
             ownership_digest=ownership_digest,
+            is_trusted=is_trusted,
         )
 
     @classmethod
-    def create_from_reservation(cls, reservation: WorktreeReservation) -> WorktreeOwnershipRecord:
+    def create_from_reservation(cls, reservation: WorktreeReservation, *, is_trusted: bool = False) -> WorktreeOwnershipRecord:
         return cls.create(
             repository_id=reservation.repository.repository_id,
             object_format=reservation.repository.object_format,
@@ -402,16 +410,19 @@ class WorktreeOwnershipRecord:
             task_ref=reservation.task_ref.full_ref,
             worktree_name=reservation.worktree_name,
             reservation_digest=reservation.reservation_digest,
+            is_trusted=is_trusted,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("is_trusted", None)
+        return d
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> WorktreeOwnershipRecord:
+    def from_dict(cls, data: dict[str, Any], *, is_trusted: bool = False) -> WorktreeOwnershipRecord:
         if not isinstance(data, dict):
             raise WorktreeValidationError("ownership record payload must be a dict")
         known_keys = {
@@ -434,18 +445,19 @@ class WorktreeOwnershipRecord:
             worktree_name=data["worktree_name"],
             reservation_digest=data["reservation_digest"],
             schema_version=data.get("schema_version", OWNERSHIP_SCHEMA_VERSION),
+            is_trusted=is_trusted,
         )
         if record.ownership_digest != data.get("ownership_digest"):
             raise WorktreeValidationError("ownership record digest mismatch or corrupted payload")
         return record
 
     @classmethod
-    def from_json(cls, raw: str) -> WorktreeOwnershipRecord:
+    def from_json(cls, raw: str, *, is_trusted: bool = False) -> WorktreeOwnershipRecord:
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError) as exc:
             raise WorktreeValidationError(f"invalid ownership record JSON: {type(exc).__name__}") from exc
-        return cls.from_dict(data)
+        return cls.from_dict(data, is_trusted=is_trusted)
 
 
 @dataclass
@@ -489,11 +501,11 @@ class WorktreeLifecycleState:
         return json.dumps(self.to_dict(), sort_keys=True)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> WorktreeLifecycleState:
+    def from_dict(cls, data: dict[str, Any], *, is_trusted: bool = False) -> WorktreeLifecycleState:
         if not isinstance(data, dict):
             raise WorktreeValidationError("lifecycle payload must be a dict")
         ownership = (
-            WorktreeOwnershipRecord.from_dict(data["ownership_record"])
+            WorktreeOwnershipRecord.from_dict(data["ownership_record"], is_trusted=is_trusted)
             if data.get("ownership_record")
             else None
         )
@@ -515,15 +527,13 @@ class WorktreeLifecycleState:
         )
 
 
-def verify_ownership_record_authenticity(
-    record: WorktreeOwnershipRecord,
-    *,
-    in_controller_storage: bool,
-) -> bool:
-    """Verify ownership record integrity and controller storage authentication."""
-    if not in_controller_storage:
-        return False
-    if not isinstance(record, WorktreeOwnershipRecord):
+def verify_ownership_record_authenticity(record: WorktreeOwnershipRecord) -> bool:
+    """Verify ownership record integrity and controller storage authentication.
+
+    SECURITY RULE: Record MUST have is_trusted=True (set only by WorktreeManager when loaded
+    directly from identity-verified controller storage). Arbitrary parsed JSON is UNTRUSTED.
+    """
+    if not isinstance(record, WorktreeOwnershipRecord) or not record.is_trusted:
         return False
     if record.schema_version != OWNERSHIP_SCHEMA_VERSION:
         return False
@@ -663,8 +673,6 @@ def check_ref_collision(
     repo_path: str | Path,
     task_ref: TaskRef,
     expected_ownership: Optional[WorktreeOwnershipRecord] = None,
-    *,
-    in_controller_storage: bool = True,
 ) -> tuple[bool, Optional[str]]:
     """Check if task_ref exists in the repository and verify ownership record match."""
     canonical_repo = Path(repo_path).resolve(strict=True)
@@ -682,7 +690,7 @@ def check_ref_collision(
             f"Ref {task_ref.full_ref!r} already exists at {existing_sha!r} and no verified ownership record was provided (FAIL CLOSED)"
         )
 
-    if not verify_ownership_record_authenticity(expected_ownership, in_controller_storage=in_controller_storage):
+    if not verify_ownership_record_authenticity(expected_ownership):
         raise TaskRefCollisionError(
             f"Ownership record for ref {task_ref.full_ref!r} failed controller storage authentication (FAIL CLOSED)"
         )
@@ -708,6 +716,28 @@ def _is_same_or_subpath(target: Path, base: Path) -> bool:
         return t == b or b in t.parents
     except (ValueError, OSError):
         return False
+
+
+def _stat_descriptor_identity(path: Path) -> tuple[int, int]:
+    """Open directory handle and stat kernel identity (st_dev, st_ino)."""
+    if not path.exists():
+        raise WorktreeValidationError(f"path {path} does not exist for descriptor verification")
+    if path.is_symlink():
+        raise WorktreeValidationError(f"path {path} is a symlink (REJECTED)")
+
+    try:
+        if sys.platform.startswith("linux"):
+            fd = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                st = os.fstat(fd)
+                return int(st.st_dev), int(st.st_ino)
+            finally:
+                os.close(fd)
+        else:
+            st = os.stat(path)
+            return int(st.st_dev), int(st.st_ino)
+    except OSError as exc:
+        raise WorktreeValidationError(f"descriptor stat failed for {path}: {type(exc).__name__}") from exc
 
 
 def get_development_worktree_root_override() -> Optional[Path]:
@@ -813,7 +843,7 @@ def create_worktree_reservation(
 
 
 # ============================================================================
-# CONCURRENCY LOCKING & WORKTREE MANAGER (SLICE 2A)
+# CONCURRENCY LOCKING & WORKTREE MANAGER (SLICE 2A.1)
 # ============================================================================
 
 @contextlib.contextmanager
@@ -895,6 +925,19 @@ class WorktreeManager:
         except OSError:
             pass
 
+    def _load_trusted_ownership_record(self, task_dir: Path) -> WorktreeOwnershipRecord:
+        """Load ownership record directly from identity-verified controller storage directory."""
+        if not _is_same_or_subpath(task_dir, self.state_root):
+            raise WorktreeValidationError(f"task directory {task_dir} is outside trusted state root {self.state_root}")
+
+        ownership_file = task_dir / "ownership.json"
+        if not ownership_file.is_file():
+            raise WorktreeValidationError(f"ownership file missing in controller state {ownership_file}")
+
+        raw_json = ownership_file.read_text(encoding="utf-8")
+        # Record is trusted because it was loaded directly from controller storage
+        return WorktreeOwnershipRecord.from_json(raw_json, is_trusted=True)
+
     def create(
         self,
         reservation: WorktreeReservation,
@@ -923,8 +966,8 @@ class WorktreeManager:
             if _is_same_or_subpath(task_dir, repo.canonical_root):
                 raise WorktreeValidationError("task state directory cannot be inside or equal to repository checkout")
 
-            if worktree_dir.exists():
-                raise TaskRefCollisionError(f"worktree path {worktree_dir} already exists on disk")
+            if worktree_dir.exists() or worktree_dir.is_symlink():
+                raise TaskRefCollisionError(f"worktree path {worktree_dir} already exists on disk or is a symlink")
 
             ownership_file = task_dir / "ownership.json"
             if ownership_file.exists():
@@ -1005,9 +1048,9 @@ class WorktreeManager:
 
             # Stage 5: WORKTREE_VERIFIED
             self._verify_created_worktree(repo, reservation, worktree_dir)
-            st_wt = os.stat(worktree_dir)
-            state.worktree_device = int(st_wt.st_dev)
-            state.worktree_inode = int(st_wt.st_ino)
+            st_dev, st_ino = _stat_descriptor_identity(worktree_dir)
+            state.worktree_device = st_dev
+            state.worktree_inode = st_ino
             state.stage_reached = "WORKTREE_VERIFIED"
             state.status = WorktreeLifecycleStatus.WORKTREE_VERIFIED
             self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
@@ -1016,18 +1059,16 @@ class WorktreeManager:
                 raise WorktreeValidationError("injected failure after WORKTREE_VERIFIED")
 
             # Stage 6: READY
-            ownership = WorktreeOwnershipRecord.create_from_reservation(reservation)
+            ownership = WorktreeOwnershipRecord.create_from_reservation(reservation, is_trusted=True)
             self._atomic_write_json(ownership_file, ownership.to_dict())
 
-            # Re-read and verify written ownership record
-            with open(ownership_file, "r", encoding="utf-8") as f:
-                loaded_ownership = WorktreeOwnershipRecord.from_json(f.read())
-            if not verify_ownership_record_authenticity(loaded_ownership, in_controller_storage=True):
+            loaded_ownership = self._load_trusted_ownership_record(task_dir)
+            if not verify_ownership_record_authenticity(loaded_ownership):
                 raise WorktreeValidationError("written ownership record failed verification")
 
             state.ownership_record = loaded_ownership
             state.stage_reached = "READY"
-            state.status = WorktreeLifecycleStatus.READY
+            state.status = WorktreeLifecycleStatus.CLEAN_BASELINE_DISPOSABLE
             state.updated_at = str(int(time.time()))
             self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
 
@@ -1042,6 +1083,8 @@ class WorktreeManager:
         """Independently verify created worktree filesystem and Git plumbing metadata."""
         if not worktree_dir.is_dir():
             raise WorktreeValidationError(f"worktree directory does not exist: {worktree_dir}")
+        if worktree_dir.is_symlink():
+            raise WorktreeValidationError(f"worktree path is a symlink: {worktree_dir}")
 
         git_file = worktree_dir / ".git"
         if not git_file.is_file():
@@ -1087,7 +1130,6 @@ class WorktreeManager:
         task_dir = self._get_task_state_dir(repo.repository_id, task_id, generation)
         worktree_dir = task_dir / "worktree"
         lifecycle_file = task_dir / "lifecycle.json"
-        ownership_file = task_dir / "ownership.json"
 
         if not task_dir.exists():
             return WorktreeLifecycleState(
@@ -1127,33 +1169,55 @@ class WorktreeManager:
 
         with open(lifecycle_file, "r", encoding="utf-8") as f:
             state_data = json.load(f)
-        state = WorktreeLifecycleState.from_dict(state_data)
+        state = WorktreeLifecycleState.from_dict(state_data, is_trusted=False)
 
-        if ownership_file.exists():
-            with open(ownership_file, "r", encoding="utf-8") as f:
-                raw_owner = f.read()
-            try:
-                owner = WorktreeOwnershipRecord.from_json(raw_owner)
-                if verify_ownership_record_authenticity(owner, in_controller_storage=True):
-                    state.ownership_record = owner
-                else:
-                    state.status = WorktreeLifecycleStatus.OWNERSHIP_MISMATCH
-                    return state
-            except WorktreeValidationError:
+        try:
+            owner = self._load_trusted_ownership_record(task_dir)
+            if verify_ownership_record_authenticity(owner):
+                state.ownership_record = owner
+            else:
                 state.status = WorktreeLifecycleStatus.OWNERSHIP_MISMATCH
                 return state
+        except WorktreeValidationError:
+            state.status = WorktreeLifecycleStatus.OWNERSHIP_MISMATCH
+            return state
 
-        if not worktree_dir.exists():
-            if state.status == WorktreeLifecycleStatus.READY:
+        if not worktree_dir.exists() or worktree_dir.is_symlink():
+            if state.status in {WorktreeLifecycleStatus.READY, WorktreeLifecycleStatus.CLEAN_BASELINE_DISPOSABLE}:
                 state.status = WorktreeLifecycleStatus.PARTIAL_REF_ONLY
             return state
 
+        # Check task branch current SHA vs baseline SHA
+        res_ref = _run_git_plumbing(["git", "rev-parse", state.task_ref], cwd=repo.canonical_root)
+        if res_ref.returncode != 0:
+            state.status = WorktreeLifecycleStatus.PARTIAL_WORKTREE
+            return state
+        current_ref_sha = res_ref.stdout.strip().lower()
+
+        # Check worktree HEAD current SHA
+        res_wt_head = _run_git_plumbing(["git", "rev-parse", "HEAD"], cwd=worktree_dir)
+        if res_wt_head.returncode != 0:
+            state.status = WorktreeLifecycleStatus.GIT_METADATA_MISMATCH
+            return state
+        current_wt_sha = res_wt_head.stdout.strip().lower()
+
         # Check git status inside worktree
         res_status = _run_git_plumbing(["git", "status", "--porcelain"], cwd=worktree_dir)
-        if res_status.returncode == 0 and res_status.stdout.strip():
+        is_clean = (res_status.returncode == 0 and not res_status.stdout.strip())
+
+        if not is_clean:
             state.status = WorktreeLifecycleStatus.DIRTY_PRESERVED
             return state
 
+        # Working tree is clean. Now check if task branch produced commits beyond baseline!
+        baseline_sha = state.baseline_commit_sha.lower()
+        if current_ref_sha != baseline_sha or current_wt_sha != baseline_sha:
+            # CLEAN WORKTREE != DISPOSABLE TASK! Task produced commits beyond baseline.
+            state.status = WorktreeLifecycleStatus.COMMITTED_WORK_PRESERVED
+            return state
+
+        # Working tree is clean AND branch is at baseline SHA -> DISPOSABLE
+        state.status = WorktreeLifecycleStatus.CLEAN_BASELINE_DISPOSABLE
         return state
 
     def recover(self, repo_path: str | Path, task_id: str, generation: int) -> WorktreeLifecycleState:
@@ -1166,17 +1230,19 @@ class WorktreeManager:
     def preserve(self, repo_path: str | Path, task_id: str, generation: int) -> WorktreeLifecycleState:
         """Explicitly preserve task worktree state."""
         state = self.inspect(repo_path, task_id, generation)
-        if state.status not in {WorktreeLifecycleStatus.MISSING, WorktreeLifecycleStatus.CLEAN_DISPOSABLE}:
+        if state.status not in {WorktreeLifecycleStatus.MISSING, WorktreeLifecycleStatus.CLEAN_BASELINE_DISPOSABLE}:
             state.status = WorktreeLifecycleStatus.DIRTY_PRESERVED
         return state
 
     def remove_if_safe(self, repo_path: str | Path, task_id: str, generation: int) -> bool:
-        """Safely remove a clean, verified worktree and its task ref.
+        """Safely remove a clean, baseline-only owned worktree and its task ref.
 
         REFUSES DELETION and preserves work if:
-        - Worktree contains uncommitted/dirty/untracked changes.
-        - Ownership record is missing or invalid.
-        - Worktree filesystem/Git identity checks fail.
+        - Worktree contains uncommitted/dirty/untracked changes (DIRTY_PRESERVED).
+        - Task branch contains commits beyond baseline (COMMITTED_WORK_PRESERVED).
+        - Ownership record is missing, invalid, or unverified.
+        - Worktree kernel identity (st_dev/st_ino) changed unexpectedly.
+        - Ref deletion race is detected (git update-ref -d fails).
         """
         repo = RepositoryIdentity.from_path(repo_path)
         lock_path = self._get_lock_path(repo.repository_id)
@@ -1186,36 +1252,55 @@ class WorktreeManager:
             if state.status == WorktreeLifecycleStatus.MISSING:
                 return True
 
-            if state.status == WorktreeLifecycleStatus.DIRTY_PRESERVED:
+            if state.status == WorktreeLifecycleStatus.COMMITTED_WORK_PRESERVED:
                 raise WorktreeValidationError(
-                    f"Worktree for task {task_id} g{generation} contains uncommitted changes and CANNOT be deleted (PRESERVED)"
+                    f"Task branch for {task_id} g{generation} contains committed work beyond baseline and CANNOT be deleted (COMMITTED_WORK_PRESERVED)"
                 )
 
-            if state.status != WorktreeLifecycleStatus.READY or not state.ownership_record:
+            if state.status == WorktreeLifecycleStatus.DIRTY_PRESERVED:
                 raise WorktreeValidationError(
-                    f"Worktree state for task {task_id} g{generation} is not READY or lacks verified ownership (PRESERVED)"
+                    f"Worktree for task {task_id} g{generation} contains uncommitted changes and CANNOT be deleted (DIRTY_PRESERVED)"
+                )
+
+            if state.status != WorktreeLifecycleStatus.CLEAN_BASELINE_DISPOSABLE or not state.ownership_record:
+                raise WorktreeValidationError(
+                    f"Worktree state for task {task_id} g{generation} is status={state.status.value} (NOT DISPOSABLE, PRESERVED)"
                 )
 
             task_dir = self._get_task_state_dir(repo.repository_id, task_id, generation)
             worktree_dir = task_dir / "worktree"
             ref_name = state.task_ref
 
-            # 1. Verify git status porcelain is empty
+            # 1. Re-verify descriptor kernel identity (st_dev/st_ino) before destructive action
             if worktree_dir.exists():
+                cur_dev, cur_ino = _stat_descriptor_identity(worktree_dir)
+                if state.worktree_device is not None and (cur_dev != state.worktree_device or cur_ino != state.worktree_inode):
+                    raise WorktreeValidationError(
+                        f"Worktree filesystem identity changed! Expected ({state.worktree_device}, {state.worktree_inode}), observed ({cur_dev}, {cur_ino}) (PRESERVED)"
+                    )
+
+                # 2. Re-verify git status porcelain is empty
                 res_st = _run_git_plumbing(["git", "status", "--porcelain"], cwd=worktree_dir)
                 if res_st.returncode != 0 or res_st.stdout.strip():
                     raise WorktreeValidationError("Worktree contains modified/untracked files (PRESERVED)")
 
-                # 2. Prune worktree using git worktree remove
+                # 3. Prune worktree using git worktree remove
                 res_rm = _run_git_plumbing(["git", "worktree", "remove", str(worktree_dir)], cwd=repo.canonical_root)
                 if res_rm.returncode != 0:
-                    # Fallback to directory deletion if git worktree remove fails but dir is clean
                     shutil.rmtree(worktree_dir, ignore_errors=True)
                     _run_git_plumbing(["git", "worktree", "prune"], cwd=repo.canonical_root)
 
-            # 3. Delete task branch
-            _run_git_plumbing(["git", "branch", "-D", ref_name.replace("refs/heads/", "")], cwd=repo.canonical_root)
+            # 4. Identity-bound ref deletion with race guard: git update-ref -d <ref> <expected_sha>
+            expected_baseline = state.baseline_commit_sha
+            res_del_ref = _run_git_plumbing(
+                ["git", "update-ref", "-d", ref_name, expected_baseline],
+                cwd=repo.canonical_root,
+            )
+            if res_del_ref.returncode != 0:
+                raise WorktreeValidationError(
+                    f"git update-ref -d failed for {ref_name} expecting {expected_baseline}: ref race or mismatch detected (PRESERVED)"
+                )
 
-            # 4. Remove task state directory
+            # 5. Remove task state directory
             shutil.rmtree(task_dir, ignore_errors=True)
             return True
