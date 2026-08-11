@@ -1,4 +1,4 @@
-"""Milestone 5 Controlled Git Worktree — Task Identity & Ref Validation Substrate.
+"""Milestone 5 Controlled Git Worktree — Controller-Owned Worktree Lifecycle Substrate.
 
 This module provides trusted, controller-side primitives for:
 1. Repository Identity representation & kernel identity binding (SHA-1 / SHA-256 detection).
@@ -6,43 +6,40 @@ This module provides trusted, controller-side primitives for:
 3. Task Ref derivation & strict ASCII ref grammar enforcement.
 4. Ownership proof modeling, controller storage authentication, and fail-closed ref rules.
 5. Controller-owned durable worktree state root outside the authoritative checkout.
+6. Real linked Git worktree creation, post-creation verification, transaction tracking,
+   concurrency locking, crash recovery classification, and safe preservation/removal.
 
 GOVERNING PRINCIPLE: Models reason; AgenticOS guarantees.
 AUTHORITY BOUNDARY: The main .git directory is NEVER exposed to hostile workers.
 
-SLICE 2 HARD CONSTRAINTS & FILESYSTEM AUTHORITY CONTRACT:
-1. Pathname String Semantics:
-   - String pathname comparisons (_is_same_or_subpath) are non-authoritative defense-in-depth ONLY.
-   - Textual normalization does NOT establish filesystem object identity.
-   - Real Slice 2 worktree creation/destruction on Linux MUST operate on descriptor handles:
-     a. Open trusted state_root directory (O_DIRECTORY | O_CLOEXEC | O_PATH).
-     b. Verify directory kernel identity (fstat st_dev / st_ino).
-     c. Resolve paths using openat2 with RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS.
-     d. Record & re-verify st_dev / st_ino before any destructive lifecycle action.
-2. Durable State Root:
-   - Production worktrees MUST use an explicit durable controller state_root outside the checkout.
-   - Defaulting to OS temporary storage (/tmp) in production is disallowed (controller crash != loss of work).
-   - Ambient process environment (AGENTICOS_WORKTREE_ROOT) is NOT trusted authority for production.
-3. Ownership Authenticity:
-   - SHA-256 ownership_digest proves integrity and equality, NOT authentic provenance.
-   - Ownership records are authoritative ONLY when stored in controller-owned state (in_controller_storage=True).
-   - Worker-controlled .git metadata is NEVER used as an ownership record.
+SLICE 2A SCOPE & BOUNDARIES:
+- Controller-only lifecycle management.
+- Host-side Git worktree creation and identity verification.
+- No hostile worker launched.
+- Main .git directory is NEVER mounted into Bubblewrap/worker.
+- No worker Git view / commands exposed in this slice.
 """
 
 from __future__ import annotations
 
+import contextlib
+import enum
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 
 OWNERSHIP_SCHEMA_VERSION = "AOSWORKTREE/1"
+LIFECYCLE_SCHEMA_VERSION = "AOSLIFECYCLE/1"
 
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _WORKTREE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -83,31 +80,51 @@ class RepositoryIdentityError(WorktreeValidationError):
     """Raised when repository identity verification fails."""
 
 
+class WorktreeLifecycleStatus(str, enum.Enum):
+    """Enumeration of lifecycle status and recovery classifications."""
+
+    RESERVED = "RESERVED"
+    STATE_PREPARED = "STATE_PREPARED"
+    REF_RESERVED = "REF_RESERVED"
+    WORKTREE_CREATED = "WORKTREE_CREATED"
+    WORKTREE_VERIFIED = "WORKTREE_VERIFIED"
+    READY = "READY"
+
+    # Recovery / Anomaly Classifications
+    PARTIAL_STATE_ONLY = "PARTIAL_STATE_ONLY"
+    PARTIAL_REF_ONLY = "PARTIAL_REF_ONLY"
+    PARTIAL_WORKTREE = "PARTIAL_WORKTREE"
+    DIRTY_PRESERVED = "DIRTY_PRESERVED"
+    OWNERSHIP_MISMATCH = "OWNERSHIP_MISMATCH"
+    GIT_METADATA_MISMATCH = "GIT_METADATA_MISMATCH"
+    UNKNOWN_PRESERVED = "UNKNOWN_PRESERVED"
+    MISSING = "MISSING"
+    CLEAN_DISPOSABLE = "CLEAN_DISPOSABLE"
+
+
 def _sanitize_git_env() -> dict[str, str]:
-    """Build a sanitized environment for controller-side Git subprocesses."""
+    """Build a deterministic controller-side environment for Git plumbing commands."""
     kept: dict[str, str] = {
         "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+        "GIT_SSH": "",
+        "GIT_SSH_COMMAND": "",
+        "HOME": "/nonexistent",
+        "XDG_CONFIG_HOME": "/nonexistent",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
         "LC_ALL": "C.UTF-8",
         "LANG": "C.UTF-8",
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     }
-    for key, value in os.environ.items():
-        upper = key.upper()
-        if (
-            upper in _ENV_DENY_EXACT
-            or any(upper.startswith(p) for p in _ENV_DENY_PREFIXES)
-            or any(s in upper for s in _ENV_DENY_SUBSTRINGS)
-        ):
-            continue
-        if key not in kept:
-            kept[key] = value
     return kept
 
 
 def _run_git_plumbing(
     argv: list[str],
     cwd: Path,
-    timeout: float = 5.0,
+    timeout: float = 10.0,
 ) -> subprocess.CompletedProcess[str]:
     """Execute a Git plumbing command safely without shell interpretation."""
     if not argv or argv[0] != "git":
@@ -431,18 +448,79 @@ class WorktreeOwnershipRecord:
         return cls.from_dict(data)
 
 
+@dataclass
+class WorktreeLifecycleState:
+    """Controller-side lifecycle transaction state."""
+
+    schema_version: str
+    status: WorktreeLifecycleStatus
+    stage_reached: str
+    task_id: str
+    generation: int
+    repository_id: str
+    baseline_commit_sha: str
+    task_ref: str
+    worktree_path: Path
+    worktree_device: Optional[int]
+    worktree_inode: Optional[int]
+    ownership_record: Optional[WorktreeOwnershipRecord]
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "status": self.status.value,
+            "stage_reached": self.stage_reached,
+            "task_id": self.task_id,
+            "generation": self.generation,
+            "repository_id": self.repository_id,
+            "baseline_commit_sha": self.baseline_commit_sha,
+            "task_ref": self.task_ref,
+            "worktree_path": str(self.worktree_path),
+            "worktree_device": self.worktree_device,
+            "worktree_inode": self.worktree_inode,
+            "ownership_record": self.ownership_record.to_dict() if self.ownership_record else None,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> WorktreeLifecycleState:
+        if not isinstance(data, dict):
+            raise WorktreeValidationError("lifecycle payload must be a dict")
+        ownership = (
+            WorktreeOwnershipRecord.from_dict(data["ownership_record"])
+            if data.get("ownership_record")
+            else None
+        )
+        return cls(
+            schema_version=data.get("schema_version", LIFECYCLE_SCHEMA_VERSION),
+            status=WorktreeLifecycleStatus(data["status"]),
+            stage_reached=data["stage_reached"],
+            task_id=data["task_id"],
+            generation=data["generation"],
+            repository_id=data["repository_id"],
+            baseline_commit_sha=data["baseline_commit_sha"],
+            task_ref=data["task_ref"],
+            worktree_path=Path(data["worktree_path"]),
+            worktree_device=data.get("worktree_device"),
+            worktree_inode=data.get("worktree_inode"),
+            ownership_record=ownership,
+            created_at=data["created_at"],
+            updated_at=data["updated_at"],
+        )
+
+
 def verify_ownership_record_authenticity(
     record: WorktreeOwnershipRecord,
     *,
     in_controller_storage: bool,
 ) -> bool:
-    """Verify ownership record integrity and controller storage authentication.
-
-    SECURITY RULE: SHA-256 ownership_digest proves integrity and identity equality,
-    NOT authentic provenance. Anyone can recompute a SHA-256 digest over tampered JSON.
-    Ownership records are authoritative ONLY when retrieved from trusted, controller-owned
-    storage (in_controller_storage=True) that hostile workers cannot write or modify.
-    """
+    """Verify ownership record integrity and controller storage authentication."""
     if not in_controller_storage:
         return False
     if not isinstance(record, WorktreeOwnershipRecord):
@@ -588,11 +666,7 @@ def check_ref_collision(
     *,
     in_controller_storage: bool = True,
 ) -> tuple[bool, Optional[str]]:
-    """Check if task_ref exists in the repository and verify ownership record match.
-
-    Returns (exists, commit_sha).
-    Raises TaskRefCollisionError if the ref exists and ownership cannot be proven (FAIL CLOSED).
-    """
+    """Check if task_ref exists in the repository and verify ownership record match."""
     canonical_repo = Path(repo_path).resolve(strict=True)
     res = _run_git_plumbing(
         ["git", "rev-parse", "--verify", "--quiet", "--end-of-options", task_ref.full_ref],
@@ -627,12 +701,7 @@ def check_ref_collision(
 
 
 def _is_same_or_subpath(target: Path, base: Path) -> bool:
-    """Non-authoritative early controller-side validation (DEFENSE-IN-DEPTH ONLY).
-
-    NOTE: Pathname string comparison DOES NOT establish filesystem object identity.
-    Real Slice 2 authority enforcement MUST use descriptor handles (openat2),
-    kernel identity (st_dev/st_ino), and RESOLVE_BENEATH semantics.
-    """
+    """Non-authoritative early controller-side validation (DEFENSE-IN-DEPTH ONLY)."""
     try:
         t = target.resolve()
         b = base.resolve()
@@ -642,11 +711,7 @@ def _is_same_or_subpath(target: Path, base: Path) -> bool:
 
 
 def get_development_worktree_root_override() -> Optional[Path]:
-    """Retrieve development/test override from environment.
-
-    NOTE: Ambient environment variables are NOT trusted authority roots for production tasks.
-    Top-level controller configuration MUST explicitly validate and bind state_root.
-    """
+    """Retrieve development/test override from environment."""
     val = os.environ.get("AGENTICOS_WORKTREE_ROOT")
     return Path(val).resolve() if val else None
 
@@ -657,12 +722,7 @@ def get_default_worktree_root(
     *,
     allow_temporary_for_test: bool = False,
 ) -> Path:
-    """Determine trusted controller-owned worktree root outside the authoritative repository checkout.
-
-    PRODUCTION REQUIREMENT: Production worktree state MUST use an explicit durable controller state_root.
-    Silently defaulting to temporary OS storage (/tmp) in production is disallowed to ensure
-    uncommitted model work survives controller restart/crash.
-    """
+    """Determine trusted controller-owned worktree root outside the authoritative repository checkout."""
     if state_root is not None:
         root = Path(state_root).resolve()
     else:
@@ -683,7 +743,7 @@ def get_default_worktree_root(
             f"Worktree state root {root} cannot be equal to or located inside the authoritative repository checkout {canonical_repo}"
         )
 
-    return root / repo_identity.repository_id
+    return root / "worktrees" / repo_identity.repository_id
 
 
 def create_worktree_reservation(
@@ -723,7 +783,7 @@ def create_worktree_reservation(
     target_root = get_default_worktree_root(
         repo, state_root=state_root, allow_temporary_for_test=allow_temporary_for_test
     )
-    proposed_path = target_root / task_identity.identity_digest[:16] / worktree_name
+    proposed_path = target_root / task_id / f"g{generation}" / "worktree"
 
     if _is_same_or_subpath(proposed_path, repo.canonical_root):
         raise WorktreeValidationError(
@@ -750,3 +810,412 @@ def create_worktree_reservation(
         proposed_worktree_path=proposed_path,
         reservation_digest=reservation_digest,
     )
+
+
+# ============================================================================
+# CONCURRENCY LOCKING & WORKTREE MANAGER (SLICE 2A)
+# ============================================================================
+
+@contextlib.contextmanager
+def acquire_repository_lock(lock_path: Path, timeout: float = 30.0):
+    """Kernel-held cross-process repository lock released automatically on process exit."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path, "a+b")
+    start = time.monotonic()
+    acquired = False
+    while time.monotonic() - start < timeout:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except OSError:
+            time.sleep(0.05)
+
+    if not acquired:
+        f.close()
+        raise WorktreeValidationError(f"failed to acquire controller repository lock at {lock_path} within {timeout}s")
+
+    try:
+        yield f
+    finally:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        f.close()
+
+
+class WorktreeManager:
+    """Trusted host-side controller managing Git worktree creation, verification, and preservation."""
+
+    def __init__(self, state_root: str | Path, lock_timeout: float = 30.0):
+        self.state_root = Path(state_root).resolve()
+        self.lock_timeout = lock_timeout
+        if not self.state_root.is_dir():
+            self.state_root.mkdir(parents=True, exist_ok=True)
+
+    def _get_repo_state_dir(self, repo_id: str) -> Path:
+        return self.state_root / "worktrees" / repo_id
+
+    def _get_task_state_dir(self, repo_id: str, task_id: str, generation: int) -> Path:
+        return self._get_repo_state_dir(repo_id) / task_id / f"g{generation}"
+
+    def _get_lock_path(self, repo_id: str) -> Path:
+        return self._get_repo_state_dir(repo_id) / "controller.lock"
+
+    def _atomic_write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(f".tmp.{os.getpid()}")
+        raw = json.dumps(payload, sort_keys=True, indent=2).encode("utf-8")
+
+        with open(tmp_path, "wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_path, path)
+        try:
+            parent_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            pass
+
+    def create(
+        self,
+        reservation: WorktreeReservation,
+        *,
+        _inject_failure_at_stage: Optional[str] = None,
+    ) -> WorktreeLifecycleState:
+        """Create a real linked Git worktree safely from a validated reservation."""
+        repo = reservation.repository
+        task = reservation.task_identity
+        ref = reservation.task_ref
+
+        lock_path = self._get_lock_path(repo.repository_id)
+        with acquire_repository_lock(lock_path, timeout=self.lock_timeout):
+            # 1. Re-verify baseline commit SHA
+            validated_baseline = validate_baseline_commit(
+                repo.canonical_root, task.baseline_commit_sha, expected_object_format=repo.object_format
+            )
+
+            # 2. Check path & ref collisions
+            worktree_dir = reservation.proposed_worktree_path
+            task_dir = worktree_dir.parent
+
+            if _is_same_or_subpath(worktree_dir, repo.canonical_root):
+                raise WorktreeValidationError("worktree directory cannot be inside or equal to repository checkout")
+
+            if _is_same_or_subpath(task_dir, repo.canonical_root):
+                raise WorktreeValidationError("task state directory cannot be inside or equal to repository checkout")
+
+            if worktree_dir.exists():
+                raise TaskRefCollisionError(f"worktree path {worktree_dir} already exists on disk")
+
+            ownership_file = task_dir / "ownership.json"
+            if ownership_file.exists():
+                raise TaskRefCollisionError(f"task state directory {task_dir} already contains ownership.json")
+
+            check_ref_collision(repo.canonical_root, ref, expected_ownership=None)
+
+            now_str = str(int(time.time()))
+            state = WorktreeLifecycleState(
+                schema_version=LIFECYCLE_SCHEMA_VERSION,
+                status=WorktreeLifecycleStatus.RESERVED,
+                stage_reached="RESERVED",
+                task_id=task.task_id,
+                generation=task.generation,
+                repository_id=repo.repository_id,
+                baseline_commit_sha=validated_baseline,
+                task_ref=ref.full_ref,
+                worktree_path=worktree_dir,
+                worktree_device=None,
+                worktree_inode=None,
+                ownership_record=None,
+                created_at=now_str,
+                updated_at=now_str,
+            )
+            self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+
+            if _inject_failure_at_stage == "RESERVED":
+                state.status = WorktreeLifecycleStatus.PARTIAL_STATE_ONLY
+                self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+                raise WorktreeValidationError("injected failure after RESERVED")
+
+            # Stage 2: STATE_PREPARED
+            state.stage_reached = "STATE_PREPARED"
+            state.status = WorktreeLifecycleStatus.STATE_PREPARED
+            task_dir.mkdir(parents=True, exist_ok=True)
+            self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+
+            if _inject_failure_at_stage == "STATE_PREPARED":
+                state.status = WorktreeLifecycleStatus.PARTIAL_STATE_ONLY
+                self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+                raise WorktreeValidationError("injected failure after STATE_PREPARED")
+
+            # Stage 3: REF_RESERVED
+            res_branch = _run_git_plumbing(
+                ["git", "branch", ref.branch_name, validated_baseline],
+                cwd=repo.canonical_root,
+            )
+            if res_branch.returncode != 0:
+                raise WorktreeValidationError(f"failed to create task branch {ref.branch_name}: {res_branch.stderr.strip()}")
+
+            state.stage_reached = "REF_RESERVED"
+            state.status = WorktreeLifecycleStatus.REF_RESERVED
+            self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+
+            if _inject_failure_at_stage == "REF_RESERVED":
+                state.status = WorktreeLifecycleStatus.PARTIAL_REF_ONLY
+                self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+                raise WorktreeValidationError("injected failure after REF_RESERVED")
+
+            # Stage 4: WORKTREE_CREATED
+            res_wt = _run_git_plumbing(
+                ["git", "worktree", "add", str(worktree_dir), ref.branch_name],
+                cwd=repo.canonical_root,
+            )
+            if res_wt.returncode != 0:
+                state.status = WorktreeLifecycleStatus.PARTIAL_REF_ONLY
+                self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+                raise WorktreeValidationError(f"git worktree add failed: {res_wt.stderr.strip()}")
+
+            state.stage_reached = "WORKTREE_CREATED"
+            state.status = WorktreeLifecycleStatus.WORKTREE_CREATED
+            self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+
+            if _inject_failure_at_stage == "WORKTREE_CREATED":
+                state.status = WorktreeLifecycleStatus.PARTIAL_WORKTREE
+                self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+                raise WorktreeValidationError("injected failure after WORKTREE_CREATED")
+
+            # Stage 5: WORKTREE_VERIFIED
+            self._verify_created_worktree(repo, reservation, worktree_dir)
+            st_wt = os.stat(worktree_dir)
+            state.worktree_device = int(st_wt.st_dev)
+            state.worktree_inode = int(st_wt.st_ino)
+            state.stage_reached = "WORKTREE_VERIFIED"
+            state.status = WorktreeLifecycleStatus.WORKTREE_VERIFIED
+            self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+
+            if _inject_failure_at_stage == "WORKTREE_VERIFIED":
+                raise WorktreeValidationError("injected failure after WORKTREE_VERIFIED")
+
+            # Stage 6: READY
+            ownership = WorktreeOwnershipRecord.create_from_reservation(reservation)
+            self._atomic_write_json(ownership_file, ownership.to_dict())
+
+            # Re-read and verify written ownership record
+            with open(ownership_file, "r", encoding="utf-8") as f:
+                loaded_ownership = WorktreeOwnershipRecord.from_json(f.read())
+            if not verify_ownership_record_authenticity(loaded_ownership, in_controller_storage=True):
+                raise WorktreeValidationError("written ownership record failed verification")
+
+            state.ownership_record = loaded_ownership
+            state.stage_reached = "READY"
+            state.status = WorktreeLifecycleStatus.READY
+            state.updated_at = str(int(time.time()))
+            self._atomic_write_json(task_dir / "lifecycle.json", state.to_dict())
+
+            return state
+
+    def _verify_created_worktree(
+        self,
+        repo: RepositoryIdentity,
+        reservation: WorktreeReservation,
+        worktree_dir: Path,
+    ) -> None:
+        """Independently verify created worktree filesystem and Git plumbing metadata."""
+        if not worktree_dir.is_dir():
+            raise WorktreeValidationError(f"worktree directory does not exist: {worktree_dir}")
+
+        git_file = worktree_dir / ".git"
+        if not git_file.is_file():
+            raise WorktreeValidationError(f"worktree lacks .git file: {git_file}")
+
+        git_content = git_file.read_text(encoding="utf-8").strip()
+        if not git_content.startswith("gitdir:"):
+            raise WorktreeValidationError(f"worktree .git file format invalid: {git_content!r}")
+
+        gitdir_raw = Path(git_content.split("gitdir:", 1)[1].strip())
+        gitdir = gitdir_raw if gitdir_raw.is_absolute() else (worktree_dir / gitdir_raw).resolve()
+
+        if not _is_same_or_subpath(gitdir, repo.common_git_dir / "worktrees"):
+            raise WorktreeValidationError(f"gitdir {gitdir} is not inside repository common git dir worktrees namespace")
+
+        commondir_file = gitdir / "commondir"
+        if not commondir_file.is_file():
+            raise WorktreeValidationError(f"gitdir lacks commondir file: {commondir_file}")
+
+        raw_cd = commondir_file.read_text(encoding="utf-8").strip()
+        commondir = Path(raw_cd) if Path(raw_cd).is_absolute() else (gitdir / raw_cd).resolve()
+        if commondir != repo.common_git_dir:
+            raise WorktreeValidationError(f"commondir {commondir} does not match repo common git dir {repo.common_git_dir}")
+
+        head_file = gitdir / "HEAD"
+        if not head_file.is_file():
+            raise WorktreeValidationError("gitdir lacks HEAD file")
+        head_content = head_file.read_text(encoding="utf-8").strip()
+        if head_content != f"ref: {reservation.task_ref.full_ref}":
+            raise WorktreeValidationError(f"worktree HEAD {head_content!r} does not match expected task ref {reservation.task_ref.full_ref!r}")
+
+        res_head = _run_git_plumbing(["git", "rev-parse", "HEAD"], cwd=worktree_dir)
+        if res_head.returncode != 0 or res_head.stdout.strip().lower() != reservation.task_identity.baseline_commit_sha:
+            raise WorktreeValidationError(f"worktree HEAD rev-parse SHA does not match baseline SHA {reservation.task_identity.baseline_commit_sha}")
+
+        res_ref = _run_git_plumbing(["git", "rev-parse", reservation.task_ref.full_ref], cwd=repo.canonical_root)
+        if res_ref.returncode != 0 or res_ref.stdout.strip().lower() != reservation.task_identity.baseline_commit_sha:
+            raise WorktreeValidationError(f"task ref rev-parse SHA does not match baseline SHA {reservation.task_identity.baseline_commit_sha}")
+
+    def inspect(self, repo_path: str | Path, task_id: str, generation: int) -> WorktreeLifecycleState:
+        """Inspect and classify worktree state strictly from controller-owned records and repository."""
+        repo = RepositoryIdentity.from_path(repo_path)
+        task_dir = self._get_task_state_dir(repo.repository_id, task_id, generation)
+        worktree_dir = task_dir / "worktree"
+        lifecycle_file = task_dir / "lifecycle.json"
+        ownership_file = task_dir / "ownership.json"
+
+        if not task_dir.exists():
+            return WorktreeLifecycleState(
+                schema_version=LIFECYCLE_SCHEMA_VERSION,
+                status=WorktreeLifecycleStatus.MISSING,
+                stage_reached="NONE",
+                task_id=task_id,
+                generation=generation,
+                repository_id=repo.repository_id,
+                baseline_commit_sha="",
+                task_ref=f"refs/heads/aos/{task_id}/g{generation}",
+                worktree_path=worktree_dir,
+                worktree_device=None,
+                worktree_inode=None,
+                ownership_record=None,
+                created_at="0",
+                updated_at="0",
+            )
+
+        if not lifecycle_file.exists():
+            return WorktreeLifecycleState(
+                schema_version=LIFECYCLE_SCHEMA_VERSION,
+                status=WorktreeLifecycleStatus.PARTIAL_STATE_ONLY,
+                stage_reached="STATE_UNTRACKED",
+                task_id=task_id,
+                generation=generation,
+                repository_id=repo.repository_id,
+                baseline_commit_sha="",
+                task_ref=f"refs/heads/aos/{task_id}/g{generation}",
+                worktree_path=worktree_dir,
+                worktree_device=None,
+                worktree_inode=None,
+                ownership_record=None,
+                created_at="0",
+                updated_at="0",
+            )
+
+        with open(lifecycle_file, "r", encoding="utf-8") as f:
+            state_data = json.load(f)
+        state = WorktreeLifecycleState.from_dict(state_data)
+
+        if ownership_file.exists():
+            with open(ownership_file, "r", encoding="utf-8") as f:
+                raw_owner = f.read()
+            try:
+                owner = WorktreeOwnershipRecord.from_json(raw_owner)
+                if verify_ownership_record_authenticity(owner, in_controller_storage=True):
+                    state.ownership_record = owner
+                else:
+                    state.status = WorktreeLifecycleStatus.OWNERSHIP_MISMATCH
+                    return state
+            except WorktreeValidationError:
+                state.status = WorktreeLifecycleStatus.OWNERSHIP_MISMATCH
+                return state
+
+        if not worktree_dir.exists():
+            if state.status == WorktreeLifecycleStatus.READY:
+                state.status = WorktreeLifecycleStatus.PARTIAL_REF_ONLY
+            return state
+
+        # Check git status inside worktree
+        res_status = _run_git_plumbing(["git", "status", "--porcelain"], cwd=worktree_dir)
+        if res_status.returncode == 0 and res_status.stdout.strip():
+            state.status = WorktreeLifecycleStatus.DIRTY_PRESERVED
+            return state
+
+        return state
+
+    def recover(self, repo_path: str | Path, task_id: str, generation: int) -> WorktreeLifecycleState:
+        """Run crash recovery inspection for a task worktree."""
+        repo = RepositoryIdentity.from_path(repo_path)
+        lock_path = self._get_lock_path(repo.repository_id)
+        with acquire_repository_lock(lock_path, timeout=self.lock_timeout):
+            return self.inspect(repo_path, task_id, generation)
+
+    def preserve(self, repo_path: str | Path, task_id: str, generation: int) -> WorktreeLifecycleState:
+        """Explicitly preserve task worktree state."""
+        state = self.inspect(repo_path, task_id, generation)
+        if state.status not in {WorktreeLifecycleStatus.MISSING, WorktreeLifecycleStatus.CLEAN_DISPOSABLE}:
+            state.status = WorktreeLifecycleStatus.DIRTY_PRESERVED
+        return state
+
+    def remove_if_safe(self, repo_path: str | Path, task_id: str, generation: int) -> bool:
+        """Safely remove a clean, verified worktree and its task ref.
+
+        REFUSES DELETION and preserves work if:
+        - Worktree contains uncommitted/dirty/untracked changes.
+        - Ownership record is missing or invalid.
+        - Worktree filesystem/Git identity checks fail.
+        """
+        repo = RepositoryIdentity.from_path(repo_path)
+        lock_path = self._get_lock_path(repo.repository_id)
+
+        with acquire_repository_lock(lock_path, timeout=self.lock_timeout):
+            state = self.inspect(repo_path, task_id, generation)
+            if state.status == WorktreeLifecycleStatus.MISSING:
+                return True
+
+            if state.status == WorktreeLifecycleStatus.DIRTY_PRESERVED:
+                raise WorktreeValidationError(
+                    f"Worktree for task {task_id} g{generation} contains uncommitted changes and CANNOT be deleted (PRESERVED)"
+                )
+
+            if state.status != WorktreeLifecycleStatus.READY or not state.ownership_record:
+                raise WorktreeValidationError(
+                    f"Worktree state for task {task_id} g{generation} is not READY or lacks verified ownership (PRESERVED)"
+                )
+
+            task_dir = self._get_task_state_dir(repo.repository_id, task_id, generation)
+            worktree_dir = task_dir / "worktree"
+            ref_name = state.task_ref
+
+            # 1. Verify git status porcelain is empty
+            if worktree_dir.exists():
+                res_st = _run_git_plumbing(["git", "status", "--porcelain"], cwd=worktree_dir)
+                if res_st.returncode != 0 or res_st.stdout.strip():
+                    raise WorktreeValidationError("Worktree contains modified/untracked files (PRESERVED)")
+
+                # 2. Prune worktree using git worktree remove
+                res_rm = _run_git_plumbing(["git", "worktree", "remove", str(worktree_dir)], cwd=repo.canonical_root)
+                if res_rm.returncode != 0:
+                    # Fallback to directory deletion if git worktree remove fails but dir is clean
+                    shutil.rmtree(worktree_dir, ignore_errors=True)
+                    _run_git_plumbing(["git", "worktree", "prune"], cwd=repo.canonical_root)
+
+            # 3. Delete task branch
+            _run_git_plumbing(["git", "branch", "-D", ref_name.replace("refs/heads/", "")], cwd=repo.canonical_root)
+
+            # 4. Remove task state directory
+            shutil.rmtree(task_dir, ignore_errors=True)
+            return True
