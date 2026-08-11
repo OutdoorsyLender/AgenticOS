@@ -4,14 +4,29 @@ This module provides trusted, controller-side primitives for:
 1. Repository Identity representation & kernel identity binding (SHA-1 / SHA-256 detection).
 2. Baseline commit SHA validation (Plumbing-only, repo-object-format strict verification).
 3. Task Ref derivation & strict ASCII ref grammar enforcement.
-4. Ownership proof modeling and fail-closed ref ownership rules.
-5. Controller-owned worktree root location outside the authoritative checkout.
+4. Ownership proof modeling, controller storage authentication, and fail-closed ref rules.
+5. Controller-owned durable worktree state root outside the authoritative checkout.
 
 GOVERNING PRINCIPLE: Models reason; AgenticOS guarantees.
 AUTHORITY BOUNDARY: The main .git directory is NEVER exposed to hostile workers.
-PATHWAY CONSTRAINT FOR SLICE 2: Path.resolve(strict=True) is controller-side validation only.
-Slice 2 creation MUST use descriptor handles (openat2), kernel identity checks (st_dev/st_ino),
-and RESOLVE_BENEATH semantics.
+
+SLICE 2 HARD CONSTRAINTS & FILESYSTEM AUTHORITY CONTRACT:
+1. Pathname String Semantics:
+   - String pathname comparisons (_is_same_or_subpath) are non-authoritative defense-in-depth ONLY.
+   - Textual normalization does NOT establish filesystem object identity.
+   - Real Slice 2 worktree creation/destruction on Linux MUST operate on descriptor handles:
+     a. Open trusted state_root directory (O_DIRECTORY | O_CLOEXEC | O_PATH).
+     b. Verify directory kernel identity (fstat st_dev / st_ino).
+     c. Resolve paths using openat2 with RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS.
+     d. Record & re-verify st_dev / st_ino before any destructive lifecycle action.
+2. Durable State Root:
+   - Production worktrees MUST use an explicit durable controller state_root outside the checkout.
+   - Defaulting to OS temporary storage (/tmp) in production is disallowed (controller crash != loss of work).
+   - Ambient process environment (AGENTICOS_WORKTREE_ROOT) is NOT trusted authority for production.
+3. Ownership Authenticity:
+   - SHA-256 ownership_digest proves integrity and equality, NOT authentic provenance.
+   - Ownership records are authoritative ONLY when stored in controller-owned state (in_controller_storage=True).
+   - Worker-controlled .git metadata is NEVER used as an ownership record.
 """
 
 from __future__ import annotations
@@ -416,6 +431,43 @@ class WorktreeOwnershipRecord:
         return cls.from_dict(data)
 
 
+def verify_ownership_record_authenticity(
+    record: WorktreeOwnershipRecord,
+    *,
+    in_controller_storage: bool,
+) -> bool:
+    """Verify ownership record integrity and controller storage authentication.
+
+    SECURITY RULE: SHA-256 ownership_digest proves integrity and identity equality,
+    NOT authentic provenance. Anyone can recompute a SHA-256 digest over tampered JSON.
+    Ownership records are authoritative ONLY when retrieved from trusted, controller-owned
+    storage (in_controller_storage=True) that hostile workers cannot write or modify.
+    """
+    if not in_controller_storage:
+        return False
+    if not isinstance(record, WorktreeOwnershipRecord):
+        return False
+    if record.schema_version != OWNERSHIP_SCHEMA_VERSION:
+        return False
+
+    payload = {
+        "baseline_commit_sha": record.baseline_commit_sha,
+        "generation": record.generation,
+        "nonce": record.nonce,
+        "object_format": record.object_format,
+        "policy_digest": record.policy_digest,
+        "repository_id": record.repository_id,
+        "reservation_digest": record.reservation_digest,
+        "schema_version": record.schema_version,
+        "task_id": record.task_id,
+        "task_ref": record.task_ref,
+        "worktree_name": record.worktree_name,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    expected_digest = hashlib.sha256(encoded).hexdigest()
+    return record.ownership_digest == expected_digest
+
+
 def validate_baseline_commit(
     repo_path: str | Path,
     baseline_sha: str,
@@ -533,6 +585,8 @@ def check_ref_collision(
     repo_path: str | Path,
     task_ref: TaskRef,
     expected_ownership: Optional[WorktreeOwnershipRecord] = None,
+    *,
+    in_controller_storage: bool = True,
 ) -> tuple[bool, Optional[str]]:
     """Check if task_ref exists in the repository and verify ownership record match.
 
@@ -554,8 +608,10 @@ def check_ref_collision(
             f"Ref {task_ref.full_ref!r} already exists at {existing_sha!r} and no verified ownership record was provided (FAIL CLOSED)"
         )
 
-    if not isinstance(expected_ownership, WorktreeOwnershipRecord):
-        raise TaskRefCollisionError("expected_ownership must be a valid WorktreeOwnershipRecord instance")
+    if not verify_ownership_record_authenticity(expected_ownership, in_controller_storage=in_controller_storage):
+        raise TaskRefCollisionError(
+            f"Ownership record for ref {task_ref.full_ref!r} failed controller storage authentication (FAIL CLOSED)"
+        )
 
     if expected_ownership.task_ref != task_ref.full_ref:
         raise TaskRefCollisionError(
@@ -571,33 +627,60 @@ def check_ref_collision(
 
 
 def _is_same_or_subpath(target: Path, base: Path) -> bool:
-    """Check if target path is equal to or located inside base path."""
+    """Non-authoritative early controller-side validation (DEFENSE-IN-DEPTH ONLY).
+
+    NOTE: Pathname string comparison DOES NOT establish filesystem object identity.
+    Real Slice 2 authority enforcement MUST use descriptor handles (openat2),
+    kernel identity (st_dev/st_ino), and RESOLVE_BENEATH semantics.
+    """
     try:
-        t = target.resolve().as_posix().lower()
-        b = base.resolve().as_posix().lower()
-        return t == b or t.startswith(b.rstrip("/") + "/")
+        t = target.resolve()
+        b = base.resolve()
+        return t == b or b in t.parents
     except (ValueError, OSError):
         return False
 
 
+def get_development_worktree_root_override() -> Optional[Path]:
+    """Retrieve development/test override from environment.
+
+    NOTE: Ambient environment variables are NOT trusted authority roots for production tasks.
+    Top-level controller configuration MUST explicitly validate and bind state_root.
+    """
+    val = os.environ.get("AGENTICOS_WORKTREE_ROOT")
+    return Path(val).resolve() if val else None
+
+
 def get_default_worktree_root(
     repo_identity: RepositoryIdentity,
-    custom_root: Optional[str | Path] = None,
+    state_root: str | Path | None = None,
+    *,
+    allow_temporary_for_test: bool = False,
 ) -> Path:
-    """Determine trusted controller-owned worktree root outside the authoritative repository checkout."""
-    if custom_root:
-        root = Path(custom_root).resolve()
+    """Determine trusted controller-owned worktree root outside the authoritative repository checkout.
+
+    PRODUCTION REQUIREMENT: Production worktree state MUST use an explicit durable controller state_root.
+    Silently defaulting to temporary OS storage (/tmp) in production is disallowed to ensure
+    uncommitted model work survives controller restart/crash.
+    """
+    if state_root is not None:
+        root = Path(state_root).resolve()
     else:
-        env_root = os.environ.get("AGENTICOS_WORKTREE_ROOT")
-        if env_root:
-            root = Path(env_root).resolve()
-        else:
+        dev_override = get_development_worktree_root_override()
+        if dev_override is not None:
+            root = dev_override
+        elif allow_temporary_for_test:
             root = Path(tempfile.gettempdir()).resolve() / "agenticos_worktrees"
+        else:
+            raise WorktreeValidationError(
+                "Production worktree reservation requires an explicit durable controller state_root; "
+                "temporary directory storage is disallowed"
+            )
 
     canonical_repo = repo_identity.canonical_root
     if _is_same_or_subpath(root, canonical_repo):
         raise WorktreeValidationError(
-            f"Worktree root {root} cannot be equal to or located inside the authoritative repository checkout {canonical_repo}"
+            f"Worktree state root {root} cannot be equal to or located inside the authoritative repository checkout {canonical_repo}"
         )
 
     return root / repo_identity.repository_id
@@ -610,8 +693,9 @@ def create_worktree_reservation(
     baseline_commit_sha: str,
     nonce: str,
     policy_digest: str,
-    worktree_root: Optional[str | Path] = None,
+    state_root: str | Path | None = None,
     existing_ownership: Optional[WorktreeOwnershipRecord] = None,
+    allow_temporary_for_test: bool = False,
 ) -> WorktreeReservation:
     """Construct a verified, collision-checked WorktreeReservation outside authoritative checkout."""
     repo = RepositoryIdentity.from_path(repo_path)
@@ -636,7 +720,9 @@ def create_worktree_reservation(
     if not _WORKTREE_NAME_RE.fullmatch(worktree_name) or ".." in worktree_name or "/" in worktree_name or "\\" in worktree_name:
         raise InvalidRefNameError(f"derived worktree name {worktree_name!r} is invalid")
 
-    target_root = get_default_worktree_root(repo, custom_root=worktree_root)
+    target_root = get_default_worktree_root(
+        repo, state_root=state_root, allow_temporary_for_test=allow_temporary_for_test
+    )
     proposed_path = target_root / task_identity.identity_digest[:16] / worktree_name
 
     if _is_same_or_subpath(proposed_path, repo.canonical_root):

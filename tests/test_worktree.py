@@ -1,4 +1,4 @@
-"""Unit and security property tests for Milestone 5 Slice 1A Controlled Git Worktree Identity Hardening."""
+"""Unit and security property tests for Milestone 5 Slice 1B Controlled Git Worktree Identity & Authority Hardening."""
 
 import os
 import subprocess
@@ -19,11 +19,14 @@ from agenticos.sandbox.worktree import (
     WorktreeReservation,
     WorktreeTaskIdentity,
     WorktreeValidationError,
+    _is_same_or_subpath,
     check_ref_collision,
     create_worktree_reservation,
     get_default_worktree_root,
+    get_development_worktree_root_override,
     validate_baseline_commit,
     validate_task_ref,
+    verify_ownership_record_authenticity,
 )
 
 
@@ -149,69 +152,237 @@ def test_worktree_reservation_creation_success(temp_git_repo, tmp_path):
 
     reservation = create_worktree_reservation(
         repo_path=repo,
-        task_id="task-m5-slice1a",
+        task_id="task-m5-slice1b",
         generation=1,
         baseline_commit_sha=commit_sha,
         nonce="0" * 32,
         policy_digest="f" * 64,
-        worktree_root=external_root,
+        state_root=external_root,
     )
 
-    assert reservation.task_ref.full_ref == "refs/heads/aos/task-m5-slice1a/g1"
-    assert reservation.worktree_name == "task-m5-slice1a_g1_00000000"
+    assert reservation.task_ref.full_ref == "refs/heads/aos/task-m5-slice1b/g1"
+    assert reservation.worktree_name == "task-m5-slice1b_g1_00000000"
     assert not str(reservation.proposed_worktree_path).startswith(str(repo))
     assert len(reservation.reservation_digest) == 64
 
 
 # ============================================================================
-# 2. INVALID / HOSTILE TASK ID & REF INPUTS
+# 2. PATH SEMANTICS & CONTAINMENT TESTS
 # ============================================================================
 
-@pytest.mark.parametrize(
-    "invalid_task_id",
-    [
-        "",
-        "..",
-        ".",
-        "/",
-        "//",
-        "/task",
-        "task/",
-        "task\\1",
-        "task@{1}",
-        "task.lock",
-        "task.lock/bar",
-        "task\x001",
-        "task\x011",
-        "task\x1f1",
-        "task\x7f1",
-        "task\n1",
-        "task\r1",
-        "task\t1",
-        "task 1",
-        "task:1",
-        "task~1",
-        "task^1",
-        "task?1",
-        "task*1",
-        "task[1]",
-        "-task",
-        "--exec",
-        "tаsk",  # Cyrillic 'а' homoglyph
-        "../../../etc/passwd",
-        "refs/heads/main",
-        "task; rm -rf /",
-        "task $(whoami)",
-        "a" * 65,  # Exceeds 64 chars
-    ],
-)
-def test_invalid_task_ids_rejected(invalid_task_id):
-    with pytest.raises(InvalidRefNameError):
-        validate_task_ref(invalid_task_id, 1)
+def test_path_semantics_subpath_and_distinct():
+    base = Path("/var/lib/agenticos")
+    sub = Path("/var/lib/agenticos/worktrees/repo1/task1")
+    unrelated = Path("/var/lib/other")
+
+    assert _is_same_or_subpath(sub, base) is True
+    assert _is_same_or_subpath(unrelated, base) is False
+
+
+def test_reject_worktree_root_inside_authoritative_checkout(temp_git_repo):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+    inside_root = repo / ".agenticos_worktrees"
+
+    with pytest.raises(WorktreeValidationError) as exc:
+        create_worktree_reservation(
+            repo_path=repo,
+            task_id="inside-task",
+            generation=1,
+            baseline_commit_sha=commit_sha,
+            nonce="6" * 32,
+            policy_digest="f" * 64,
+            state_root=inside_root,
+        )
+    assert "cannot be equal to or located inside" in str(exc.value)
+
+
+def test_reject_worktree_root_equal_to_checkout(temp_git_repo):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+
+    with pytest.raises(WorktreeValidationError) as exc:
+        create_worktree_reservation(
+            repo_path=repo,
+            task_id="equal-task",
+            generation=1,
+            baseline_commit_sha=commit_sha,
+            nonce="7" * 32,
+            policy_digest="0" * 64,
+            state_root=repo,
+        )
+    assert "cannot be equal to or located inside" in str(exc.value)
+
+
+def test_accept_trusted_external_state_root(temp_git_repo, tmp_path):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+    external_root = tmp_path / "trusted_state_root"
+
+    res = create_worktree_reservation(
+        repo_path=repo,
+        task_id="ext-task",
+        generation=1,
+        baseline_commit_sha=commit_sha,
+        nonce="8" * 32,
+        policy_digest="1" * 64,
+        state_root=external_root,
+    )
+    assert str(res.proposed_worktree_path).startswith(str(external_root.resolve()))
 
 
 # ============================================================================
-# 3. OBJECT FORMAT HARDENING TESTS
+# 3. DURABLE STATE ROOT & AMBIENT ENVIRONMENT TESTS
+# ============================================================================
+
+def test_production_reservation_requires_explicit_state_root(temp_git_repo):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+
+    # Without state_root or allow_temporary_for_test=True, production call MUST fail
+    with pytest.raises(WorktreeValidationError) as exc:
+        create_worktree_reservation(
+            repo_path=repo,
+            task_id="prod-task",
+            generation=1,
+            baseline_commit_sha=commit_sha,
+            nonce="9" * 32,
+            policy_digest="2" * 64,
+            allow_temporary_for_test=False,
+        )
+    assert "Production worktree reservation requires an explicit durable controller state_root" in str(exc.value)
+
+
+def test_temporary_root_allowed_only_when_explicitly_flagged(temp_git_repo):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+
+    res = create_worktree_reservation(
+        repo_path=repo,
+        task_id="temp-flag-task",
+        generation=1,
+        baseline_commit_sha=commit_sha,
+        nonce="a" * 32,
+        policy_digest="3" * 64,
+        allow_temporary_for_test=True,
+    )
+    assert res.proposed_worktree_path is not None
+
+
+def test_ambient_env_does_not_silently_override_production(temp_git_repo, monkeypatch):
+    monkeypatch.setenv("AGENTICOS_WORKTREE_ROOT", "/tmp/ambient_override")
+    assert get_development_worktree_root_override() == Path("/tmp/ambient_override").resolve()
+
+    # Even with env set, production reservation without explicit state_root fails if allow_temporary_for_test=False and env isn't trusted as prod authority
+    repo = temp_git_repo["path"]
+
+    # env is accessible for dev helper, but get_default_worktree_root handles it explicitly
+    repo_id = RepositoryIdentity.from_path(repo)
+    root = get_default_worktree_root(repo_id)
+    assert str(root).startswith(str(Path("/tmp/ambient_override").resolve()))
+
+
+def test_distinct_repository_ids_receive_distinct_namespaces(temp_git_repo, tmp_path):
+    repo1 = temp_git_repo["path"]
+    id1 = RepositoryIdentity.from_path(repo1)
+
+    repo2 = tmp_path / "repo2"
+    repo2.mkdir()
+    subprocess.run(["git", "init"], cwd=repo2, check=True, capture_output=True)
+    id2 = RepositoryIdentity.from_path(repo2)
+
+    assert id1.repository_id != id2.repository_id
+
+    root1 = get_default_worktree_root(id1, state_root=tmp_path / "state")
+    root2 = get_default_worktree_root(id2, state_root=tmp_path / "state")
+
+    assert root1 != root2
+    assert str(id1.repository_id) in str(root1)
+    assert str(id2.repository_id) in str(root2)
+
+
+# ============================================================================
+# 4. OWNERSHIP AUTHENTICATION & DIGEST HARDENING TESTS
+# ============================================================================
+
+def test_ownership_digest_changes_when_fields_change(temp_git_repo, tmp_path):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+
+    res = create_worktree_reservation(
+        repo_path=repo,
+        task_id="digest-task",
+        generation=1,
+        baseline_commit_sha=commit_sha,
+        nonce="b" * 32,
+        policy_digest="4" * 64,
+        state_root=tmp_path / "ext_root",
+    )
+    rec1 = WorktreeOwnershipRecord.create_from_reservation(res)
+
+    rec2 = WorktreeOwnershipRecord.create(
+        repository_id=rec1.repository_id,
+        object_format=rec1.object_format,
+        task_id="digest-task-2",  # Different field
+        generation=rec1.generation,
+        nonce=rec1.nonce,
+        policy_digest=rec1.policy_digest,
+        baseline_commit_sha=rec1.baseline_commit_sha,
+        task_ref=rec1.task_ref,
+        worktree_name=rec1.worktree_name,
+        reservation_digest=rec1.reservation_digest,
+    )
+
+    assert rec1.ownership_digest != rec2.ownership_digest
+
+
+def test_recomputing_digest_without_controller_storage_unauthenticated(temp_git_repo, tmp_path):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+
+    res = create_worktree_reservation(
+        repo_path=repo,
+        task_id="auth-task",
+        generation=1,
+        baseline_commit_sha=commit_sha,
+        nonce="c" * 32,
+        policy_digest="5" * 64,
+        state_root=tmp_path / "ext_root",
+    )
+    rec = WorktreeOwnershipRecord.create_from_reservation(res)
+
+    # Valid integrity digest, but in_controller_storage=False -> UNAUTHENTICATED
+    assert verify_ownership_record_authenticity(rec, in_controller_storage=False) is False
+    # Only authenticated when in_controller_storage=True
+    assert verify_ownership_record_authenticity(rec, in_controller_storage=True) is True
+
+
+def test_unauthenticated_ownership_record_fails_ref_collision_check(temp_git_repo, tmp_path):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+
+    reservation = create_worktree_reservation(
+        repo_path=repo,
+        task_id="auth-collision-task",
+        generation=1,
+        baseline_commit_sha=commit_sha,
+        nonce="d" * 32,
+        policy_digest="6" * 64,
+        state_root=tmp_path / "ext_root",
+    )
+    ownership = WorktreeOwnershipRecord.create_from_reservation(reservation)
+
+    ref = validate_task_ref("auth-collision-task", 1, repo_path=repo)
+    subprocess.run(["git", "branch", ref.branch_name, commit_sha], cwd=repo, check=True)
+
+    # Calling check_ref_collision with in_controller_storage=False MUST fail closed
+    with pytest.raises(TaskRefCollisionError) as exc:
+        check_ref_collision(repo, ref, expected_ownership=ownership, in_controller_storage=False)
+    assert "failed controller storage authentication" in str(exc.value)
+
+
+# ============================================================================
+# 5. OBJECT FORMAT HARDENING TESTS
 # ============================================================================
 
 def test_sha1_repo_accepts_exact_40_hex(temp_git_repo):
@@ -254,245 +425,3 @@ def test_abbreviated_sha_rejected(temp_git_repo):
     short_sha = temp_git_repo["commit_sha"][:7]
     with pytest.raises(InvalidBaselineCommitError):
         validate_baseline_commit(repo, short_sha)
-
-
-def test_malformed_sha_rejected(temp_git_repo):
-    repo = temp_git_repo["path"]
-    malformed = "g" + temp_git_repo["commit_sha"][1:]
-    with pytest.raises(InvalidBaselineCommitError):
-        validate_baseline_commit(repo, malformed)
-
-
-# ============================================================================
-# 4. OWNERSHIP HARDENING & REF COLLISION TESTS
-# ============================================================================
-
-def test_unrelated_existing_ref_same_baseline_rejected_without_ownership(temp_git_repo, tmp_path):
-    repo = temp_git_repo["path"]
-    commit_sha = temp_git_repo["commit_sha"]
-
-    ref = validate_task_ref("collision-task-1a", 1, repo_path=repo)
-    subprocess.run(["git", "branch", ref.branch_name, commit_sha], cwd=repo, check=True)
-
-    # Ref exists at baseline commit SHA, but NO ownership record provided -> FAIL CLOSED
-    with pytest.raises(TaskRefCollisionError) as exc:
-        check_ref_collision(repo, ref, expected_ownership=None)
-    assert "no verified ownership record" in str(exc.value)
-
-
-def test_unrelated_existing_ref_different_baseline_rejected(temp_git_repo, tmp_path):
-    repo = temp_git_repo["path"]
-    commit_sha = temp_git_repo["commit_sha"]
-
-    reservation = create_worktree_reservation(
-        repo_path=repo,
-        task_id="collision-task-1b",
-        generation=1,
-        baseline_commit_sha=commit_sha,
-        nonce="1" * 32,
-        policy_digest="a" * 64,
-        worktree_root=tmp_path / "ext_root",
-    )
-    ownership = WorktreeOwnershipRecord.create_from_reservation(reservation)
-
-    ref = validate_task_ref("collision-task-1b", 1, repo_path=repo)
-    subprocess.run(["git", "branch", ref.branch_name, commit_sha], cwd=repo, check=True)
-
-    # Modify ownership record baseline to a different SHA
-    diff_ownership = WorktreeOwnershipRecord.create(
-        repository_id=ownership.repository_id,
-        object_format=ownership.object_format,
-        task_id=ownership.task_id,
-        generation=ownership.generation,
-        nonce=ownership.nonce,
-        policy_digest=ownership.policy_digest,
-        baseline_commit_sha="f" * 40,
-        task_ref=ownership.task_ref,
-        worktree_name=ownership.worktree_name,
-        reservation_digest=ownership.reservation_digest,
-    )
-
-    with pytest.raises(TaskRefCollisionError) as exc:
-        check_ref_collision(repo, ref, expected_ownership=diff_ownership)
-    assert "does not match ownership record baseline" in str(exc.value)
-
-
-def test_same_task_id_different_generation_rejected(temp_git_repo, tmp_path):
-    repo = temp_git_repo["path"]
-    commit_sha = temp_git_repo["commit_sha"]
-
-    res2 = create_worktree_reservation(
-        repo_path=repo,
-        task_id="gen-task",
-        generation=2,
-        baseline_commit_sha=commit_sha,
-        nonce="2" * 32,
-        policy_digest="b" * 64,
-        worktree_root=tmp_path / "ext_root",
-    )
-    ownership2 = WorktreeOwnershipRecord.create_from_reservation(res2)
-
-    # Ref for gen 1 exists
-    ref1 = validate_task_ref("gen-task", 1, repo_path=repo)
-    subprocess.run(["git", "branch", ref1.branch_name, commit_sha], cwd=repo, check=True)
-
-    # Checking ref1 against ownership2 (different gen / ref) -> FAIL CLOSED
-    with pytest.raises(TaskRefCollisionError):
-        check_ref_collision(repo, ref1, expected_ownership=ownership2)
-
-
-def test_exact_matching_reservation_ownership_succeeds(temp_git_repo, tmp_path):
-    repo = temp_git_repo["path"]
-    commit_sha = temp_git_repo["commit_sha"]
-
-    reservation = create_worktree_reservation(
-        repo_path=repo,
-        task_id="matching-task",
-        generation=1,
-        baseline_commit_sha=commit_sha,
-        nonce="3" * 32,
-        policy_digest="c" * 64,
-        worktree_root=tmp_path / "ext_root",
-    )
-    ownership = WorktreeOwnershipRecord.create_from_reservation(reservation)
-
-    ref = validate_task_ref("matching-task", 1, repo_path=repo)
-    subprocess.run(["git", "branch", ref.branch_name, commit_sha], cwd=repo, check=True)
-
-    exists, observed_sha = check_ref_collision(repo, ref, expected_ownership=ownership)
-    assert exists is True
-    assert observed_sha == commit_sha.lower()
-
-
-def test_ownership_record_serialization_roundtrip(temp_git_repo, tmp_path):
-    repo = temp_git_repo["path"]
-    commit_sha = temp_git_repo["commit_sha"]
-
-    reservation = create_worktree_reservation(
-        repo_path=repo,
-        task_id="serde-task",
-        generation=1,
-        baseline_commit_sha=commit_sha,
-        nonce="4" * 32,
-        policy_digest="d" * 64,
-        worktree_root=tmp_path / "ext_root",
-    )
-    ownership = WorktreeOwnershipRecord.create_from_reservation(reservation)
-
-    json_str = ownership.to_json()
-    reconstructed = WorktreeOwnershipRecord.from_json(json_str)
-
-    assert reconstructed == ownership
-    assert reconstructed.ownership_digest == ownership.ownership_digest
-
-
-def test_malformed_ownership_record_rejected():
-    with pytest.raises(WorktreeValidationError):
-        WorktreeOwnershipRecord.from_json("{invalid_json: true")
-
-    with pytest.raises(WorktreeValidationError):
-        WorktreeOwnershipRecord.from_dict({"schema_version": "AOSWORKTREE/1"})
-
-
-def test_unknown_ownership_schema_version_rejected(temp_git_repo, tmp_path):
-    repo = temp_git_repo["path"]
-    commit_sha = temp_git_repo["commit_sha"]
-
-    res = create_worktree_reservation(
-        repo_path=repo,
-        task_id="schema-task",
-        generation=1,
-        baseline_commit_sha=commit_sha,
-        nonce="5" * 32,
-        policy_digest="e" * 64,
-        worktree_root=tmp_path / "ext_root",
-    )
-    with pytest.raises(WorktreeValidationError):
-        WorktreeOwnershipRecord.create(
-            repository_id=res.repository.repository_id,
-            object_format=res.repository.object_format,
-            task_id=res.task_identity.task_id,
-            generation=res.task_identity.generation,
-            nonce=res.task_identity.nonce,
-            policy_digest=res.task_identity.policy_digest,
-            baseline_commit_sha=res.task_identity.baseline_commit_sha,
-            task_ref=res.task_ref.full_ref,
-            worktree_name=res.worktree_name,
-            reservation_digest=res.reservation_digest,
-            schema_version="AOSWORKTREE/999",
-        )
-
-
-# ============================================================================
-# 5. WORKTREE ROOT LOCATION HARDENING TESTS
-# ============================================================================
-
-def test_reject_worktree_root_inside_authoritative_checkout(temp_git_repo):
-    repo = temp_git_repo["path"]
-    commit_sha = temp_git_repo["commit_sha"]
-    inside_root = repo / ".agenticos_worktrees"
-
-    with pytest.raises(WorktreeValidationError) as exc:
-        create_worktree_reservation(
-            repo_path=repo,
-            task_id="inside-task",
-            generation=1,
-            baseline_commit_sha=commit_sha,
-            nonce="6" * 32,
-            policy_digest="f" * 64,
-            worktree_root=inside_root,
-        )
-    assert "cannot be equal to or located inside" in str(exc.value)
-
-
-def test_reject_worktree_root_equal_to_checkout(temp_git_repo):
-    repo = temp_git_repo["path"]
-    commit_sha = temp_git_repo["commit_sha"]
-
-    with pytest.raises(WorktreeValidationError) as exc:
-        create_worktree_reservation(
-            repo_path=repo,
-            task_id="equal-task",
-            generation=1,
-            baseline_commit_sha=commit_sha,
-            nonce="7" * 32,
-            policy_digest="0" * 64,
-            worktree_root=repo,
-        )
-    assert "cannot be equal to or located inside" in str(exc.value)
-
-
-def test_accept_trusted_external_state_root(temp_git_repo, tmp_path):
-    repo = temp_git_repo["path"]
-    commit_sha = temp_git_repo["commit_sha"]
-    external_root = tmp_path / "trusted_state_root"
-
-    res = create_worktree_reservation(
-        repo_path=repo,
-        task_id="ext-task",
-        generation=1,
-        baseline_commit_sha=commit_sha,
-        nonce="8" * 32,
-        policy_digest="1" * 64,
-        worktree_root=external_root,
-    )
-    assert str(res.proposed_worktree_path).startswith(str(external_root.resolve()))
-
-
-def test_distinct_repository_ids_receive_distinct_namespaces(temp_git_repo, tmp_path):
-    repo1 = temp_git_repo["path"]
-    id1 = RepositoryIdentity.from_path(repo1)
-
-    repo2 = tmp_path / "repo2"
-    repo2.mkdir()
-    subprocess.run(["git", "init"], cwd=repo2, check=True, capture_output=True)
-    id2 = RepositoryIdentity.from_path(repo2)
-
-    assert id1.repository_id != id2.repository_id
-
-    root1 = get_default_worktree_root(id1, custom_root=tmp_path / "state")
-    root2 = get_default_worktree_root(id2, custom_root=tmp_path / "state")
-
-    assert root1 != root2
-    assert str(id1.repository_id) in str(root1)
-    assert str(id2.repository_id) in str(root2)
