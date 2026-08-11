@@ -3765,6 +3765,12 @@ def _relay_origin_response(
             framer.receive_data(chunk)
         except h11.LocalProtocolError:
             return "peer_error", "response_unframeable"
+        except h11.RemoteProtocolError:
+            # The ORIGIN violated HTTP/1.1 framing (duplicate/conflicting
+            # Content-Length, malformed chunk-size, oversized header block):
+            # typed fail-closed detail; nothing after the violation is
+            # relayed and the connection terminates.
+            return "peer_error", "response_remote_unframeable"
         completed = False
         try:
             while True:
@@ -3776,6 +3782,8 @@ def _relay_origin_response(
                     break
         except h11.LocalProtocolError:
             return "peer_error", "response_unframeable"
+        except h11.RemoteProtocolError:
+            return "peer_error", "response_remote_unframeable"
         if chunk:
             try:
                 channel.write(

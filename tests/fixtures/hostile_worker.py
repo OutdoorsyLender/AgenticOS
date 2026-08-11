@@ -20,6 +20,7 @@ Exit codes: 0 = scenario executed and JSON result emitted (read the
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -1674,6 +1675,223 @@ def _m4b3_git_exec(step: dict[str, Any], default_timeout: float) -> dict[str, An
         return {"op": "git", "argv": argv, "error_type": "TimeoutExpired"}
 
 
+def scenario_m4b3_fetch(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Exec the REAL /usr/bin/curl under the profile's routing (M4B-3 Slice 3).
+
+    ``--canary`` carries a JSON option object with ``steps`` (1..16
+    entries).  Each step is one bounded probe:
+
+    - ``{"op": "curl", "argv": [...], "env_extra": {}, "env_scrub": [],
+      "timeout": 25}`` — run the real curl binary with the worker's fixed
+      environment, adjusted per step (mirrors the M4B3-GIT-01 exec step).
+    - ``{"op": "fetch_artifact", "url": ..., "sha256": ..., "dest": ...,
+      "curl_extra": [], "timeout": 25}`` — the qualified build-script
+      contract, exactly: curl the URL to a staging path next to ``dest``
+      (same filesystem, distinct ``.partial`` name), verify the explicit
+      SHA-256 over the staged bytes, and atomically rename into ``dest``
+      (inside /workspace) ONLY on digest match.  Partial or failed
+      downloads are never renamed.  ``curl_extra`` is a TEST-HARNESS
+      escape hatch (the redirect corpus needs ``-L``); the qualified
+      contract itself has no caller-influenced curl flags — curl's
+      last-occurrence-wins semantics mean extra flags could override
+      ``--proto '=https'``.
+    - ``{"op": "file_stat", "path": ...}``, ``{"op": "fd_census"}`` —
+      artifact and residue censuses.
+
+    Per-step outcomes are evidence inputs, never worker failures: the
+    scenario succeeds when its scripted sequence completes.
+    """
+    started = utc_now_iso()
+    try:
+        options = json.loads(args.canary) if args.canary else {}
+    except ValueError as exc:
+        return make_result(
+            scenario_id, args.target or "", started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+        )
+    steps = options.get("steps", []) if isinstance(options, dict) else None
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 16:
+        return make_result(
+            scenario_id, args.target or "", started, succeeded=False,
+            error_type="ValueError",
+            error_message="canary must carry 1..16 step entries",
+        )
+    results = []
+    for step in steps:
+        if not isinstance(step, dict) or not isinstance(step.get("op"), str):
+            return make_result(
+                scenario_id, args.target or "", started, succeeded=False,
+                error_type="ValueError",
+                error_message="each step requires an op string",
+            )
+        results.append(_m4b3_fetch_step(step, args.timeout))
+    return make_result(
+        scenario_id, args.target or "connected-build-fetch", started,
+        succeeded=True, details={"steps": results},
+    )
+
+
+def _m4b3_fetch_step(step: dict[str, Any], default_timeout: float) -> dict[str, Any]:
+    op = step["op"]
+    try:
+        if op == "curl":
+            return _m4b3_curl_exec(step, default_timeout)
+        if op == "fetch_artifact":
+            return _m4b3_fetch_artifact(step, default_timeout)
+        if op == "file_stat":
+            path = step.get("path", "")
+            exists = os.path.isfile(path)
+            return {
+                "op": op,
+                "path": path,
+                "exists": exists,
+                "size": os.path.getsize(path) if exists else None,
+            }
+        if op == "fd_census":
+            return {"op": op, "fds": _bounded_live_fd_census()}
+        return {"op": op, "error_type": "UnknownStepOp"}
+    except Exception as exc:  # noqa: BLE001 — per-step fail-closed reporting
+        return {"op": op, "error_type": type(exc).__name__,
+                "error_message": str(exc)[:256]}
+
+
+def _m4b3_curl_exec(step: dict[str, Any], default_timeout: float) -> dict[str, Any]:
+    argv = step.get("argv")
+    if (
+        not isinstance(argv, list)
+        or not 1 <= len(argv) <= 16
+        or any(
+            not isinstance(item, str)
+            or len(item) > 512
+            or not item.isascii()
+            or any(ord(char) < 0x20 or ord(char) > 0x7E for char in item)
+            for item in argv
+        )
+    ):
+        return {"op": "curl", "error_type": "ValueError",
+                "error_message": "argv must be 1..16 bounded ASCII strings"}
+    env = dict(os.environ)
+    for name in step.get("env_scrub", []):
+        env.pop(name, None)
+    for name, value in (step.get("env_extra") or {}).items():
+        if isinstance(name, str) and isinstance(value, str):
+            env[name] = value
+    timeout = min(float(step.get("timeout", default_timeout)), 60.0)
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/curl", *argv],
+            env=env,
+            cwd="/workspace",
+            capture_output=True,
+            text=False,
+            timeout=timeout,
+        )
+        stderr = completed.stderr[-4096:].decode("ascii", errors="replace")
+        filters = step.get("stderr_filter")
+        if isinstance(filters, list) and filters:
+            stderr = "\n".join(
+                line
+                for line in stderr.splitlines()
+                if any(needle in line for needle in filters if isinstance(needle, str))
+            )
+        return {
+            "op": "curl",
+            "argv": argv,
+            "exit_code": completed.returncode,
+            "stdout_hex": completed.stdout[-4096:].hex(),
+            "stderr": stderr,
+        }
+    except subprocess.TimeoutExpired:
+        return {"op": "curl", "argv": argv, "error_type": "TimeoutExpired"}
+
+
+def _m4b3_fetch_artifact(step: dict[str, Any], default_timeout: float) -> dict[str, Any]:
+    """The qualified contract: fetch -> verify explicit SHA-256 -> rename.
+
+    curl writes ONLY to a staging path next to ``dest`` (same filesystem,
+    distinct ``.partial`` name); the digest gate over the staged bytes
+    decides whether the artifact is atomically renamed into place.  A
+    failed or partial download leaves ``dest`` absent forever.
+    """
+    url = step.get("url", "")
+    expected = step.get("sha256", "")
+    dest = step.get("dest", "")
+    if (
+        not isinstance(url, str)
+        or not isinstance(expected, str)
+        or not isinstance(dest, str)
+        or not dest.startswith("/workspace/")
+    ):
+        return {"op": "fetch_artifact", "error_type": "ValueError",
+                "error_message": "url/sha256/dest(/workspace) are required"}
+    staging = dest + ".partial"
+    timeout = min(float(step.get("timeout", default_timeout)), 60.0)
+    argv = [
+        "-fsS",
+        "--proto", "=https",
+        "--tlsv1.2",
+        "-o", staging,
+        *(step.get("curl_extra") or []),
+        url,
+    ]
+    result: dict[str, Any] = {
+        "op": "fetch_artifact",
+        "url": url,
+        "dest": dest,
+        "curl_exit": None,
+        "staged_bytes": 0,
+        "digest": None,
+        "digest_match": False,
+        "renamed": False,
+        "dest_exists": False,
+        "stderr": "",
+    }
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/curl", *argv],
+            env=dict(os.environ),
+            cwd="/workspace",
+            capture_output=True,
+            text=False,
+            timeout=timeout,
+        )
+        result["curl_exit"] = completed.returncode
+        result["stderr"] = completed.stderr[-2048:].decode(
+            "ascii", errors="replace"
+        )
+    except subprocess.TimeoutExpired:
+        result["error_type"] = "TimeoutExpired"
+    # The digest gate runs over whatever (if anything) was staged, even on
+    # curl failure: a partial file can never match an honest digest.
+    if os.path.isfile(staging):
+        digest = hashlib.sha256()
+        with open(staging, "rb") as handle:
+            while True:
+                chunk = handle.read(1 << 20)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        result["staged_bytes"] = os.path.getsize(staging)
+        result["digest"] = digest.hexdigest()
+        result["digest_match"] = bool(
+            result["digest"] == expected
+            and result["curl_exit"] == 0
+            and result["staged_bytes"] > 0
+        )
+        if result["digest_match"]:
+            os.replace(staging, dest)
+            result["renamed"] = True
+        else:
+            try:
+                os.unlink(staging)
+            except OSError:
+                pass
+    result["dest_exists"] = os.path.isfile(dest)
+    return result
+
+
 def _fd_is_open(fd: int) -> bool:
     try:
         os.fstat(fd)
@@ -1887,6 +2105,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "M4B3-GIT-01": {"handler": scenario_m4b3_git,
                 "needs": (),
                 "description": "Exec the real git binary through the profile's broker routing."},
+    "M4B3-FETCH-01": {"handler": scenario_m4b3_fetch,
+                "needs": (),
+                "description": "Exec the real curl binary through the profile's broker routing."},
     "FS-16": {"handler": scenario_m4a_runtime_view, "needs": (),
                 "description": "Inspect the fixed M4A /workspace and runtime ABI."},
     "PROC-09": {"handler": scenario_m4a_security_state, "needs": (),
