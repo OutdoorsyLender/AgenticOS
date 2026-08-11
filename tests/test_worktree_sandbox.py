@@ -543,3 +543,124 @@ def test_live_worktree_sandbox_multi_task_isolation(temp_git_repo, temp_state_ro
     # Verify Task A edits appear ONLY in Task A worktree
     assert (wt_a / "file_a.txt").is_file()
     assert not (wt_b / "file_a.txt").exists()
+
+
+# ============================================================================
+# 4. SLICE 3A.1 REMEDIATION & VERIFICATION TESTS
+# ============================================================================
+
+def test_git_ssl_cainfo_allowed_and_authority_vars_rejected():
+    # GIT_SSL_CAINFO is permitted for M4B-3 network CA configuration
+    _validate_extra_worker_env((("GIT_SSL_CAINFO", "/opt/agenticos/network-ca.pem"),))
+
+    # All Git repository authority variables are strictly forbidden
+    for var in FORBIDDEN_GIT_ENV_NAMES:
+        with pytest.raises(ValueError) as exc:
+            _validate_extra_worker_env(((var, "/tmp/attack_path"),))
+        assert "forbids Git authority environment variable" in str(exc.value)
+
+
+def test_result_capture_rename_parsing(temp_git_repo, temp_state_root):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+
+    manager = WorktreeManager(temp_state_root)
+    res = create_worktree_reservation(
+        repo_path=repo,
+        task_id="rename-task",
+        generation=1,
+        baseline_commit_sha=commit_sha,
+        nonce="a" * 32,
+        policy_digest="a" * 64,
+        state_root=temp_state_root,
+    )
+    state = manager.create(res)
+    wt_dir = state.worktree_path
+
+    # Perform rename: main.py -> app.py
+    subprocess.run(["git", "mv", "main.py", "app.py"], cwd=wt_dir, check=True)
+    # Untracked file
+    (wt_dir / "untracked.py").write_text("print('untracked')\n", encoding="utf-8")
+    # Modified file
+    (wt_dir / "README.md").write_text("# Renamed Repo\n", encoding="utf-8")
+
+    res_obj = manager.capture_result(repo, "rename-task", 1, worker_exit_code=0)
+
+    assert res_obj.is_clean is False
+    assert ("main.py", "app.py") in res_obj.renamed_paths
+    assert "README.md" in res_obj.modified_paths
+    assert "untracked.py" in res_obj.added_untracked_paths
+    assert "app.py" not in res_obj.added_untracked_paths
+
+
+def test_result_capture_rename_with_spaces(temp_git_repo, temp_state_root):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+
+    manager = WorktreeManager(temp_state_root)
+    res = create_worktree_reservation(
+        repo_path=repo,
+        task_id="rename-space-task",
+        generation=1,
+        baseline_commit_sha=commit_sha,
+        nonce="b" * 32,
+        policy_digest="b" * 64,
+        state_root=temp_state_root,
+    )
+    state = manager.create(res)
+    wt_dir = state.worktree_path
+
+    subprocess.run(["git", "mv", "main.py", "my main script.py"], cwd=wt_dir, check=True)
+
+    res_obj = manager.capture_result(repo, "rename-space-task", 1, worker_exit_code=0)
+
+    assert ("main.py", "my main script.py") in res_obj.renamed_paths
+
+
+def test_untracked_file_evidence_bounds(temp_git_repo, temp_state_root):
+    repo = temp_git_repo["path"]
+    commit_sha = temp_git_repo["commit_sha"]
+
+    manager = WorktreeManager(temp_state_root)
+    res = create_worktree_reservation(
+        repo_path=repo,
+        task_id="untracked-bounds-task",
+        generation=1,
+        baseline_commit_sha=commit_sha,
+        nonce="c" * 32,
+        policy_digest="c" * 64,
+        state_root=temp_state_root,
+    )
+    state = manager.create(res)
+    wt_dir = state.worktree_path
+
+    # Small text file
+    (wt_dir / "small.txt").write_text("hello\n", encoding="utf-8")
+    # Empty file
+    (wt_dir / "empty.txt").write_text("", encoding="utf-8")
+    # Large file (> 64 KiB)
+    large_data = b"X" * (70 * 1024)
+    (wt_dir / "large.bin").write_bytes(large_data)
+    # Binary file with NUL bytes
+    binary_data = b"hello\x00world\x00123"
+    (wt_dir / "binary.dat").write_bytes(binary_data)
+    # Symlink
+    if hasattr(os, "symlink"):
+        try:
+            os.symlink("small.txt", str(wt_dir / "symlink.txt"))
+        except OSError:
+            pass
+
+    res_obj = manager.capture_result(repo, "untracked-bounds-task", 1, worker_exit_code=0)
+
+    assert "small.txt" in res_obj.added_untracked_paths
+    assert "empty.txt" in res_obj.added_untracked_paths
+    assert "large.bin" in res_obj.added_untracked_paths
+    assert "binary.dat" in res_obj.added_untracked_paths
+
+    assert "[UNTRACKED LARGE FILE:" in res_obj.diff_content
+    assert "[UNTRACKED BINARY FILE:" in res_obj.diff_content
+    assert len(res_obj.diff_sha256) == 64
+    # Ensure source worktree files remain untouched and intact
+    assert (wt_dir / "large.bin").read_bytes() == large_data
+    assert (wt_dir / "binary.dat").read_bytes() == binary_data

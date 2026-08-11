@@ -643,7 +643,7 @@ def _validate_extra_worker_env(
             or not _EXTRA_WORKER_ENV_NAME_RE.fullmatch(name)
         ):
             raise ValueError("extra_worker_env names must be env identifiers")
-        if name in FORBIDDEN_GIT_ENV_NAMES or name.startswith("GIT_"):
+        if name in FORBIDDEN_GIT_ENV_NAMES:
             raise ValueError(f"extra_worker_env forbids Git authority environment variable: {name!r}")
         if name in base_names or name in seen:
             raise ValueError("extra_worker_env names must not collide")

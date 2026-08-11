@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1402,6 +1403,7 @@ class WorktreeManager:
             current_head_sha = res_head.stdout.strip().lower()
 
             res_st = _run_git_plumbing(["git", "status", "--porcelain=v1", "-z"], cwd=worktree_dir)
+            renamed_set: set[tuple[str, str]] = set()
             modified_set: set[str] = set()
             added_set: set[str] = set()
             deleted_set: set[str] = set()
@@ -1416,59 +1418,54 @@ class WorktreeManager:
                         continue
                     if len(entry) >= 3:
                         st_code = entry[:2]
-                        path_str = entry[3:]
+                        path1 = entry[3:]
                         if st_code[0] in ("R", "C") or st_code[1] in ("R", "C"):
                             if idx + 1 < len(raw_entries):
-                                path_str = raw_entries[idx + 1]
+                                path2 = raw_entries[idx + 1]
                                 idx += 1
-
-                        if st_code == "??" or "A" in st_code:
-                            added_set.add(path_str)
+                                renamed_set.add((path2, path1))
+                                if st_code[1] == "M":
+                                    modified_set.add(path1)
+                        elif st_code == "??" or "A" in st_code:
+                            added_set.add(path1)
                         elif "D" in st_code:
-                            deleted_set.add(path_str)
-                        else:
-                            modified_set.add(path_str)
+                            deleted_set.add(path1)
+                        elif "M" in st_code:
+                            modified_set.add(path1)
                     idx += 1
 
             mod_paths = tuple(sorted(modified_set)[:max_paths_per_category])
             add_paths = tuple(sorted(added_set)[:max_paths_per_category])
             del_paths = tuple(sorted(deleted_set)[:max_paths_per_category])
+            ren_paths = tuple(sorted(renamed_set)[:max_paths_per_category])
 
-            res_diff = _run_git_plumbing(["git", "diff", "HEAD"], cwd=worktree_dir)
-            diff_bytes = res_diff.stdout.encode("utf-8") if res_diff.returncode == 0 else b""
+            diff_byte_count, diff_sha256, diff_content, is_diff_truncated = _run_git_diff_bounded(
+                worktree_dir, max_diff_bytes=max_diff_bytes, timeout=self.lock_timeout
+            )
 
             if added_set:
-                extra_diffs = []
+                extra_chunks = []
                 for rel_p in sorted(added_set):
-                    full_p = worktree_dir / rel_p
-                    if full_p.is_file() and not full_p.is_symlink():
-                        try:
-                            content = full_p.read_text(encoding="utf-8", errors="replace")
-                            lines = content.splitlines()
-                            extra_diffs.append(
-                                f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,{len(lines)} @@\n+"
-                                + "\n+".join(lines)
-                                + "\n"
-                            )
-                        except OSError:
-                            pass
-                if extra_diffs:
-                    diff_bytes += ("\n" + "".join(extra_diffs)).encode("utf-8")
-
-            diff_sha256 = hashlib.sha256(diff_bytes).hexdigest()
-            diff_byte_count = len(diff_bytes)
-
-            if diff_byte_count > max_diff_bytes:
-                is_diff_truncated = True
-                diff_content = diff_bytes[:max_diff_bytes].decode("utf-8", errors="replace") + f"\n... [TRUNCATED {diff_byte_count - max_diff_bytes} BYTES]"
-            else:
-                is_diff_truncated = False
-                diff_content = diff_bytes.decode("utf-8", errors="replace")
+                    chunk_b = _format_untracked_file_evidence(worktree_dir, rel_p)
+                    if chunk_b:
+                        extra_chunks.append(chunk_b)
+                if extra_chunks:
+                    combined_extra = b"\n" + b"".join(extra_chunks)
+                    base_bytes = diff_content.encode("utf-8", errors="replace")
+                    all_bytes = base_bytes + combined_extra
+                    diff_byte_count = len(all_bytes)
+                    diff_sha256 = hashlib.sha256(all_bytes).hexdigest()
+                    if diff_byte_count > max_diff_bytes:
+                        is_diff_truncated = True
+                        diff_content = all_bytes[:max_diff_bytes].decode("utf-8", errors="replace") + f"\n... [TRUNCATED {diff_byte_count - max_diff_bytes} BYTES]"
+                    else:
+                        diff_content = all_bytes.decode("utf-8", errors="replace")
 
             is_clean = (
                 len(modified_set) == 0
                 and len(added_set) == 0
                 and len(deleted_set) == 0
+                and len(renamed_set) == 0
                 and current_head_sha == state.baseline_commit_sha.lower()
             )
 
@@ -1497,6 +1494,7 @@ class WorktreeManager:
                 modified_paths=mod_paths,
                 added_untracked_paths=add_paths,
                 deleted_paths=del_paths,
+                renamed_paths=ren_paths,
                 diff_sha256=diff_sha256,
                 diff_byte_count=diff_byte_count,
                 diff_content=diff_content,
@@ -1512,6 +1510,113 @@ class WorktreeManager:
             self._atomic_write_json(task_dir / "result.json", result.to_dict())
 
             return result
+
+
+MAX_UNTRACKED_FILE_EVIDENCE_BYTES = 64_000
+
+
+def _run_git_diff_bounded(
+    cwd: Path,
+    max_diff_bytes: int = 1_000_000,
+    timeout: float = 10.0,
+) -> tuple[int, str, str, bool]:
+    """Execute git diff HEAD with bounded streaming memory consumption.
+
+    Returns (diff_byte_count, diff_sha256, diff_inline_content, is_diff_truncated).
+    """
+    cmd = ["git", "diff", "HEAD"]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_sanitize_git_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WorktreeValidationError(f"git diff execution failed: {type(exc).__name__}") from exc
+
+    hasher = hashlib.sha256()
+    total_bytes = 0
+    inline_buf = bytearray()
+
+    try:
+        if proc.stdout is not None:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                total_bytes += len(chunk)
+                if len(inline_buf) < max_diff_bytes:
+                    space = max_diff_bytes - len(inline_buf)
+                    inline_buf.extend(chunk[:space])
+        proc.wait(timeout=timeout)
+    except Exception as exc:
+        proc.kill()
+        proc.wait()
+        raise WorktreeValidationError(f"git diff streaming failed: {type(exc).__name__}") from exc
+
+    if proc.returncode != 0:
+        return 0, hashlib.sha256(b"").hexdigest(), "", False
+
+    is_truncated = total_bytes > max_diff_bytes
+    diff_sha256 = hasher.hexdigest()
+    diff_text = inline_buf.decode("utf-8", errors="replace")
+
+    return total_bytes, diff_sha256, diff_text, is_truncated
+
+
+def _format_untracked_file_evidence(
+    worktree_dir: Path,
+    rel_p: str,
+    max_evidence_bytes: int = MAX_UNTRACKED_FILE_EVIDENCE_BYTES,
+) -> bytes:
+    """Generate bounded, safe evidence diff chunk for an untracked file without following symlinks."""
+    full_p = worktree_dir / rel_p
+    try:
+        st = full_p.lstat()
+    except OSError:
+        return b""
+
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            target = os.readlink(full_p)
+        except OSError:
+            target = "<unreadable>"
+        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,1 @@\n+ [SYMLINK -> {target}]\n".encode("utf-8")
+
+    if not stat.S_ISREG(st.st_mode):
+        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,1 @@\n+ [NON-REGULAR FILE: mode {oct(st.st_mode)}]\n".encode("utf-8")
+
+    if st.st_size == 0:
+        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +0,0 @@\n".encode("utf-8")
+
+    if st.st_size > max_evidence_bytes:
+        hasher = hashlib.sha256()
+        try:
+            with open(full_p, "rb") as f:
+                while chunk := f.read(65536):
+                    hasher.update(chunk)
+            sha = hasher.hexdigest()
+        except OSError:
+            sha = "<unreadable>"
+        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,1 @@\n+ [UNTRACKED LARGE FILE: {st.st_size} BYTES, SHA256: {sha}]\n".encode("utf-8")
+
+    try:
+        with open(full_p, "rb") as f:
+            raw = f.read(max_evidence_bytes + 1)
+    except OSError:
+        return b""
+
+    if b"\x00" in raw:
+        sha = hashlib.sha256(raw).hexdigest()
+        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,1 @@\n+ [UNTRACKED BINARY FILE: {len(raw)} BYTES, SHA256: {sha}]\n".encode("utf-8")
+
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    content = f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,{len(lines)} @@\n+" + "\n+".join(lines) + "\n"
+    return content.encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -1540,6 +1645,7 @@ class TaskWorktreeResult:
     diff_content: str
     is_diff_truncated: bool
     preservation_classification: str
+    renamed_paths: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1560,6 +1666,7 @@ class TaskWorktreeResult:
             "modified_paths": list(self.modified_paths),
             "added_untracked_paths": list(self.added_untracked_paths),
             "deleted_paths": list(self.deleted_paths),
+            "renamed_paths": [list(pair) for pair in self.renamed_paths],
             "diff_sha256": self.diff_sha256,
             "diff_byte_count": self.diff_byte_count,
             "diff_content": self.diff_content,
