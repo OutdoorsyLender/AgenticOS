@@ -23,6 +23,20 @@ from .network_models import (
     canonical_policy_bytes,
     policy_digest,
 )
+from .provider_broker import TaskProviderBroker
+from .provider_models import (
+    NetworkAuthority,
+    ProviderAuthCapability,
+    ProviderBrokerEvidence,
+    ProviderBrokerIdentity,
+    ProviderBrokerPolicy,
+    ProviderFailureClass,
+    ProviderGrant,
+    SecretValue,
+    SyntheticBearerAuth,
+    canonical_provider_policy_bytes,
+    provider_policy_digest,
+)
 
 
 def __getattr__(name: str) -> object:
@@ -44,12 +58,24 @@ __all__ = [
     "HostQualificationMismatchError",
     "ListenerEvidence",
     "NamespaceLandlockRunner",
+    "NetworkAuthority",
+    "ProviderAuthCapability",
+    "ProviderBrokerEvidence",
+    "ProviderBrokerIdentity",
+    "ProviderBrokerPolicy",
+    "ProviderFailureClass",
+    "ProviderGrant",
+    "SecretValue",
+    "SyntheticBearerAuth",
+    "TaskProviderBroker",
     "TransportMode",
     "TransportPolicy",
     "canonical_manifest_bytes",
     "canonical_policy_bytes",
+    "canonical_provider_policy_bytes",
     "compute_host_manifest",
     "manifest_digest",
     "policy_digest",
+    "provider_policy_digest",
     "verify_host_manifest",
 ]
