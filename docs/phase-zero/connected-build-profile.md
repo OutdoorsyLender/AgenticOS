@@ -148,3 +148,10 @@ conformance-only, no production impact).
   unbypassable by the reviewer.
 - Full Linux suite at closure: 1919 passed, 1 skipped (baseline was
   1833 passed, 1 skipped).
+- Later slices: Slice 2 git qualification
+  (`docs/phase-zero/connected-build-git.md`), Slice 3 artifact fetch
+  (`docs/phase-zero/connected-build-fetch.md`), Slice 4 pip
+  qualification (`docs/phase-zero/connected-build-pip.md`), Slice 5
+  lifecycle matrix and acquisition evidence
+  (`docs/phase-zero/connected-build-lifecycle.md`,
+  `docs/phase-zero/connected-build-evidence.md`).
