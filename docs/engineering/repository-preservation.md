@@ -110,13 +110,13 @@ boundaries:
 
 ```bash
 git fetch --prune origin
-git pull --ff-only
+git pull --ff-only origin main
 ```
 
-Never create an incidental merge or rebase of shared `main` merely to
+Never use `git reset --hard` to synchronize clones. Never create an incidental merge or rebase of shared `main` merely to
 synchronize. If the pull reports that local changes or untracked files would
 be overwritten, that is a dirty-tree situation — handle it per the next
-section, not by forcing the pull.
+section, not by forcing the pull or executing `git reset --hard`.
 
 ## Dirty-tree and divergence handling (provenance first)
 
