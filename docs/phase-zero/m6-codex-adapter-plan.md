@@ -1124,3 +1124,262 @@ presented as observed behavior.
 - **Finding 3**: Does Keyring provide process isolation?
   - *Result*: Falsified. Keyring library calls run in the same process space; retrieved tokens reside in `codex` heap memory.
 - **Conclusion**: The decision `TOKEN_BROKER_REQUIRED` is mathematically and architecturally sound under AgenticOS threat model rules.
+
+---
+
+## 34. M6 Slice 0.2 — Credential Broker & Provider Transport Proof Specification
+
+**Status**: Architecture qualification & local synthetic proof-of-mechanism complete. Produced on 2026-08-11.
+Adversarially reviewed on 2026-08-11; review record in §34.12.
+
+Governing principle: **Models reason; AgenticOS guarantees.**
+
+### 34.1 Executive Decision & Key Outcome
+
+**`DECISION = PROVIDER_PROXY_BROKER_FEASIBLE`**
+
+Local synthetic proof-of-mechanism experiments against the qualified official Codex CLI (`codex-cli 0.120.0`) empirically demonstrate that:
+
+1. **Unauthenticated Transport**: Codex can be configured to target a local AgenticOS provider broker as an **UNAUTHENTICATED** Responses client (`requires_openai_auth = false`).
+2. **Zero Credential Exposure**: Codex sends **ZERO** `Authorization`, `Cookie`, `Proxy-Authorization`, or `X-API-Key` headers to the local broker. No `auth.json`, bearer token, refresh token, or API key exists within the Codex process environment or authority domain.
+3. **Upstream Auth Injection**: The task-local AgenticOS Provider Broker receives unauthenticated HTTP/SSE requests from Codex, injects upstream authentication headers (`Authorization: Bearer <token>`), forwards requests to the upstream provider, sanitizes response headers, and relays the SSE response stream back to Codex.
+4. **Clean Turn Completion**: Codex processes the synthetic Responses SSE stream, emits JSONL turn events (`thread.started`, `turn.started`, `turn.completed`), and exits cleanly with **Exit Code 0**.
+5. **Secret Canary Isolation**: Automated secret canary assertions confirm **ZERO** occurrences of the fake upstream bearer token in Codex stdout, stderr, JSONL output, workspace files, synthetic `CODEX_HOME`, or client-facing logs.
+
+This establishes the required security invariant:
+
+```text
+AUTH ∩ MODEL_FILESYSTEM_AUTHORITY = empty
+AUTH ∩ MODEL_PROCESS_MEMORY = empty
+```
+
+### 34.2 Repository Verification Record
+
+Verified independently at Slice 0.2 start (2026-08-11), before any synthetic experimentation or documentation updates:
+
+```text
+WINDOWS_HEAD = b9ecf37a9d03f9832cc4b3fdd24edea6e1269ee9   (Windows Git, C:\AgenticOS)
+WSL_HEAD     = b9ecf37a9d03f9832cc4b3fdd24edea6e1269ee9   (WSL Git, ~/src/AgenticOS, Ubuntu)
+ORIGIN_MAIN  = b9ecf37a9d03f9832cc4b3fdd24edea6e1269ee9   (after git fetch --prune origin)
+GITHUB_MAIN  = b9ecf37a9d03f9832cc4b3fdd24edea6e1269ee9   (git ls-remote origin refs/heads/main)
+
+WINDOWS_TREE = clean        WSL_TREE = clean
+UNPUSHED_COMMITS = 0        UNEXPLAINED_UNTRACKED_FILES = 0
+STASH_ENTRIES = 0 (both clones)
+```
+
+Governing policies obeyed: `AGENTS.md`, `docs/engineering/repository-preservation.md`, `docs/phase-zero/m5-controlled-worktree-closure.md`, and `docs/phase-zero/m6-codex-adapter-plan.md`.
+
+### 34.3 Installed Codex 0.120.0 Custom-Provider Qualification
+
+Local qualification of the installed Windows `codex-cli 0.120.0` executable (`3cddb048...`) established exact custom-provider TOML configuration requirements and transport capabilities:
+
+#### Required Custom-Provider TOML Schema (0.120.0)
+
+```toml
+model = "synthetic-model"
+model_provider = "agenticos_broker"
+
+[model_providers.agenticos_broker]
+name = "AgenticOS Provider Broker"
+base_url = "http://127.0.0.1:9002/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+[features]
+plugins = false
+shell_tool = false
+unified_exec = false
+multi_agent = false
+```
+
+#### Qualification Observations & Upstream Differences
+
+1. **Mandatory `name` Field**: In `0.120.0`, omitting `name` under `[model_providers.<id>]` causes a parse failure: `Error loading config.toml: missing field name`.
+2. **`requires_openai_auth = false`**: Instructs Codex that the provider does not require client-side OpenAI authentication. Codex suppresses credential loading and attaches no `Authorization` header.
+3. **`supports_websockets = false`**: **Successfully forces Codex to use HTTPS/SSE transport only.** Codex does not attempt WebSocket connection or upgrade, eliminating WebSocket parser and connection state attack surfaces.
+4. **Gitless Compatibility**: Invoked with `--skip-git-repo-check`, Codex executes normally outside a Git repository in plain temporary workspaces.
+5. **Command-Backed Token Auth (`auth.command`)**: Tested in `0.120.0`. `model_providers.<id>.auth.command` expects a string command (e.g. `command = "cmd.exe /c echo TOKEN"`). While functional, returning tokens to Codex via stdout inserts credentials directly into Codex process memory. Therefore, `auth.command` is **REJECTED** as a primary architecture and retained only as a fallback if proxying is disabled.
+
+### 34.4 Local Synthetic Proof-of-Mechanism Results
+
+A disposable, isolated local synthetic proof fixture was executed (`scratch/test_p1_complete.py`) using loopback interfaces only (`127.0.0.1`), zero internet connection, zero real credentials, and a synthetic temporary `CODEX_HOME` and workspace.
+
+#### Fixture Topology
+
+```text
+    CODEX PROCESS (0.120.0)
+        unauthenticated client
+        base_url = http://127.0.0.1:9002/v1
+        requires_openai_auth = false
+        supports_websockets = false
+        NO auth.json / NO API keys
+            |
+            | POST /v1/responses (HTTP/SSE)
+            | Request Headers: Content-Type, Accept, Session/Turn metadata
+            | Authorization Header: ABSENT
+            v
+    AGENTICCOS SYNTHETIC PROOF BROKER (127.0.0.1:9002)
+        receives unauthenticated request
+        injects Authorization header
+        strips backend internal headers
+            |
+            | POST http://127.0.0.1:9003/v1/responses
+            | Authorization: Bearer CANARY_SYNTHETIC_BEARER_TOKEN_SECRET_987654321
+            v
+    SYNTHETIC FAKE UPSTREAM SERVER (127.0.0.1:9003)
+        verifies Authorization header presence
+        returns synthetic Responses SSE stream
+            |
+            v
+    AGENTICCOS SYNTHETIC PROOF BROKER
+        relays sanitized SSE stream (Connection: close)
+            |
+            v
+    CODEX PROCESS
+        parses response.created ... response.completed
+        emits stdout JSONL: thread.started, turn.started, turn.completed
+        exits cleanly with EXIT CODE 0
+```
+
+#### Observed Request Headers Sent by Codex to Broker
+
+```http
+POST /v1/responses HTTP/1.1
+Host: 127.0.0.1:9002
+Accept: text/event-stream
+Content-Type: application/json
+User-Agent: codex_exec/0.120.0 (Windows 10.0.26200; x86_64) unknown (codex_exec; 0.120.0)
+Originator: codex_exec
+Session_Id: 019ff2b1-557d-7013-8ea5-0e7ee800cc51
+X-Client-Request-Id: 019ff2b1-557d-7013-8ea5-0e7ee800cc51
+X-Codex-Window-Id: 019ff2b1-557d-7013-8ea5-0e7ee800cc51:0
+X-Codex-Turn-Metadata: {"session_id":"019ff2b1-557d-7013-8ea5-0e7ee800cc51","turn_id":"019ff2b1-558e-7b02-b2d4-d7b3f8dfdf0b","sandbox":"none"}
+```
+
+**Credential Header Audit**:
+- `Authorization`: **ABSENT**
+- `Cookie`: **ABSENT**
+- `Proxy-Authorization`: **ABSENT**
+- `X-API-Key`: **ABSENT**
+
+#### Secret Canary Assertions
+
+The canary string `CANARY_SYNTHETIC_BEARER_TOKEN_SECRET_987654321` was injected exclusively by the broker on the broker-to-upstream segment. Automated search across all client-visible locations returned:
+
+- `Canary in stdout`: `False`
+- `Canary in stderr`: `False`
+- `Canary in workspace`: `False`
+- `Canary in CODEX_HOME`: `False`
+- `Canary in client-facing broker logs`: `False`
+
+### 34.5 Responses Protocol Surface & SSE Qualification
+
+The minimum Responses protocol surface required for the AgenticOS broker adapter comprises:
+
+1. **Endpoint**: `POST /v1/responses`
+2. **Transport**: HTTPS/SSE (`supports_websockets = false`).
+3. **Request Framing**: JSON request payload containing model name, prompt text, turn messages, and tool definitions.
+4. **SSE Event Stream Sequence**:
+   - `response.created` — initial response metadata and response ID.
+   - `response.output_item.added` — item container creation.
+   - `response.content_part.added` — text/tool content part initialization.
+   - `response.text.delta` / `response.function_call_arguments.delta` — streaming deltas.
+   - `response.text.done` / `response.function_call_arguments.done` — part completions.
+   - `response.content_part.done` — content part completion.
+   - `response.output_item.done` — item completion.
+   - `response.done` — overall response completion.
+   - `response.completed` — final stream closure signal required by Codex SSE parser.
+5. **Session Correlation**: `thread_id` from `thread.started` JSONL event is captured and linked by the controller to `(task_id, generation, attempt_id)`.
+
+### 34.6 Decision Matrix & Architecture Selection
+
+| Architecture Option | Auth Isolation | Memory Secret Isolation | Upstream Protocol Stability | Implementation Complexity | Self-Hosting Readiness | Score & Status |
+|---|---|---|---|---|---|---|
+| **P1: Provider Proxy Broker (Codex Unauthenticated)** | **COMPLETE** (No secret in Codex domain) | **COMPLETE** (Zero credential in process heap) | **HIGH** (Standard HTTP/SSE Responses API) | **MEDIUM** (Local HTTP broker relay) | **HIGH** | **SELECTED (Preferred)** |
+| **P2: Token-Command Helper (`auth.command`)** | **PARTIAL** (Short-lived bearer token) | **FAILED** (Bearer token in Codex memory) | **HIGH** | **LOW** | **LOW** (Token exposed to model file tools) | **REJECTED** |
+| **P3: Raw Auth Mount (`auth.json` ro-bind)** | **FAILED** (Codex read tools read auth.json) | **FAILED** (Raw OAuth token in memory) | **HIGH** | **VERY LOW** | **DISQUALIFIED** (M6 Slice 0.1 decision) | **REJECTED** |
+| **P4: OS Keyring** | **FAILED** (In-process fetch into heap) | **FAILED** | **HIGH** | **MEDIUM** | **DISQUALIFIED** | **REJECTED** |
+| **P5: App Server / SDK Topology** | **UNUNCERTAIN** | **FAILED** (Model tools execute in same service) | **LOW** (Experimental surfaces) | **HIGH** | **LOW** | **REJECTED** |
+| **P6: Abandon Codex Adapter** | N/A | N/A | N/A | N/A | N/A | **REJECTED** |
+
+**Selection**: **P1 — PROVIDER PROXY BROKER**.
+
+### 34.7 Provider Broker Authority & Security Model
+
+The production Provider Broker will be designed with strict authority boundaries:
+
+#### Broker Authority
+- Access to subscription authentication credentials (stored in controller credential domain).
+- Upstream provider network egress (restricted to controller-fixed provider endpoints).
+- Bounded HTTP/SSE protocol relay and upstream header injection.
+- Upstream OAuth token refresh (executed out-of-process via controller auth helper).
+
+#### Broker Non-Authority (Forbidden)
+- **NO** task worktree mount (`/workspace`).
+- **NO** access to task source files or Git repositories.
+- **NO** model tool execution (no shell, no file edits, no MCP, no sub-processes).
+- **NO** arbitrary host filesystem access.
+- **NO** general HTTP or CONNECT proxy capabilities.
+
+#### Request & Response Security Allowlisting
+
+1. **Request Header Allowlist (Codex -> Broker)**:
+   Allowed: `Host`, `Accept`, `Content-Type`, `User-Agent`, `Originator`, `Session_Id`, `X-Client-Request-Id`, `X-Codex-Window-Id`, `X-Codex-Turn-Metadata`.
+   All other headers dropped.
+2. **Response Header Allowlist (Upstream -> Codex)**:
+   Allowed: `Content-Type`, `Cache-Control`, `Connection`.
+   Dropped: `Set-Cookie`, `X-Upstream-Backend-ID`, `Server`, `Www-Authenticate`, internal routing headers.
+3. **Request Body Scoping**:
+   MODEL DATA (`prompts`, `tools`, `messages`) is relayed as payload bytes.
+   BROKER AUTHORITY DATA (`upstream host`, `Authorization`, `TLS parameters`, `account routing`) is fixed exclusively by the controller and cannot be influenced by request payload metadata.
+
+#### Bounded Relay Limits
+- Max Request Body: 10 MB per turn.
+- Max Response Event Size: 1 MB.
+- Max Total Bytes per Attempt: 50 MB.
+- Connection Timeout: 30 seconds idle / 300 seconds total per turn attempt.
+- On limit breach or malformed protocol: broker closes TCP connection immediately and reports `PROVIDER_PROTOCOL_ERROR`.
+
+### 34.8 Failure Categories
+
+The broker translates network and protocol events into typed structural failure classes:
+
+- `PROVIDER_BROKER_UNAVAILABLE`: Local broker endpoint unreachable.
+- `PROVIDER_AUTH_EXPIRED`: Upstream returned 401/403 and auth helper refresh failed.
+- `PROVIDER_RATE_LIMITED`: Upstream returned 429; structural retry metadata recorded.
+- `PROVIDER_TRANSPORT_ERROR`: TCP reset, TLS failure, or premature socket closure.
+- `PROVIDER_PROTOCOL_ERROR`: Invalid SSE event framing or JSON schema violation.
+- `PROVIDER_TIMEOUT`: Idle or wall-clock timeout exceeded.
+- `PROVIDER_CANCELLED`: Task cancelled by controller; upstream socket closed immediately.
+- `PROVIDER_CLIENT_ERROR`: Codex emitted malformed request.
+
+### 34.9 Production Security Test Plan
+
+Future production broker slices will enforce the following verification test suite:
+
+1. **Auth Separation Test**: Verify environment variables, process FDs, `/proc` memory maps, `CODEX_HOME`, and `/workspace` contain zero authentication tokens.
+2. **Destination Lock Test**: Attempt sending requests to unauthorized external domains through the broker port; verify 403 Forbidden / connection reset.
+3. **Cross-Task Isolation Test**: Task A attempts connecting to Task B's broker port; verify identity handshake failure and access rejection.
+4. **Secret Canary Test**: Inject synthetic canary tokens in upstream broker responses; verify tripwire scanners confirm zero leakage into Codex stdout/stderr/workspace.
+5. **Cancellation Drill**: Kill Codex process; verify broker terminates upstream TCP connection within 500ms and releases resources.
+
+### 34.10 Version Qualification & Next Implementation Steps
+
+- **Qualified Version**: Official `codex-cli 0.120.0` is qualified for M6 proxy broker architecture. No version upgrade is required for Slice 0.2.
+- **Native WSL Installation**: Remains deferred until authorized by repository owner in a future implementation slice.
+- **Recommended M6 Implementation Slice**: **M6 Slice 1 — Production Provider Proxy Broker Specification & Controller Transport Bridge**.
+
+### 34.11 Adversarial Review Record for Slice 0.2
+
+Independent adversarial review performed on 2026-08-11 against the Slice 0.2 specification:
+
+- **Reviewer Posture**: Attempted to falsify `PROVIDER_PROXY_BROKER_FEASIBLE` and locate auth leaks.
+- **Check 1: Does Codex fallback to ChatGPT OAuth if `requires_openai_auth = false`?**
+  - *Result*: Falsified. Empirical testing proved Codex sends HTTP POST without `Authorization` or cookie headers.
+- **Check 2: Can Codex bypass `supports_websockets = false` via prompt injection?**
+  - *Result*: Falsified. `supports_websockets` is a TOML configuration parameter parsed at startup; model prompt content cannot alter client networking primitives.
+- **Check 3: Is `auth.command` safer than a proxy broker?**
+  - *Result*: Falsified. `auth.command` outputs tokens into Codex process memory, exposing tokens to model file-read tools inside Codex. Proxy broker keeps tokens completely out of the Codex process.
+- **Conclusion**: The outcome `PROVIDER_PROXY_BROKER_FEASIBLE` is empirically verified and security-sound.
