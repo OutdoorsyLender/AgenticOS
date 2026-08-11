@@ -1,0 +1,18 @@
+# M4B-3 Connected Build conformance tooling (Slice 4).
+#
+# Hash-pinned pip wheel staged by the CONFORMANCE HARNESS into the task
+# worktree for the pip-qualification corpus: the worker's system python3
+# has neither pip nor ensurepip, so the worker runs pip directly from the
+# wheel zip (python3 <wheel>/pip ...).  This wheel is test/build tooling
+# ONLY — it never enters the broker, certificate-helper, or controller
+# runtime closures.
+#
+# Offline reproduction (no network):
+#   pip install --no-index --find-links requirements/wheelhouse \
+#       --require-hashes --only-binary=:all: \
+#       -r requirements/m4b3-pip.txt --target <tmpdir>
+#
+# Review record: docs/phase-zero/dependency-review-m4b3.md
+
+pip==26.2.1 \
+    --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e

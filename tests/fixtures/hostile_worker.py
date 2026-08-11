@@ -1675,6 +1675,161 @@ def _m4b3_git_exec(step: dict[str, Any], default_timeout: float) -> dict[str, An
         return {"op": "git", "argv": argv, "error_type": "TimeoutExpired"}
 
 
+def scenario_m4b3_pip(
+    scenario_id: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Exec REAL pip-from-wheel under the profile's routing (M4B-3 Slice 4).
+
+    The worker's system python3 has no pip/ensurepip; the conformance
+    harness stages a hash-verified pip wheel into the worktree and pip runs
+    directly from the wheel zip.  ``--canary`` carries a JSON option object
+    with ``steps`` (1..16 entries):
+
+    - ``{"op": "pip", "argv": [...], "env_extra": {}, "env_scrub": [],
+      "timeout": 60}`` — run ``/usr/bin/python3 <staged-wheel>/pip`` with
+      the worker's fixed environment, adjusted per step.
+    - ``{"op": "tree_census"}`` — bounded relative-path census of
+      /workspace, /tmp, and /home/tool (cache/write confinement).
+    - ``{"op": "file_stat", "path": ...}``, ``{"op": "dns_probe",
+      "hostname": ...}``, ``{"op": "env_census"}``,
+      ``{"op": "fd_census"}`` — isolation probes.
+
+    Per-step outcomes are evidence inputs, never worker failures: the
+    scenario succeeds when its scripted sequence completes.
+    """
+    started = utc_now_iso()
+    try:
+        options = json.loads(args.canary) if args.canary else {}
+    except ValueError as exc:
+        return make_result(
+            scenario_id, args.target or "", started, succeeded=False,
+            error_type=type(exc).__name__, error_message=str(exc),
+        )
+    steps = options.get("steps", []) if isinstance(options, dict) else None
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 16:
+        return make_result(
+            scenario_id, args.target or "", started, succeeded=False,
+            error_type="ValueError",
+            error_message="canary must carry 1..16 step entries",
+        )
+    pip_zip = (
+        options.get("pip_zip")
+        if isinstance(options, dict)
+        else None
+    ) or "/workspace/.aos-pip/pip-26.2.1-py3-none-any.whl"
+    results = []
+    for step in steps:
+        if not isinstance(step, dict) or not isinstance(step.get("op"), str):
+            return make_result(
+                scenario_id, args.target or "", started, succeeded=False,
+                error_type="ValueError",
+                error_message="each step requires an op string",
+            )
+        results.append(_m4b3_pip_step(step, args.timeout, pip_zip))
+    return make_result(
+        scenario_id, args.target or "connected-build-pip", started,
+        succeeded=True, details={"steps": results},
+    )
+
+
+def _m4b3_pip_step(step, default_timeout, pip_zip):
+    op = step["op"]
+    try:
+        if op == "pip":
+            return _m4b3_pip_exec(step, default_timeout, pip_zip)
+        if op == "tree_census":
+            census = {}
+            for root in ("/workspace", "/tmp", "/home/tool"):
+                entries = []
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames.sort()
+                    for name in sorted(filenames):
+                        if len(entries) >= 128:
+                            break
+                        full = os.path.join(dirpath, name)
+                        entries.append(
+                            [
+                                os.path.relpath(full, root),
+                                os.path.getsize(full),
+                            ]
+                        )
+                    if len(entries) >= 128:
+                        break
+                census[root] = entries
+            return {"op": op, "census": census}
+        if op == "file_stat":
+            path = step.get("path", "")
+            exists = os.path.isfile(path)
+            return {
+                "op": op,
+                "path": path,
+                "exists": exists,
+                "size": os.path.getsize(path) if exists else None,
+            }
+        if op == "dns_probe":
+            hostname = step.get("hostname", "")
+            try:
+                socket.getaddrinfo(hostname, 443)
+            except OSError as exc:
+                return {
+                    "op": op,
+                    "hostname": hostname,
+                    "resolved": False,
+                    "error_type": type(exc).__name__,
+                }
+            return {"op": op, "hostname": hostname, "resolved": True}
+        if op == "env_census":
+            return {"op": op, "environment": dict(os.environ)}
+        if op == "fd_census":
+            return {"op": op, "fds": _bounded_live_fd_census()}
+        return {"op": op, "error_type": "UnknownStepOp"}
+    except Exception as exc:  # noqa: BLE001 — per-step fail-closed reporting
+        return {"op": op, "error_type": type(exc).__name__,
+                "error_message": str(exc)[:256]}
+
+
+def _m4b3_pip_exec(step, default_timeout, pip_zip):
+    argv = step.get("argv")
+    if (
+        not isinstance(argv, list)
+        or not 1 <= len(argv) <= 24
+        or any(
+            not isinstance(item, str)
+            or len(item) > 512
+            or not item.isascii()
+            or any(ord(char) < 0x20 or ord(char) > 0x7E for char in item)
+            for item in argv
+        )
+    ):
+        return {"op": "pip", "error_type": "ValueError",
+                "error_message": "argv must be 1..24 bounded ASCII strings"}
+    env = dict(os.environ)
+    for name in step.get("env_scrub", []):
+        env.pop(name, None)
+    for name, value in (step.get("env_extra") or {}).items():
+        if isinstance(name, str) and isinstance(value, str):
+            env[name] = value
+    timeout = min(float(step.get("timeout", default_timeout)), 90.0)
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/python3", pip_zip + "/pip", *argv],
+            env=env,
+            cwd="/workspace",
+            capture_output=True,
+            text=False,
+            timeout=timeout,
+        )
+        return {
+            "op": "pip",
+            "argv": argv,
+            "exit_code": completed.returncode,
+            "stdout": completed.stdout[-4096:].decode("ascii", errors="replace"),
+            "stderr": completed.stderr[-4096:].decode("ascii", errors="replace"),
+        }
+    except subprocess.TimeoutExpired:
+        return {"op": "pip", "argv": argv, "error_type": "TimeoutExpired"}
+
+
 def scenario_m4b3_fetch(
     scenario_id: str, args: argparse.Namespace
 ) -> dict[str, Any]:
@@ -2108,6 +2263,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "M4B3-FETCH-01": {"handler": scenario_m4b3_fetch,
                 "needs": (),
                 "description": "Exec the real curl binary through the profile's broker routing."},
+    "M4B3-PIP-01": {"handler": scenario_m4b3_pip,
+                "needs": (),
+                "description": "Exec real pip-from-wheel through the profile's broker routing."},
     "FS-16": {"handler": scenario_m4a_runtime_view, "needs": (),
                 "description": "Inspect the fixed M4A /workspace and runtime ABI."},
     "PROC-09": {"handler": scenario_m4a_security_state, "needs": (),
