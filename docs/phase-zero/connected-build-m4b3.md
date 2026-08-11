@@ -189,11 +189,16 @@ generic curl fetch, public/pinned-only, fixture-qualified**. See
 - Slice 3: +20 → **1958 passed, 1 skipped**.
 - Slice 4: +14 → **1972 passed, 1 skipped**.
 - Slice 5: +6 → **1978 passed, 1 skipped**.
-- Fixture-rotation fix: +1 grant unit test → **1979 passed, 1 skipped**
-  expected.
-- **Final recorded counts, three consecutive full-suite runs at closure
-  (to be measured): passed=(recorded at closure: PENDING),
-  skipped=(recorded at closure: PENDING).**
+- Fixture-rotation fix: +1 grant unit test → **1979 passed, 1 skipped**.
+- **Final verification, full Linux suites: four consecutive green runs —
+  1979 passed, 1 skipped each** (335 s, 336 s, 322 s in the closing
+  triple; 341 s in the preceding isolated run), no flakes. Disclosure:
+  one single-test failure occurred in an earlier triple attempt whose
+  run-2 window overlapped concurrent WSL shell activity by the operator
+  (a native-build compile and scratch cleanup against session policy);
+  the failure did not reproduce in four subsequent fully isolated runs
+  (~7900 test executions), residue checks were clean, and the episode is
+  attributed to that environmental perturbation, not to the code.
 - Windows regression clone (Windows host, regression-only): **777
   passed**, skipped 164 (baseline) → **168** across slices (new
   Linux-gated tests).
