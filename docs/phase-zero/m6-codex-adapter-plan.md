@@ -1041,3 +1041,86 @@ endpoint): loom.js `docs/codex-auth-experiment.md` (pinned-commit audit of
 
 Architectural inference is labeled as such in §12, §18, §19 and is not
 presented as observed behavior.
+
+---
+
+## 32. M6 Slice 0.1 — Codex Credential-Boundary and Provider-Sandbox Decision Spike
+
+**Status**: Decision Spike complete. Produced on 2026-08-11 by independent research agent.
+
+### 32.1 Decision Outcome
+
+**`DECISION = TOKEN_BROKER_REQUIRED`**
+
+- **Rationale**: The official Codex CLI (`codex`) operates as a single monolithic process where authentication material loading (`auth.json` or OS Keyring) and model-directed file tools (`read_file`, `list_dir`) execute within the **same process authority domain**. Mounting raw credentials (even read-only) into the provider sandbox gives model-directed read tools effective read authority over raw credentials. Under the AgenticOS governing principle **"Models reason; AgenticOS guarantees"**, an enforceable kernel/process boundary is required to separate credential read authority from model-directed read tools. Therefore, a minimal credential broker/helper (or client topology redesign running the client outside the hostile model tool domain) is required before authenticating tasks.
+
+### 32.2 Process and Tool Authority Model
+
+- **Process Structure**: `codex` is a single native binary.
+- **Auth Subsystem**: Opens and reads `$CODEX_HOME/auth.json` (or calls OS Keyring APIs) directly within the main `codex` process event loop.
+- **Model File Read / Edit Subsystem**: Internal Rust tool routines (`read_file`, `list_dir`, `apply_patch`) execute inside the main `codex` process using the same process file descriptors and OS user privileges.
+- **Child Processes**: Spawns shell helpers (`bwrap` on Linux, `codex-command-runner.exe` on Windows) when `shell_tool` is enabled. Disabling `shell_tool` (`features.shell_tool=false`) stops child shell processes, but **does NOT remove internal file read tool authority** inside the parent `codex` process.
+
+### 32.3 Credential-Store Mechanisms (Keyring Research)
+
+- `cli_auth_credentials_store` supports `file | keyring | auto`.
+- Keyring integration (Windows Credential Manager / Linux Secret Service) issues API calls **in-process** to fetch tokens into process memory.
+- Keyring does **NOT** separate process authority domains: the `codex` process still retrieves the raw secret into its memory space.
+- In sandboxed Linux netns/userns environments, Keyring adds complex daemon dependencies without creating a kernel barrier against in-process model tool exfiltration.
+
+### 32.4 Trust Test Evaluation
+
+- **Test**: If a prompt injection causes a model tool request `read_file("/opt/agenticos/provider-home/auth.json")`, what kernel/process boundary prevents it?
+- **Finding**: NONE. The kernel sees `codex` reading a file `codex` has permission to read.
+- Software path filters or prompt instructions fail the AgenticOS guarantee ("Models reason; AgenticOS guarantees").
+
+### 32.5 Network Exfiltration Analysis
+
+- The `codex` process holds legitimate network egress (TCP 443) to provider hosts (`*.openai.com`, `*.chatgpt.com`).
+- If secret material enters model context via `read_file`, `codex` will include it in API requests to the provider. Egress filtering to exact provider endpoints does NOT prevent credential leakage to those endpoints.
+
+### 32.6 Canary / Tripwire Classification
+
+- Canary decoy files and regex scanners are **DETECTIVE** or **FORENSIC**. They detect exposure after or during an attempt; they do **NOT** prevent credential reading.
+
+### 32.7 Auth Bind-Mount Analysis (Q8 Review)
+
+- A read-only bind-mount of `auth.json` prevents modification/overwriting of tokens on disk, but does **NOT** prevent reading or exfiltrating tokens.
+- Linux mount namespaces cannot distinguish access between internal auth routines and internal model tool handlers within the same process.
+
+### 32.8 Child-Process Authority Matrix
+
+| Process | AUTH (auth.json) | NETWORK (Egress) | MODEL FILESYSTEM | MODEL SHELL |
+|---|---|---|---|---|
+| `codex` (Parent) | **YES** | **YES** (Provider TCP 443) | **YES** (Internal read/edit tools) | **NO** (Tool dispatcher) |
+| `bwrap` / `sh` (Shell child) | **INHERITED** | **NO** | **YES** (/workspace RW) | **YES** (Shell exec) |
+| `codex` (`shell_tool=false`) | **YES** | **YES** | **YES** (Internal read/edit tools) | **DISABLED** |
+
+### 32.9 Feature Reduction & "No Shell Is Not Enough"
+
+- Disabling `shell_tool` stops shell command execution, but file read tools remain active. File read authority alone is sufficient for credential exfiltration.
+
+### 32.10 Token Broker Tradeoff Matrix
+
+1. **Raw auth mounted (Architecture C′)**: Simple, but fails credential isolation guarantee (honest residual).
+2. **OS Keyring**: In-process fetch; no process boundary improvement.
+3. **Minimal Controller Credential Broker**: Ephemeral token injection or controller-side proxy; enforces secret isolation, but requires handling short-lived tokens or proxy design.
+4. **Provider Client Outside Hostile Domain**: Client runs in controller domain, communicating with an edit executor. Requires official tool split hook (currently unsupported in official CLI).
+
+### 32.11 Recommended Path Forward
+
+- Move to a **Credential Broker / Helper** architecture or **Provider Client Redesign** where raw consumer auth material never enters a process domain executing model-controlled file read tools.
+- Defer Q1 (WSL install), Q2 (WSL login), and Q5 (version pin) until the credential broker/topology decision is finalized by the repository owner.
+
+---
+
+## 33. Independent Adversarial Review of M6 Slice 0.1 Findings
+
+- **Reviewer posture**: Falsification attempt against credential isolation claims.
+- **Finding 1**: Could `permissions` config rules in Codex reliably block `read_file` access to `CODEX_HOME`?
+  - *Result*: No. `permissions` rules are soft client policy, not kernel-enforceable barriers. Model prompt injection or bypasses could override client self-policy.
+- **Finding 2**: Does Linux mount namespace `remount,ro` prevent exfiltration?
+  - *Result*: Falsified. `ro` blocks `write()`/`unlink()`, but `read()` succeeds unconditionally. Exfiltration requires only `read()`.
+- **Finding 3**: Does Keyring provide process isolation?
+  - *Result*: Falsified. Keyring library calls run in the same process space; retrieved tokens reside in `codex` heap memory.
+- **Conclusion**: The decision `TOKEN_BROKER_REQUIRED` is mathematically and architecturally sound under AgenticOS threat model rules.

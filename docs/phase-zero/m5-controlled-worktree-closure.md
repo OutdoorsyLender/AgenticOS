@@ -36,7 +36,7 @@ M5 implements a trusted, controller-owned Git worktree substrate operating outsi
         ↓
     WorktreeReservation (nonce, policy_digest, state_root)
         ↓
-    controller-owned Git ref/worktree creation (git worktree add -b refs/agenticos/task-id/g1)
+    controller-owned Git ref/worktree creation (git worktree add -b refs/heads/aos/task-id/g1)
         ↓
     durable controller ownership/lifecycle state (lifecycle.json & atomic state root)
         ↓
@@ -70,7 +70,7 @@ Every stage in this pipeline is backed by current implementation (`src/agenticos
 ### Controller Authority (Trusted Domain)
 The trusted AgenticOS controller exclusively owns:
 - Repository identity and baseline commit SHA strict validation.
-- Task identity, task generation, and `refs/agenticos/*` ref creation/deletion.
+- Task identity, task generation, and `refs/heads/aos/*` ref creation/deletion.
 - Worktree reservation, lifecycle state machine (`lifecycle.json`, `result.json`), and durable state root storage.
 - Real Git plumbing operations (`git worktree add`, `git rev-parse`, `git status --porcelain=v1 -z`, `git diff HEAD`).
 - Filesystem descriptor verification (`openat2`, `fstat` kernel device/inode checks).
@@ -242,7 +242,7 @@ The adapter MUST NOT:
 - Access main `.git` or controller state root directories.
 - Open raw network sockets outside M4B Connected Build proxy policy.
 - Inherit ambient host environment variables or credentials.
-- Mutate `refs/agenticos/*` refs or execute `git commit`/`git push`.
+- Mutate `refs/heads/aos/*` refs or execute `git commit`/`git push`.
 - Mark a task worktree disposable or execute cleanup.
 
 ---
@@ -286,7 +286,7 @@ The following 17 claims are authoritatively earned by current M5 implementation 
 
 1. **Exact Repository Identity**: Deterministic detection of repository SHA-1 and SHA-256 object formats.
 2. **Immutable Baseline Selection**: Plumbing verification (`git rev-parse --verify`) of baseline commit SHAs.
-3. **Task-Specific Refs**: Isolation of worker worktrees under controller refs (`refs/agenticos/<task_id>/g<gen>`).
+3. **Task-Specific Refs**: Isolation of worker worktrees under controller refs (`refs/heads/aos/<task_id>/g<gen>`).
 4. **Durable Controller Ownership**: Atomic state root tracking (`lifecycle.json`, `result.json`, `reservation.json`).
 5. **Linked Worktree Lifecycle**: Controller creation, transaction tracking, and kernel-identity guarded verification.
 6. **Committed & Uncommitted Preservation**: Strict classification (`CLEAN_BASELINE_DISPOSABLE`, `DIRTY_PRESERVED`, `COMMITTED_WORK_PRESERVED`).
