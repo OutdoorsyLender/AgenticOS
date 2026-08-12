@@ -1,7 +1,8 @@
 """Controller-side manager for out-of-process provider authentication daemon.
 
 Launches and manages a dedicated AuthHelperDaemon process with least OS authority.
-Ensures refresh token authority is strictly process-separated from controller and provider broker.
+The trusted controller retains the documented same-UID authority residual; the
+hostile Codex workspace and provider broker receive no refresh-secret authority.
 """
 
 from __future__ import annotations
@@ -11,18 +12,29 @@ import os
 import secrets
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from .auth_helper_daemon import (
+    IPC_PROTOCOL_VERSION,
+    _decode_response_packet,
+    _encode_packet,
+    _linux_open_fds,
+    _recv_linux_packet,
+    _recv_stream_packet,
+    _send_linux_packet,
+    _send_stream_packet,
+)
 
 from .provider_models import (
     AuthHelperProcessIdentity,
     ProviderAuthCapability,
     ProviderAuthBinding,
-    SecretValue,
     SubscriptionAuthCapability,
 )
 
@@ -60,9 +72,11 @@ class ControllerAuthHelper:
         with open(self._auth_json_path, "w", encoding="utf-8") as f:
             json.dump(data, f)
 
-        self._proc: Optional[subprocess.Popen[str]] = None
+        self._proc: Optional[subprocess.Popen[Any]] = None
+        self._ipc_sock: Optional[socket.socket] = None
         self._ipc_endpoint: Optional[str] = None
         self._process_identity: Optional[AuthHelperProcessIdentity] = None
+        self._ipc_lock = threading.Lock()
 
         self._start_daemon()
 
@@ -90,47 +104,113 @@ class ControllerAuthHelper:
             if not minimal_env[k]:
                 del minimal_env[k]
 
-        # Port 0 for dynamic loopback socket binding
         argv = [
             sys.executable,
             "-m",
             daemon_module,
             "--auth-file",
             str(self._auth_json_path),
-            "--socket-endpoint",
-            "0",
             "--parent-pid",
             str(os.getpid()),
         ]
+        if sys.platform.startswith("linux"):
+            parent_socket, child_socket = socket.socketpair(
+                socket.AF_UNIX, socket.SOCK_SEQPACKET
+            )
+            parent_socket.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            child_socket.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            creation_peer = struct.unpack(
+                "3i",
+                parent_socket.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                ),
+            )
+            if creation_peer != (os.getpid(), os.getuid(), os.getgid()):
+                parent_socket.close()
+                child_socket.close()
+                raise RuntimeError("Auth helper socketpair creation peer mismatch")
+            argv.extend(["--ipc-fd", str(child_socket.fileno())])
+            try:
+                self._proc = subprocess.Popen(
+                    argv,
+                    cwd=str(self._private_root),
+                    env=minimal_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    pass_fds=(child_socket.fileno(),),
+                )
+            finally:
+                child_socket.close()
+            self._ipc_sock = parent_socket
+            self._ipc_endpoint = f"fd://{parent_socket.fileno()}"
+            assert self._proc is not None
+            ready_packet = _recv_linux_packet(
+                parent_socket,
+                expected_pid=self._proc.pid,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+                allowed_fds=self._current_controller_fds(),
+            )
+        elif os.name == "nt":
+            bootstrap_nonce = secrets.token_bytes(32)
+            argv.append("--windows-loopback")
+            self._proc = subprocess.Popen(
+                argv,
+                cwd=str(self._private_root),
+                env=minimal_env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                text=False,
+            )
+            assert self._proc.stdin is not None
+            self._proc.stdin.write(bootstrap_nonce)
+            self._proc.stdin.flush()
+            self._proc.stdin.close()
+            assert self._proc.stdout is not None
+            ready_line = self._proc.stdout.readline(129)
+            self._proc.stdout.close()
+            prefix = b"AUTH_HELPER_READY:"
+            if (
+                not ready_line.endswith(b"\n")
+                or len(ready_line) > 128
+                or not ready_line.startswith(prefix)
+            ):
+                self.stop()
+                raise RuntimeError("Auth helper daemon failed bounded startup")
+            endpoint = ready_line[len(prefix) : -1].decode("ascii", errors="strict")
+            if not endpoint.startswith("tcp://127.0.0.1:"):
+                self.stop()
+                raise RuntimeError("Auth helper daemon returned invalid endpoint")
+            port = int(endpoint.rsplit(":", 1)[1])
+            ipc_socket = socket.create_connection(
+                ("127.0.0.1", port), timeout=2.0
+            )
+            self._ipc_sock = ipc_socket
+            self._ipc_endpoint = endpoint
+            _send_stream_packet(
+                ipc_socket,
+                _encode_packet(
+                    {
+                        "protocol_version": IPC_PROTOCOL_VERSION,
+                        "action": "BOOTSTRAP",
+                        "bootstrap_nonce": bootstrap_nonce.hex(),
+                    }
+                ),
+            )
+            bootstrap_nonce = b""
+            ready_packet = _recv_stream_packet(ipc_socket)
+        else:
+            raise RuntimeError("Unsupported auth helper platform")
 
-        self._proc = subprocess.Popen(
-            argv,
-            cwd=str(self._private_root),
-            env=minimal_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            close_fds=True,
-        )
-
-        # Wait for daemon readiness signal
-        assert self._proc.stdout is not None
-        ready_line = self._proc.stdout.readline().strip()
-        if not ready_line.startswith("AUTH_HELPER_READY:"):
-            stderr_msg = self._proc.stderr.read() if self._proc.stderr else ""
+        ready = _decode_response_packet(ready_packet)
+        if ready.get("status") != "READY" or "identity" not in ready:
             self.stop()
-            raise RuntimeError(f"Auth helper daemon failed to start: {ready_line} {stderr_msg}")
-
-        self._ipc_endpoint = ready_line.split(":", 1)[1]
-
-        # Request identity snapshot over IPC
-        id_resp = self._send_ipc({"action": "GET_IDENTITY"})
-        if id_resp.get("status") != "OK" or "identity" not in id_resp:
-            self.stop()
-            raise RuntimeError(f"Auth helper daemon identity handshake failed: {id_resp}")
-
-        raw_id = id_resp["identity"]
+            raise RuntimeError("Auth helper daemon identity handshake failed")
+        raw_id = ready["identity"]
         self._process_identity = AuthHelperProcessIdentity(
             pid=raw_id["pid"],
             executable=raw_id["executable"],
@@ -143,36 +223,33 @@ class ControllerAuthHelper:
             started_at_monotonic_ns=raw_id["started_at_monotonic_ns"],
         )
 
+    def _current_controller_fds(self) -> frozenset[int]:
+        if not sys.platform.startswith("linux"):
+            return frozenset()
+        return _linux_open_fds()
+
     def _send_ipc(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Send line-delimited JSON IPC request to auth helper daemon."""
-        if not self._ipc_endpoint:
+        """Exchange one strict bounded request on the persistent authenticated channel."""
+        if not self._ipc_endpoint or self._ipc_sock is None:
             raise RuntimeError("Auth helper daemon endpoint not available")
-
-        if self._ipc_endpoint.startswith("tcp://"):
-            host, port_str = self._ipc_endpoint[6:].split(":", 1)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((host, int(port_str)))
-        elif self._ipc_endpoint.startswith("unix://"):
-            path = self._ipc_endpoint[7:]
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(path)
-        else:
-            raise RuntimeError(f"Unsupported IPC endpoint format: {self._ipc_endpoint}")
-
-        with sock:
-            sock.sendall(json.dumps(payload).encode("utf-8") + b"\n")
-            data = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if b"\n" in chunk:
-                    break
-            line = data.decode("utf-8").strip()
-            if not line:
-                raise RuntimeError("Empty response from auth helper daemon")
-            return json.loads(line)
+        request = _encode_packet(
+            {"protocol_version": IPC_PROTOCOL_VERSION, **payload}
+        )
+        with self._ipc_lock:
+            if sys.platform.startswith("linux"):
+                _send_linux_packet(self._ipc_sock, request)
+                assert self._proc is not None
+                response = _recv_linux_packet(
+                    self._ipc_sock,
+                    expected_pid=self._proc.pid,
+                    expected_uid=os.getuid(),
+                    expected_gid=os.getgid(),
+                    allowed_fds=self._current_controller_fds(),
+                )
+            else:
+                _send_stream_packet(self._ipc_sock, request)
+                response = _recv_stream_packet(self._ipc_sock)
+        return _decode_response_packet(response)
 
     @property
     def auth_mode(self) -> str:
@@ -291,6 +368,13 @@ class ControllerAuthHelper:
             except Exception:
                 pass
             self._ipc_endpoint = None
+
+        if self._ipc_sock is not None:
+            try:
+                self._ipc_sock.close()
+            except Exception:
+                pass
+            self._ipc_sock = None
 
         if self._proc is not None:
             try:

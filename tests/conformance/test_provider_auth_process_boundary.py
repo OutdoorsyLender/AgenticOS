@@ -3,6 +3,8 @@
 import os
 import pathlib
 import json
+import socket
+import sys
 import pytest
 
 from agenticos.sandbox.controller_auth_helper import ControllerAuthHelper
@@ -54,6 +56,34 @@ def test_auth_helper_process_boundary_proof(auth_fixture_data) -> None:
 
         # 5. Open FD census
         assert proc_id.open_fd_count >= 0
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux transport contract")
+def test_linux_helper_uses_only_inherited_connected_seqpacket(auth_fixture_data) -> None:
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        assert helper.process_identity.ipc_endpoint.startswith("fd://")
+        assert helper._ipc_endpoint.startswith("fd://")
+        assert helper._ipc_sock is not None
+        assert helper._ipc_sock.family == socket.AF_UNIX
+        assert helper._ipc_sock.type & socket.SOCK_SEQPACKET == socket.SOCK_SEQPACKET
+        assert helper._ipc_sock.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) == 1
+
+        # The same authenticated channel remains live for more than one request.
+        assert helper._send_ipc({"action": "PING"})["status"] == "PONG"
+        assert helper._send_ipc({"action": "PING"})["status"] == "PONG"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux transport contract")
+def test_linux_helper_rejects_message_4097(auth_fixture_data) -> None:
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        for _ in range(4_096):
+            assert helper._send_ipc({"action": "PING"})["status"] == "PONG"
+
+        assert helper._send_ipc({"action": "PING"}) == {
+            "protocol_version": "AOSAUTH/1",
+            "status": "ERROR",
+            "error": "IPC_MESSAGE_LIMIT",
+        }
 
 
 def test_hostile_worker_cannot_access_auth_secrets(auth_fixture_data, tmp_path) -> None:
