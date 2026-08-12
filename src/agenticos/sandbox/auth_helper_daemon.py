@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import argparse
 import array
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import queue
 import secrets
 import socket
+import stat
 import struct
 import sys
 import threading
@@ -29,6 +32,12 @@ IPC_MAX_RESPONSE_BYTES = 16_384
 IPC_REQUEST_TIMEOUT_SECONDS = 2.0
 IPC_RESPONSE_TIMEOUT_SECONDS = 2.0
 IPC_MAX_MESSAGES_PER_HELPER = 4_096
+
+_PR_GET_DUMPABLE = 3
+_PR_SET_DUMPABLE = 4
+_PR_SET_NO_NEW_PRIVS = 38
+_PR_GET_NO_NEW_PRIVS = 39
+_UINT_MAX = (1 << 32) - 1
 
 
 class AuthProtocolError(RuntimeError):
@@ -130,6 +139,26 @@ def _linux_open_fds() -> frozenset[int]:
         else:
             result.add(fd)
     return frozenset(result)
+
+
+def _linux_open_fds_fcntl() -> tuple[int, ...]:
+    """Prove the exact live FD set with bounded proc-independent kernel probes."""
+    import fcntl
+    import resource
+
+    soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit == resource.RLIM_INFINITY:
+        raise AuthProtocolError("HARDEN_NOFILE_UNBOUNDED")
+    result: list[int] = []
+    for fd in range(int(soft_limit)):
+        try:
+            fcntl.fcntl(fd, fcntl.F_GETFD)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+        else:
+            result.append(fd)
+    return tuple(result)
 
 
 def _recv_linux_packet(
@@ -309,6 +338,10 @@ _REQUEST_FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "protocol_version": str,
     "action": str,
     "bootstrap_nonce": str,
+    "auth_file": str,
+    "controller_pid": int,
+    "controller_uid": int,
+    "controller_gid": int,
     "request_nonce": str,
     "task_id": str,
     "generation": int,
@@ -325,6 +358,16 @@ _REQUEST_FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
 
 _REQUEST_FIELDS: dict[str, frozenset[str]] = {
     "BOOTSTRAP": frozenset({"protocol_version", "action", "bootstrap_nonce"}),
+    "STARTUP": frozenset(
+        {
+            "protocol_version",
+            "action",
+            "auth_file",
+            "controller_pid",
+            "controller_uid",
+            "controller_gid",
+        }
+    ),
     "PING": frozenset({"protocol_version", "action"}),
     "GET_IDENTITY": frozenset({"protocol_version", "action"}),
     "GET_TASK_PROVIDER_CAPABILITY": frozenset(
@@ -409,14 +452,132 @@ def _encode_response(response: Mapping[str, Any]) -> bytes:
     return _encode_packet({"protocol_version": IPC_PROTOCOL_VERSION, **response})
 
 
-def _get_executable_digest() -> str:
-    """Return SHA-256 hex digest of the current Python executable."""
+def _file_identity(path: str) -> tuple[str, int, int, str]:
+    """Hash one no-follow regular file and bind the digest to its kernel identity."""
+    absolute = os.path.abspath(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(absolute, flags)
     try:
-        with open(sys.executable, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except Exception:
-        # Fallback digest if binary cannot be read directly
-        return hashlib.sha256(sys.executable.encode("utf-8")).hexdigest()
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise AuthProtocolError("IDENTITY_NOT_REGULAR")
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        return absolute, metadata.st_dev, metadata.st_ino, digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _linux_prctl(option: int, argument: int = 0) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.prctl(option, argument, 0, 0, 0)
+    if result == -1:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return int(result)
+
+
+def _linux_close_range(first: int, last: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    close_range = getattr(libc, "close_range", None)
+    if close_range is None:
+        raise AuthProtocolError("HARDEN_CLOSE_RANGE")
+    if close_range(first, last, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _bind_standard_fds_to_null() -> None:
+    null_fd = os.open(os.devnull, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+    try:
+        for target in (0, 1, 2):
+            if null_fd != target:
+                os.dup2(null_fd, target, inheritable=False)
+    finally:
+        if null_fd > 2:
+            os.close(null_fd)
+
+
+def _standard_fds_are_null() -> bool:
+    null_metadata = os.stat(os.devnull)
+    return all(
+        stat.S_ISCHR(metadata.st_mode)
+        and (metadata.st_dev, metadata.st_ino)
+        == (null_metadata.st_dev, null_metadata.st_ino)
+        for metadata in (os.fstat(0), os.fstat(1), os.fstat(2))
+    )
+
+
+def _fd_is_null(fd: int) -> bool:
+    null_metadata = os.stat(os.devnull)
+    metadata = os.fstat(fd)
+    return (metadata.st_dev, metadata.st_ino) == (
+        null_metadata.st_dev,
+        null_metadata.st_ino,
+    )
+
+
+def _normalize_linux_ipc_and_harden(
+    ipc_fd: int,
+    *,
+    test_fault: str | None,
+    test_inherited_fds: tuple[int, ...],
+) -> tuple[socket.socket, dict[str, Any]]:
+    """Establish the exact pre-READY Linux process state."""
+    import resource
+
+    if test_fault == "core":
+        raise AuthProtocolError("HARDEN_CORE")
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    core_soft, core_hard = resource.getrlimit(resource.RLIMIT_CORE)
+    if (core_soft, core_hard) != (0, 0):
+        raise AuthProtocolError("HARDEN_CORE")
+
+    if test_fault == "dumpable":
+        raise AuthProtocolError("HARDEN_DUMPABLE")
+    _linux_prctl(_PR_SET_DUMPABLE, 0)
+    if _linux_prctl(_PR_GET_DUMPABLE) != 0:
+        raise AuthProtocolError("HARDEN_DUMPABLE")
+
+    _bind_standard_fds_to_null()
+    if not _standard_fds_are_null():
+        raise AuthProtocolError("HARDEN_STANDARD_FDS")
+    if ipc_fd != 3:
+        os.dup2(ipc_fd, 3, inheritable=False)
+        os.close(ipc_fd)
+    else:
+        os.set_inheritable(3, False)
+    ipc_socket = socket.socket(fileno=3)
+    if test_fault == "fd_sanitize":
+        raise AuthProtocolError("HARDEN_FD_SANITIZE")
+    _linux_close_range(4, _UINT_MAX)
+    open_fds = _linux_open_fds_fcntl()
+    if open_fds != (0, 1, 2, 3):
+        raise AuthProtocolError("HARDEN_FD_CENSUS")
+    closed_inherited_fds: list[int] = []
+    for inherited_fd in test_inherited_fds:
+        try:
+            os.fstat(inherited_fd)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+            closed_inherited_fds.append(inherited_fd)
+            continue
+        raise AuthProtocolError("HARDEN_INHERITED_FD")
+    return ipc_socket, {
+        "open_fds": open_fds,
+        "core_soft_limit": core_soft,
+        "core_hard_limit": core_hard,
+        "dumpable": 0,
+        "standard_fds_null": True,
+        "closed_inherited_fds": tuple(closed_inherited_fds),
+    }
 
 
 def _count_open_fds() -> int:
@@ -433,13 +594,20 @@ def _count_open_fds() -> int:
 class AuthHelperDaemon:
     """Out-of-process daemon managing synthetic provider authentication state."""
 
-    def __init__(self, auth_file: str, parent_pid: int) -> None:
+    def __init__(
+        self,
+        auth_file: str,
+        parent_pid: int,
+        *,
+        startup_identity: Mapping[str, Any],
+    ) -> None:
         self.auth_file = os.path.abspath(auth_file)
         self.parent_pid = parent_pid
         self.started_at_monotonic_ns = time.monotonic_ns()
         self.helper_epoch = secrets.token_hex(16)
         self.revoked_tasks: set[str] = set()
         self.issued_nonces: set[str] = set()
+        self._startup_identity = dict(startup_identity)
 
         if not os.path.exists(self.auth_file):
             raise FileNotFoundError(f"Auth file not found: {self.auth_file}")
@@ -474,14 +642,52 @@ class AuthHelperDaemon:
         self._refresh_fail_trigger = True
 
     def get_identity_dict(self, ipc_endpoint: str) -> Dict[str, Any]:
+        executable, executable_device, executable_inode, executable_digest = (
+            _file_identity(sys.executable)
+        )
+        entrypoint, entrypoint_device, entrypoint_inode, entrypoint_digest = (
+            _file_identity(__file__)
+        )
         return {
             "pid": os.getpid(),
-            "executable": sys.executable,
-            "executable_digest": _get_executable_digest(),
+            "uid": os.getuid() if hasattr(os, "getuid") else 0,
+            "gid": os.getgid() if hasattr(os, "getgid") else 0,
+            "controller_uid": self._startup_identity["controller_uid"],
+            "controller_gid": self._startup_identity["controller_gid"],
+            "executable": executable,
+            "executable_device": executable_device,
+            "executable_inode": executable_inode,
+            "executable_digest": executable_digest,
+            "entrypoint": entrypoint,
+            "entrypoint_device": entrypoint_device,
+            "entrypoint_inode": entrypoint_inode,
+            "entrypoint_digest": entrypoint_digest,
             "cwd": os.getcwd(),
             "env_keys": sorted(list(os.environ.keys())),
-            "open_fd_count": _count_open_fds(),
+            "import_paths": list(sys.path),
+            "open_fds": list(self._startup_identity["open_fds"]),
+            "standard_fds_null": self._startup_identity.get(
+                "standard_fds_null", False
+            ),
+            "windows_stdin_bootstrap_closed": self._startup_identity.get(
+                "windows_stdin_bootstrap_closed", False
+            ),
+            "closed_inherited_fds": list(
+                self._startup_identity.get("closed_inherited_fds", ())
+            ),
             "ipc_endpoint": ipc_endpoint,
+            "ipc_type": self._startup_identity["ipc_type"],
+            "ipc_peer_auth": self._startup_identity["ipc_peer_auth"],
+            "helper_epoch": self.helper_epoch,
+            "protocol_version": IPC_PROTOCOL_VERSION,
+            "core_soft_limit": self._startup_identity["core_soft_limit"],
+            "core_hard_limit": self._startup_identity["core_hard_limit"],
+            "dumpable": self._startup_identity["dumpable"],
+            "no_new_privs": self._startup_identity["no_new_privs"],
+            "landlock_abi": None,
+            "landlock_handled_access_fs": None,
+            "auth_root_device": None,
+            "auth_root_inode": None,
             "parent_pid": self.parent_pid,
             "started_at_monotonic_ns": self.started_at_monotonic_ns,
         }
@@ -625,10 +831,37 @@ def _run_authenticated_session(
             return
 
 
-def run_linux_daemon(auth_file: str, parent_pid: int, ipc_fd: int) -> None:
+def _validate_startup(
+    startup: Mapping[str, Any],
+    *,
+    parent_pid: int,
+    controller_uid: int,
+    controller_gid: int,
+) -> str:
+    if startup["action"] != "STARTUP":
+        raise AuthProtocolError("STARTUP_ACTION")
+    if (
+        startup["controller_pid"],
+        startup["controller_uid"],
+        startup["controller_gid"],
+    ) != (parent_pid, controller_uid, controller_gid):
+        raise AuthProtocolError("STARTUP_IDENTITY")
+    return startup["auth_file"]
+
+
+def run_linux_daemon(
+    parent_pid: int,
+    ipc_fd: int,
+    *,
+    test_fault: str | None,
+    test_inherited_fds: tuple[int, ...],
+) -> None:
     """Run one inherited Linux seqpacket endpoint with no listener or path."""
-    daemon = AuthHelperDaemon(auth_file, parent_pid)
-    ipc_socket = socket.socket(fileno=ipc_fd)
+    ipc_socket, startup_identity = _normalize_linux_ipc_and_harden(
+        ipc_fd,
+        test_fault=test_fault,
+        test_inherited_fds=test_inherited_fds,
+    )
     ipc_socket.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
     endpoint_str = f"fd://{ipc_socket.fileno()}"
     try:
@@ -644,6 +877,41 @@ def run_linux_daemon(auth_file: str, parent_pid: int, ipc_fd: int) -> None:
             os.getgid(),
         ):
             raise AuthProtocolError("IPC_CREATION_PEER")
+        startup = _decode_request_packet(
+            _recv_linux_packet(
+                ipc_socket,
+                expected_pid=parent_pid,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+                allowed_fds=frozenset({0, 1, 2, 3}),
+            )
+        )
+        auth_file = _validate_startup(
+            startup,
+            parent_pid=parent_pid,
+            controller_uid=os.getuid(),
+            controller_gid=os.getgid(),
+        )
+        if test_fault == "no_new_privs":
+            raise AuthProtocolError("HARDEN_NO_NEW_PRIVS")
+        _linux_prctl(_PR_SET_NO_NEW_PRIVS, 1)
+        no_new_privs = _linux_prctl(_PR_GET_NO_NEW_PRIVS)
+        if no_new_privs != 1:
+            raise AuthProtocolError("HARDEN_NO_NEW_PRIVS")
+        startup_identity.update(
+            {
+                "controller_uid": os.getuid(),
+                "controller_gid": os.getgid(),
+                "ipc_type": "AF_UNIX/SOCK_SEQPACKET",
+                "ipc_peer_auth": "SO_PASSCRED/SCM_CREDENTIALS",
+                "no_new_privs": no_new_privs,
+            }
+        )
+        daemon = AuthHelperDaemon(
+            auth_file,
+            parent_pid,
+            startup_identity=startup_identity,
+        )
         _send_linux_packet(
             ipc_socket,
             _encode_response(
@@ -672,11 +940,12 @@ def _replace_stdin_with_null() -> None:
     finally:
         if null_fd != 0:
             os.close(null_fd)
+    if not _fd_is_null(0):
+        raise AuthProtocolError("IPC_BOOTSTRAP_CLOSE")
 
 
-def run_windows_daemon(auth_file: str, parent_pid: int) -> None:
+def run_windows_daemon(parent_pid: int) -> None:
     """Run the bounded one-connection Windows functional fallback."""
-    daemon = AuthHelperDaemon(auth_file, parent_pid)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -700,6 +969,31 @@ def run_windows_daemon(auth_file: str, parent_pid: int) -> None:
         ):
             raise AuthProtocolError("IPC_BOOTSTRAP_AUTH")
         bootstrap_nonce = b""
+        startup = _decode_request_packet(_recv_stream_packet(connection))
+        auth_file = _validate_startup(
+            startup,
+            parent_pid=parent_pid,
+            controller_uid=0,
+            controller_gid=0,
+        )
+        daemon = AuthHelperDaemon(
+            auth_file,
+            parent_pid,
+            startup_identity={
+                "controller_uid": 0,
+                "controller_gid": 0,
+                "open_fds": tuple(),
+                "ipc_type": "AF_INET/SOCK_STREAM",
+                "ipc_peer_auth": "BOOTSTRAP_NONCE_ONLY_WINDOWS_FUNCTIONAL",
+                "core_soft_limit": None,
+                "core_hard_limit": None,
+                "dumpable": None,
+                "no_new_privs": None,
+                "standard_fds_null": False,
+                "windows_stdin_bootstrap_closed": True,
+                "closed_inherited_fds": tuple(),
+            },
+        )
         _send_stream_packet(
             connection,
             _encode_response(
@@ -716,7 +1010,6 @@ def run_windows_daemon(auth_file: str, parent_pid: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AgenticOS Out-of-Process Auth Helper Daemon")
-    parser.add_argument("--auth-file", required=True, help="Path to auth.json file")
     parser.add_argument("--parent-pid", type=int, required=True, help="Parent controller PID")
     parser.add_argument("--ipc-fd", type=int, help="Inherited Linux seqpacket descriptor")
     parser.add_argument(
@@ -724,15 +1017,27 @@ def main() -> None:
         action="store_true",
         help="Use the bounded Windows functional fallback",
     )
+    parser.add_argument("--test-startup-fault", choices=("core", "dumpable", "fd_sanitize", "no_new_privs"))
+    parser.add_argument("--test-inherited-fds", default="")
     args = parser.parse_args()
     if sys.platform.startswith("linux"):
         if args.ipc_fd is None or args.windows_loopback:
             parser.error("Linux requires exactly one inherited --ipc-fd")
-        run_linux_daemon(args.auth_file, args.parent_pid, args.ipc_fd)
+        inherited_fds = tuple(
+            int(value) for value in args.test_inherited_fds.split(",") if value
+        )
+        run_linux_daemon(
+            args.parent_pid,
+            args.ipc_fd,
+            test_fault=args.test_startup_fault,
+            test_inherited_fds=inherited_fds,
+        )
     elif os.name == "nt":
         if args.ipc_fd is not None or not args.windows_loopback:
             parser.error("Windows requires --windows-loopback")
-        run_windows_daemon(args.auth_file, args.parent_pid)
+        if args.test_startup_fault or args.test_inherited_fds:
+            parser.error("test hardening controls are Linux-only")
+        run_windows_daemon(args.parent_pid)
     else:
         parser.error("unsupported auth-helper platform")
 

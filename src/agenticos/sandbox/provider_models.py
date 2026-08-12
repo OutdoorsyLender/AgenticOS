@@ -343,28 +343,98 @@ class AuthHelperProcessIdentity:
     """Host process identity snapshot for the out-of-process auth helper process."""
 
     pid: int
+    parent_pid: int
+    uid: int
+    gid: int
+    controller_uid: int
+    controller_gid: int
     executable: str
+    executable_device: int
+    executable_inode: int
     executable_digest: str
+    entrypoint: str
+    entrypoint_device: int
+    entrypoint_inode: int
+    entrypoint_digest: str
     cwd: str
     env_keys: tuple[str, ...]
-    open_fd_count: int
+    import_paths: tuple[str, ...]
+    open_fds: tuple[int, ...]
     ipc_endpoint: str
-    parent_pid: int
+    ipc_type: str
+    ipc_peer_auth: str
+    helper_epoch: str
+    protocol_version: str
+    core_soft_limit: int | None
+    core_hard_limit: int | None
+    dumpable: int | None
+    no_new_privs: int | None
+    landlock_abi: int | None
+    landlock_handled_access_fs: int | None
+    auth_root_device: int | None
+    auth_root_inode: int | None
     started_at_monotonic_ns: int
+
+    @property
+    def open_fd_count(self) -> int:
+        """Compatibility view over the exact descriptor evidence."""
+        return len(self.open_fds)
 
     def __post_init__(self) -> None:
         _require_positive_int("pid", self.pid)
+        _require_positive_int("parent_pid", self.parent_pid)
+        for name in ("uid", "gid", "controller_uid", "controller_gid"):
+            _require_non_negative_int(name, getattr(self, name))
         if not isinstance(self.executable, str) or not self.executable:
             raise ValueError("executable must be a non-empty string")
+        _require_non_negative_int("executable_device", self.executable_device)
+        _require_positive_int("executable_inode", self.executable_inode)
         if not isinstance(self.executable_digest, str) or not _LOWER_HEX_64_RE.fullmatch(self.executable_digest):
             raise ValueError("executable_digest must be 64 lowercase hex characters")
+        if not isinstance(self.entrypoint, str) or not self.entrypoint:
+            raise ValueError("entrypoint must be a non-empty string")
+        _require_non_negative_int("entrypoint_device", self.entrypoint_device)
+        _require_positive_int("entrypoint_inode", self.entrypoint_inode)
+        if not isinstance(self.entrypoint_digest, str) or not _LOWER_HEX_64_RE.fullmatch(self.entrypoint_digest):
+            raise ValueError("entrypoint_digest must be 64 lowercase hex characters")
         if not isinstance(self.cwd, str) or not self.cwd:
             raise ValueError("cwd must be a non-empty string")
         if not isinstance(self.ipc_endpoint, str) or not self.ipc_endpoint:
             raise ValueError("ipc_endpoint must be a non-empty string")
-        _require_positive_int("parent_pid", self.parent_pid)
+        if not isinstance(self.ipc_type, str) or not self.ipc_type:
+            raise ValueError("ipc_type must be a non-empty string")
+        if not isinstance(self.ipc_peer_auth, str) or not self.ipc_peer_auth:
+            raise ValueError("ipc_peer_auth must be a non-empty string")
+        if not isinstance(self.helper_epoch, str) or not _LOWER_HEX_32_RE.fullmatch(self.helper_epoch):
+            raise ValueError("helper_epoch must be 32 lowercase hex characters")
+        if self.protocol_version != "AOSAUTH/1":
+            raise ValueError("protocol_version must be AOSAUTH/1")
+        for name, value in (("env_keys", self.env_keys), ("import_paths", self.import_paths)):
+            if type(value) is not tuple or any(type(item) is not str for item in value):
+                raise ValueError(f"{name} must be a tuple of strings")
+        if type(self.open_fds) is not tuple or any(
+            type(fd) is not int or fd < 0 for fd in self.open_fds
+        ):
+            raise ValueError("open_fds must be a tuple of non-negative integers")
+        if len(set(self.open_fds)) != len(self.open_fds):
+            raise ValueError("open_fds must not contain duplicates")
+        for name in ("core_soft_limit", "core_hard_limit"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be None or a non-negative integer")
+        for name in ("dumpable", "no_new_privs"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value not in (0, 1)):
+                raise ValueError(f"{name} must be None, zero, or one")
+        for name in ("landlock_abi", "landlock_handled_access_fs", "auth_root_device"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be None or a non-negative integer")
+        if self.auth_root_inode is not None and (
+            type(self.auth_root_inode) is not int or self.auth_root_inode <= 0
+        ):
+            raise ValueError("auth_root_inode must be None or a positive integer")
         _require_positive_int("started_at_monotonic_ns", self.started_at_monotonic_ns)
-        _require_non_negative_int("open_fd_count", self.open_fd_count)
 
 
 

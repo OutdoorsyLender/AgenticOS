@@ -536,6 +536,36 @@ def test_subscription_capability_nested_secret_state_is_immutable() -> None:
     ].reveal_secret() == "acct_synthetic_456"
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux READY evidence")
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("env_keys", ["PATH"]),
+        ("import_paths", ["/usr/lib/python"]),
+        ("open_fds", [0, 1, 2, 3]),
+        ("open_fds", (0, 1, 2, "3")),
+        ("helper_epoch", "not-32-hex"),
+        ("core_soft_limit", -1),
+        ("core_hard_limit", "0"),
+        ("dumpable", 2),
+        ("no_new_privs", 2),
+        ("landlock_abi", -1),
+        ("auth_root_device", -1),
+        ("auth_root_inode", 0),
+    ],
+)
+def test_auth_helper_identity_rejects_mutable_or_malformed_evidence(
+    field: str, invalid_value: object
+) -> None:
+    auth_data = {
+        "auth_mode": "chatgpt",
+        "tokens": {"access_token": "SYNTHETIC_ACCESS", "expires_at": 1_900_000_000},
+    }
+    with ControllerAuthHelper(auth_data) as helper:
+        with pytest.raises(ValueError):
+            replace(helper.process_identity, **{field: invalid_value})
+
+
 def test_controller_auth_helper_dict_init() -> None:
     auth_data = {
         "auth_mode": "chatgpt",

@@ -7,11 +7,13 @@ hostile Codex workspace and provider broker receive no refresh-secret authority.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -20,6 +22,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from . import auth_helper_daemon as _auth_helper_daemon
 from .auth_helper_daemon import (
     IPC_PROTOCOL_VERSION,
     _decode_response_packet,
@@ -39,10 +42,38 @@ from .provider_models import (
 )
 
 
+def _trusted_file_identity(path: Path) -> tuple[str, int, int, str]:
+    absolute = str(path.resolve(strict=True))
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(absolute, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("Trusted helper implementation is not a regular file")
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        return absolute, metadata.st_dev, metadata.st_ino, digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
 class ControllerAuthHelper:
     """Manages synthetic provider authentication state out-of-process in a dedicated daemon."""
 
-    def __init__(self, auth_json_path_or_dict: str | Dict[str, Any], private_dir: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        auth_json_path_or_dict: str | Dict[str, Any],
+        private_dir: Optional[str] = None,
+        *,
+        _test_inherited_fds: tuple[int, ...] = (),
+        _test_startup_fault: str | None = None,
+    ) -> None:
         if private_dir is None:
             self._temp_dir: Optional[str] = tempfile.mkdtemp(prefix="aos-auth-private-")
             self._private_root = Path(self._temp_dir)
@@ -77,8 +108,18 @@ class ControllerAuthHelper:
         self._ipc_endpoint: Optional[str] = None
         self._process_identity: Optional[AuthHelperProcessIdentity] = None
         self._ipc_lock = threading.Lock()
+        self._launch_argv: tuple[str, ...] = ()
+        self._test_inherited_fds = _test_inherited_fds
+        self._test_inherited_fds_closed: tuple[int, ...] = ()
+        self._test_startup_fault = _test_startup_fault
+        self._ready_standard_fds_null = False
+        self._windows_stdin_bootstrap_closed = False
 
-        self._start_daemon()
+        try:
+            self._start_daemon()
+        except Exception as exc:
+            self._abort_startup()
+            raise RuntimeError("Auth helper startup failed closed") from exc
 
     def _validate_schema(self, data: Dict[str, Any]) -> None:
         if not isinstance(data, dict):
@@ -91,28 +132,28 @@ class ControllerAuthHelper:
 
     def _start_daemon(self) -> None:
         """Launch AuthHelperDaemon in a separate OS process with minimal env and non-repo cwd."""
-        daemon_module = "agenticos.sandbox.auth_helper_daemon"
-
-        # Explicit minimal environment for auth helper process
-        minimal_env = {
-            "PATH": os.environ.get("PATH", ""),
-            "PYTHONPATH": os.environ.get("PYTHONPATH", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))),
-            "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
-        }
-        # Clean out any ambient secret variables from daemon environment
-        for k in list(minimal_env.keys()):
-            if not minimal_env[k]:
-                del minimal_env[k]
-
+        interpreter_identity = _trusted_file_identity(Path(sys.executable))
+        entrypoint_file = getattr(_auth_helper_daemon, "__file__", None)
+        if not entrypoint_file:
+            raise RuntimeError("Auth helper entrypoint identity unavailable")
+        entrypoint_identity = _trusted_file_identity(Path(entrypoint_file))
         argv = [
-            sys.executable,
-            "-m",
-            daemon_module,
-            "--auth-file",
-            str(self._auth_json_path),
+            interpreter_identity[0],
+            "-I",
+            "-S",
+            entrypoint_identity[0],
             "--parent-pid",
             str(os.getpid()),
         ]
+        minimal_env: dict[str, str]
+        if sys.platform.startswith("linux"):
+            minimal_env = {}
+        else:
+            minimal_env = {
+                key: os.environ[key]
+                for key in ("SYSTEMROOT", "WINDIR")
+                if os.environ.get(key)
+            }
         if sys.platform.startswith("linux"):
             parent_socket, child_socket = socket.socketpair(
                 socket.AF_UNIX, socket.SOCK_SEQPACKET
@@ -130,6 +171,17 @@ class ControllerAuthHelper:
                 child_socket.close()
                 raise RuntimeError("Auth helper socketpair creation peer mismatch")
             argv.extend(["--ipc-fd", str(child_socket.fileno())])
+            if self._test_startup_fault:
+                argv.extend(["--test-startup-fault", self._test_startup_fault])
+            if self._test_inherited_fds:
+                argv.extend(
+                    [
+                        "--test-inherited-fds",
+                        ",".join(str(fd) for fd in self._test_inherited_fds),
+                    ]
+                )
+            pass_fds = (child_socket.fileno(), *self._test_inherited_fds)
+            self._launch_argv = tuple(argv)
             try:
                 self._proc = subprocess.Popen(
                     argv,
@@ -139,13 +191,14 @@ class ControllerAuthHelper:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     close_fds=True,
-                    pass_fds=(child_socket.fileno(),),
+                    pass_fds=pass_fds,
                 )
             finally:
                 child_socket.close()
             self._ipc_sock = parent_socket
             self._ipc_endpoint = f"fd://{parent_socket.fileno()}"
             assert self._proc is not None
+            _send_linux_packet(parent_socket, self._startup_packet())
             ready_packet = _recv_linux_packet(
                 parent_socket,
                 expected_pid=self._proc.pid,
@@ -156,6 +209,7 @@ class ControllerAuthHelper:
         elif os.name == "nt":
             bootstrap_nonce = secrets.token_bytes(32)
             argv.append("--windows-loopback")
+            self._launch_argv = tuple(argv)
             self._proc = subprocess.Popen(
                 argv,
                 cwd=str(self._private_root),
@@ -202,6 +256,7 @@ class ControllerAuthHelper:
                 ),
             )
             bootstrap_nonce = b""
+            _send_stream_packet(ipc_socket, self._startup_packet())
             ready_packet = _recv_stream_packet(ipc_socket)
         else:
             raise RuntimeError("Unsupported auth helper platform")
@@ -213,15 +268,115 @@ class ControllerAuthHelper:
         raw_id = ready["identity"]
         self._process_identity = AuthHelperProcessIdentity(
             pid=raw_id["pid"],
+            parent_pid=raw_id["parent_pid"],
+            uid=raw_id["uid"],
+            gid=raw_id["gid"],
+            controller_uid=raw_id["controller_uid"],
+            controller_gid=raw_id["controller_gid"],
             executable=raw_id["executable"],
+            executable_device=raw_id["executable_device"],
+            executable_inode=raw_id["executable_inode"],
             executable_digest=raw_id["executable_digest"],
+            entrypoint=raw_id["entrypoint"],
+            entrypoint_device=raw_id["entrypoint_device"],
+            entrypoint_inode=raw_id["entrypoint_inode"],
+            entrypoint_digest=raw_id["entrypoint_digest"],
             cwd=raw_id["cwd"],
             env_keys=tuple(raw_id["env_keys"]),
-            open_fd_count=raw_id["open_fd_count"],
+            import_paths=tuple(raw_id["import_paths"]),
+            open_fds=tuple(raw_id["open_fds"]),
             ipc_endpoint=raw_id["ipc_endpoint"],
-            parent_pid=raw_id["parent_pid"],
+            ipc_type=raw_id["ipc_type"],
+            ipc_peer_auth=raw_id["ipc_peer_auth"],
+            helper_epoch=raw_id["helper_epoch"],
+            protocol_version=raw_id["protocol_version"],
+            core_soft_limit=raw_id["core_soft_limit"],
+            core_hard_limit=raw_id["core_hard_limit"],
+            dumpable=raw_id["dumpable"],
+            no_new_privs=raw_id["no_new_privs"],
+            landlock_abi=raw_id["landlock_abi"],
+            landlock_handled_access_fs=raw_id["landlock_handled_access_fs"],
+            auth_root_device=raw_id["auth_root_device"],
+            auth_root_inode=raw_id["auth_root_inode"],
             started_at_monotonic_ns=raw_id["started_at_monotonic_ns"],
         )
+        self._ready_standard_fds_null = bool(raw_id["standard_fds_null"])
+        self._windows_stdin_bootstrap_closed = bool(
+            raw_id["windows_stdin_bootstrap_closed"]
+        )
+        self._validate_ready_identity(
+            self._process_identity,
+            interpreter_identity=interpreter_identity,
+            entrypoint_identity=entrypoint_identity,
+        )
+        self._test_inherited_fds_closed = tuple(raw_id["closed_inherited_fds"])
+
+    def _startup_packet(self) -> bytes:
+        controller_uid = os.getuid() if hasattr(os, "getuid") else 0
+        controller_gid = os.getgid() if hasattr(os, "getgid") else 0
+        return _encode_packet(
+            {
+                "protocol_version": IPC_PROTOCOL_VERSION,
+                "action": "STARTUP",
+                "auth_file": str(self._auth_json_path),
+                "controller_pid": os.getpid(),
+                "controller_uid": controller_uid,
+                "controller_gid": controller_gid,
+            }
+        )
+
+    def _validate_ready_identity(
+        self,
+        identity: AuthHelperProcessIdentity,
+        *,
+        interpreter_identity: tuple[str, int, int, str],
+        entrypoint_identity: tuple[str, int, int, str],
+    ) -> None:
+        assert self._proc is not None
+        controller_uid = os.getuid() if hasattr(os, "getuid") else 0
+        controller_gid = os.getgid() if hasattr(os, "getgid") else 0
+        if (
+            identity.pid != self._proc.pid
+            or identity.parent_pid != os.getpid()
+            or identity.controller_uid != controller_uid
+            or identity.controller_gid != controller_gid
+            or identity.protocol_version != IPC_PROTOCOL_VERSION
+            or (
+                identity.executable,
+                identity.executable_device,
+                identity.executable_inode,
+                identity.executable_digest,
+            )
+            != interpreter_identity
+            or (
+                identity.entrypoint,
+                identity.entrypoint_device,
+                identity.entrypoint_inode,
+                identity.entrypoint_digest,
+            )
+            != entrypoint_identity
+        ):
+            raise RuntimeError("Auth helper READY identity mismatch")
+        if sys.platform.startswith("linux") and (
+            identity.uid != controller_uid
+            or identity.gid != controller_gid
+            or identity.open_fds != (0, 1, 2, 3)
+            or identity.core_soft_limit != 0
+            or identity.core_hard_limit != 0
+            or identity.dumpable != 0
+            or identity.no_new_privs != 1
+            or identity.ipc_type != "AF_UNIX/SOCK_SEQPACKET"
+            or identity.ipc_peer_auth != "SO_PASSCRED/SCM_CREDENTIALS"
+            or not self._ready_standard_fds_null
+        ):
+            raise RuntimeError("Auth helper READY hardening mismatch")
+        if os.name == "nt" and (
+            not self._windows_stdin_bootstrap_closed
+            or identity.ipc_type != "AF_INET/SOCK_STREAM"
+            or identity.ipc_peer_auth
+            != "BOOTSTRAP_NONCE_ONLY_WINDOWS_FUNCTIONAL"
+        ):
+            raise RuntimeError("Auth helper Windows bootstrap evidence mismatch")
 
     def _current_controller_fds(self) -> frozenset[int]:
         if not sys.platform.startswith("linux"):
@@ -359,6 +514,29 @@ class ControllerAuthHelper:
         })
         if resp.get("status") != "OK":
             raise ValueError(f"Token refresh update failed: {resp.get('error')}")
+
+    def _abort_startup(self) -> None:
+        """Close partial startup authority without attempting protocol shutdown."""
+        self._ipc_endpoint = None
+        if self._ipc_sock is not None:
+            try:
+                self._ipc_sock.close()
+            except Exception:
+                pass
+            self._ipc_sock = None
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    self._proc.kill()
+                    self._proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+            self._proc = None
+        if self._temp_dir and os.path.exists(self._temp_dir):
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
 
     def stop(self) -> None:
         """Stop auth helper daemon process and clean up private temp state."""
