@@ -92,7 +92,10 @@ Linux startup is ordered as follows:
    creates one `AF_UNIX SOCK_SEQPACKET` socketpair, and launches an absolute
    Python interpreter with `shell=False`, `close_fds=True`, a minimal explicit
    environment, a non-repository working directory, and only the child socket
-   endpoint inherited.
+   endpoint inherited. The environment omits `PYTHONPATH`, `PYTHONHOME`, user
+   site configuration, workspace/repository import roots, and ambient Python
+   startup hooks. Python isolated-mode flags disable user-site and environment
+   import authority.
 2. The helper immediately sets `RLIMIT_CORE` soft and hard limits to zero and
    calls `prctl(PR_SET_DUMPABLE, 0)`.
 3. The helper moves its socket endpoint to the fixed descriptor and closes
@@ -100,16 +103,21 @@ Linux startup is ordered as follows:
    validates the retained set before proceeding.
 4. The helper receives one bounded, non-secret setup record over the inherited
    endpoint. Kernel credentials must identify the expected parent controller.
-   The record supplies the auth-private root and optional pre-READY denial
-   probes; neither secrets nor private paths appear in argv or the environment.
+   The record supplies the auth-private root, the controller-observed root
+   device/inode identity, and optional pre-READY denial probes; neither secrets
+   nor private paths appear in argv or the environment. The helper opens the
+   root as a directory with no-follow resolution from a trusted root FD and
+   verifies the exact device/inode identity before using it as authority.
 5. The helper calls `prctl(PR_SET_NO_NEW_PRIVS, 1)` and verifies the observed
    value with `PR_GET_NO_NEW_PRIVS`.
 6. The helper requires Landlock ABI 3 or newer, creates a ruleset handling all
-   ABI-3 filesystem rights, adds only the approved auth-private grants, calls
-   `landlock_restrict_self()`, and closes all rule-construction descriptors.
+   ABI-3 filesystem rights, adds only the approved auth-private grant using the
+   verified opened root object, calls `landlock_restrict_self()`, and closes the
+   ruleset and no-longer-required construction descriptors.
 7. The real helper process performs configured pre-READY filesystem probes,
-   opens and parses `auth.json` under the active policy, validates its schema,
-   closes the auth file, and initializes bounded replay state.
+   resolves `auth.json` relative to the verified auth-root FD under the active
+   policy, opens and parses it, validates its schema, closes the auth file and
+   root FD, and initializes bounded replay state.
 8. The helper sends a credential-authenticated READY record containing its
    process identity and confinement evidence. Only then may the controller
    request a task provider capability.
@@ -120,6 +128,29 @@ different IPC server.
 
 Windows keeps functional protocol compatibility and full-suite regression
 coverage, but does not earn or advertise the Linux Landlock claim.
+
+## Helper implementation identity
+
+The launch contract identity-binds two independent executable inputs:
+
+1. the absolute Python interpreter, recorded by kernel file identity and a
+   SHA-256 content digest; and
+2. the actual trusted auth-helper entrypoint/module artifact, recorded by its
+   canonical location, kernel file identity, and SHA-256 content digest before
+   launch.
+
+The helper is launched as an absolute, identity-bound standalone entrypoint
+under Python isolated mode, not resolved as `-m` through ambient import search.
+It remains standard-library-only so no AgenticOS package or repository root is
+needed on `sys.path`. The helper verifies its own opened entrypoint identity
+before confinement. Repository, workspace, current-directory, user-site,
+`PYTHONPATH`, `.pth`, and startup-hook injection must not influence module
+selection.
+
+READY includes both interpreter and helper-entrypoint identities and the fixed
+protocol implementation version. The controller compares them with its
+pre-launch observations and binds the process-creation PID to that attestation.
+Attesting only `sys.executable` is insufficient.
 
 ## Landlock policy
 
@@ -133,6 +164,21 @@ the regular-file and directory operations required to read and atomically
 maintain authentication state: read file/directory, write file, remove file,
 make regular file, refer, and truncate. It grants no execute, device-node,
 socket-node, FIFO, symlink-creation, or unrelated directory authority.
+
+The controller first records the approved root's `st_dev`/`st_ino` identity.
+The helper opens that root with `openat2(O_PATH|O_DIRECTORY|O_CLOEXEC)` from a
+trusted `/` directory FD using
+`RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS`. The recorded host
+must provide this already-qualified `openat2()` mechanism; its absence fails
+startup closed rather than selecting a string-based or newly invented fallback.
+`fstat()` must match the controller's identity record. The resulting FD—not a
+second pathname lookup—is the `LANDLOCK_RULE_PATH_BENEATH` parent object and
+its identity is included in READY confinement evidence.
+
+After restriction, `auth.json` is opened relative to that verified root with a
+constrained `openat2()` resolution that rejects symlinks, magic links, absolute
+paths, and parent escape. The root FD remains open only through this read and
+the pre-READY allowed-root probes, then closes before the fixed READY census.
 
 No repository, worktree, `/workspace`, `.git`, controller-state, provider
 `CODEX_HOME`, model-output, build-artifact, arbitrary home, `/proc`, or broad
@@ -158,9 +204,11 @@ The expected retained descriptor set at READY is exactly:
 ```
 
 The controller passes no repository, worktree, workspace, `.git`, controller
-state, auth-file, or auth-directory descriptor. Landlock rule FDs and temporary
-path FDs are closed before auth loading and READY. The auth file is opened by
-path only after confinement and closed after parsing.
+state, auth-file, or auth-directory descriptor. The helper-created verified
+auth-root FD is the only temporary directory authority. Landlock ruleset and
+temporary path FDs close before auth loading; the auth-root FD closes after
+constrained relative loading and before READY. The auth file closes after
+parsing.
 
 Linux sanitation uses fixed-FD duplication plus `close_range()` where
 available and a bounded fallback only when the kernel reports the syscall
@@ -175,14 +223,20 @@ The Linux transport is one connected `AF_UNIX SOCK_SEQPACKET` socketpair. It
 has no listener, pathname, port, accept loop, or connection race. Endpoint
 cardinality and connection count are exactly one.
 
-The child validates `SO_PEERCRED` against the controller UID, GID, and parent
-PID. Because a socketpair's creation-time peer credentials alone do not prove
-the later sender process on both endpoints, both sides also enable
-`SO_PASSCRED` and require one kernel-generated `SCM_CREDENTIALS` record on every
-packet. The helper accepts only the expected controller PID/UID/GID, and the
-controller accepts only the observed helper PID with the expected UID/GID.
-`SCM_RIGHTS`, extra ancillary records, truncated credentials, or missing
-credentials fail closed.
+The child records `SO_PEERCRED` only as creation/connection-time sanity evidence
+for the controller UID, GID, and parent PID. A pre-spawn socketpair's
+controller-side `SO_PEERCRED` observation is explicitly not treated as proof of
+the process that later inherits the child endpoint.
+
+Both sides enable `SO_PASSCRED` and require exactly one kernel-generated
+`SCM_CREDENTIALS` record on every packet. Per-packet credentials are the
+current-sender identity check: the helper accepts only the expected controller
+PID/UID/GID, and the controller requires the SCM PID to equal the exact PID
+returned by helper process creation as well as the expected UID/GID. READY's
+protocol identity, parent PID, helper epoch, interpreter identity, helper
+entrypoint identity, and SCM sender identity must all agree before the process
+is accepted. `SCM_RIGHTS`, extra ancillary records, truncated credentials, or
+missing credentials fail closed.
 
 Fixed resource limits are:
 
@@ -195,6 +249,7 @@ IPC_REQUEST_TIMEOUT_SECONDS=2.0
 IPC_RESPONSE_TIMEOUT_SECONDS=2.0
 IPC_MAX_MESSAGES_PER_HELPER=4096
 IPC_MAX_REPLAY_ENTRIES=4096
+IPC_MAX_CAPABILITIES_PER_ATTEMPT=8
 ```
 
 Each `recvmsg()` provides one record boundary. The receiver allocates only its
@@ -250,6 +305,7 @@ upstream_host
 upstream_port
 provider_purpose
 capability_nonce
+capability_sequence
 issued_at
 expires_at
 access_token
@@ -270,21 +326,34 @@ paths, tokens, auth objects, or tracebacks.
 
 Every issued capability is bound to task ID, generation, attempt, launch nonce,
 provider, upstream scheme/host/port, provider purpose, helper instance epoch,
-request nonce, capability nonce, issue time, expiration, and revocation state.
-Its expiry is the earlier of the synthetic access-token expiry and five minutes
-after issue.
+request nonce, capability nonce, monotonically increasing per-attempt
+capability sequence, issue time, expiration, and revocation state. Its expiry
+is the earlier of the synthetic access-token expiry and five minutes after
+issue.
 
-Request nonces and complete task-attempt binding tuples are single-use within a
-helper epoch. Replay caches are fixed at 4096 entries and fail closed when
-full. Cancellation revokes the complete task generation/attempt context.
-Helper restart changes the instance epoch, so old capabilities are rejected.
+Each request nonce is single-use within a helper epoch. The complete
+task/generation/attempt binding is an active issuance context, not a permanently
+single-use key. An active attempt may receive at most eight sequential
+short-lived capabilities so a trusted broker can replace an expiring access
+capability without changing task identity. The helper assigns sequence 1 on
+first issuance and increments it exactly once per accepted replacement request.
+Only the newest issued sequence remains current; presenting an older sequence
+is stale and fails closed. A duplicate request nonce, skipped or repeated
+sequence, ninth issuance, expired attempt context, or changed binding field is
+rejected.
+
+Replay caches are fixed at 4096 entries and fail closed when full. Cancellation
+revokes the complete task generation/attempt context and every sequence issued
+from it. Helper restart changes the instance epoch, so capabilities from the
+prior epoch are rejected even when every task field and sequence match.
 
 `SubscriptionAuthCapability` retains the complete binding and validates it at
 the provider-broker consumption point. The broker receives only the
 short-lived access credential and optional account identifier for its existing
 exact destination policy. Cross-task, cross-generation, cross-attempt, wrong
 launch nonce, provider substitution, upstream substitution, expiration,
-cancellation, replay, and restart-epoch reuse all fail before header injection.
+cancellation, request replay, stale capability sequence, over-issuance, and
+restart-epoch reuse all fail before header injection.
 
 The broker never receives the refresh token, `auth.json`, the auth-private root,
 owner-login state, or a generic refresh operation. The Codex/provider-client
