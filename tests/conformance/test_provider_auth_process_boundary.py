@@ -470,8 +470,11 @@ def test_malformed_helper_response_synchronously_revokes_registered_broker(
     broker = BrokerProbe()
     with ControllerAuthHelper(auth_fixture_data) as helper:
         helper.register_broker(broker)
+        receiver_name = (
+            "_recv_linux_packet" if sys.platform.startswith("linux") else "_recv_stream_packet"
+        )
         monkeypatch.setattr(
-            "agenticos.sandbox.controller_auth_helper._recv_linux_packet",
+            f"agenticos.sandbox.controller_auth_helper.{receiver_name}",
             lambda *args, **kwargs: b'{"protocol_version":"AOSAUTH/1","status":"OK","error":"bad"}',
         )
         with pytest.raises(Exception):
