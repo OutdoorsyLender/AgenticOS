@@ -6,18 +6,30 @@ Status: documentation-only owner decision packet, prepared 2026-08-12.
 M6_SLICE2C2_DESIGN_STATUS=IMPLEMENTATION_READY
 NATIVE_CLIENT_QUALIFICATION=BLOCKED_OWNER_AUTHORIZATION
 M6_SLICE2C1_STATUS=EARNED_LEVEL_A
+GATE_A_APPROVED=YES
+BYTE_AUTHORITY_BRANCH=INDEPENDENT_OWNER_DIGEST
+OWNER_DIGEST_RECEIVED=NO
+GATE_B_APPROVED=NO
 ARTIFACT_ACQUIRED=NO
 ARTIFACT_INSTALLED=NO
 ARTIFACT_EXECUTED=NO
 REAL_AUTHENTICATION_USED=NO
 LIVE_PROVIDER_ACCESS_USED=NO
-ACQUISITION_RECOMMENDATION=BLOCKED_VERIFIER_TRUST_POLICY
+ACQUISITION_RECOMMENDATION=BLOCKED_OWNER_DIGEST_AND_GATE_B
 ```
 
-This packet requests narrowly separated owner permissions for one exact
-official native Linux artifact. It does not itself authorize or perform
-acquisition, installation, execution, authentication, provider access,
-production integration, or version widening.
+This packet records narrowly separated owner permissions for one exact official
+native Linux artifact. It does not itself perform acquisition, installation,
+execution, authentication, provider access, production integration, or version
+widening.
+
+Owner decision received 2026-08-12: Gate A is approved for only the exact
+OpenAI Codex CLI `0.120.0` artifact in §1, and Branch O — independent owner
+digest — is the approved byte-authority policy. No owner digest was supplied.
+The decision explicitly did not authorize acquisition, installation, execution,
+authentication, provider access, production integration, self-hosting, or any
+other artifact or version. Gates B–D therefore remain unapproved and blocked;
+Gate E remains explicitly denied.
 
 ## 1. Exact requested artifact
 
@@ -539,23 +551,24 @@ native launches.
   Windows kernel isolation, model correctness, general Codex support,
   production readiness, or permission to implement the M6 runtime slice.
 
-## 10. Narrow owner decision requested
+## 10. Narrow owner decision record
 
-Please decide each permission independently. Only A is ready for approval in
-this packet; B–D remain explicitly blocked:
+The owner approved A and the independent-owner-digest branch on 2026-08-12.
+B–D remain explicitly unapproved and blocked:
 
-- [ ] **A — Exact selection.** Approve only OpenAI Codex CLI `0.120.0`, release
+- [x] **A — Exact selection — APPROVED 2026-08-12.** Only OpenAI Codex CLI
+  `0.120.0`, release
   `rust-v0.120.0`, asset ID `393784170`,
   `codex-x86_64-unknown-linux-musl.tar.gz`, size `65,976,072`, SHA-256
   `21b08cca7784be53d33c6f46cf897cd2b440cda58dc7912563dbc676b4d17017`,
-  together with verification bundle asset ID `393784168`.
-- [ ] **B — Exact acquisition — DO NOT APPROVE YET.** Blocked pending a
-  separately reviewed addendum that selects exactly one §3 branch: either pin
-  the verifier/dependency digests, trusted-root snapshot digest, complete
-  expected signer certificate policy, and transparency-log identifiers; or pin
-  an owner-supplied independently authenticated uncompressed-binary SHA-256.
-  After that remediation, B may authorize only the branch-specific exact-host,
-  redirect-bounded, size/digest-pinned procedure in §4, with no fallback.
+  target `x86_64-unknown-linux-musl`, together with recorded verification bundle
+  asset ID `393784168`. This is selection authority only.
+- [ ] **B — Exact acquisition — NOT APPROVED.** Branch O is selected, but its
+  canonical independently authenticated uncompressed-binary SHA-256 statement
+  has not been supplied or recorded. After that blocking input exists, B still
+  requires a separate explicit owner decision and may authorize only the
+  exact-host, redirect-bounded, size/digest-pinned Branch O procedure in §4,
+  with no Sigstore or other fallback.
 - [ ] **C — Exact installation — BLOCKED ON B AND PASSIVE QUALIFICATION.** The
   eventual permission would approve atomic installation only at
   `/opt/agenticos/providers/codex/0.120.0/x86_64-unknown-linux-musl/codex`
@@ -571,7 +584,7 @@ this packet; B–D remain explicitly blocked:
   widening; and no further implementation without a separate reviewed owner
   decision.
 
-Until A–D are explicitly approved, the required state remains:
+With A approved and B–D unapproved, the required state remains:
 
 ```text
 NATIVE_CLIENT_QUALIFICATION=BLOCKED_OWNER_AUTHORIZATION

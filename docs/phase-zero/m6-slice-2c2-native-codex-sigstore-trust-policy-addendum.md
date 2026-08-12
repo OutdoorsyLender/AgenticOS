@@ -6,8 +6,10 @@ Status: documentation-only trust decision, prepared 2026-08-12.
 DECISION_OUTCOME=INDEPENDENT_OWNER_DIGEST_REQUIRED
 RESEARCH_STATUS=BLOCKED_PENDING_OWNER_DIGEST
 SIGSTORE_AUTHORITY_SELECTED=NO
+OWNER_DIGEST_BRANCH_APPROVED=YES
+OWNER_DIGEST_DELIVERY_MODE_SELECTED=NO
 OWNER_DIGEST_RECEIVED=NO
-GATE_A_APPROVED=NO
+GATE_A_APPROVED=YES
 GATE_B_APPROVED=NO
 ARTIFACT_ACQUIRED=NO
 SIGSTORE_EVIDENCE_ACQUIRED=NO
@@ -18,9 +20,17 @@ REAL_AUTHENTICATION_OR_PROVIDER_ACCESS=NO
 
 This addendum closes the verifier/trust-policy research blocker in
 [the artifact-authorization packet](m6-slice-2c2-native-codex-artifact-authorization.md).
-It does not authorize selection, acquisition, installation, execution,
+Except for the later Gate A selection and owner-digest policy approval recorded
+below, it does not authorize acquisition, installation, execution,
 authentication, provider access, production integration, self-hosting, or any
 artifact, version, target, host, verifier, or trust-policy widening.
+
+Owner decision received 2026-08-12: Gate A and this addendum's independent-
+owner-digest branch are approved for only the exact artifact in §1. The owner
+did not supply the digest or select its authenticated delivery mode and did not
+authorize Gate B or any acquisition, installation, execution, authentication,
+provider access, production integration, self-hosting, artifact, or version
+widening. Those boundaries remain blocked.
 
 ## 1. Scope and hard prohibitions
 
@@ -273,7 +283,8 @@ safe archive extraction.
 
 ### 6.2 Selected authority branch: owner digest
 
-No owner digest exists yet, so this policy is incomplete and gate B remains
+The owner-digest branch is approved, but no owner digest or authenticated
+delivery mode exists yet, so this policy is incomplete and gate B remains
 blocked. Before B can be reviewed, the owner must deliver one canonical
 `AOSCODEXOWNERDIGEST/1` statement through an authenticated authority
 independent of GitHub release hosting and the OpenAI sidecar:
@@ -438,9 +449,9 @@ placeholder that acquisition may discover.
 
 1. Reconcile Windows, WSL, `origin/main`, and GitHub; require SHA equality,
    clean trees, 0/0 divergence, and zero stashes.
-2. Obtain explicit owner approval for gate A and the owner-digest policy;
-   authenticate, validate, and record the complete §6.2 statement before any
-   network grant. A missing/invalid statement stops.
+2. Revalidate the recorded explicit owner approval for gate A and the owner-
+   digest policy; authenticate, validate, and record the complete §6.2
+   statement before any network grant. A missing/invalid statement stops.
 3. Obtain a separate owner decision B for one exact acquisition. B must name an
    already-authorized exact-host, redirect-controlled, digest-gated mechanism.
    Existing M4B-3 does not by itself authorize GitHub release-asset redirects.
@@ -616,14 +627,14 @@ INDEPENDENT_OWNER_DIGEST_REQUIRED
 
 The available Sigstore evidence shape and verifier bootstrap are insufficient
 to authenticate the selected target mapping under a precise pre-acquisition
-fail-closed policy. The exact next owner decision is:
+fail-closed policy. Gate A and the §6.2 owner-digest authority branch were
+approved on 2026-08-12. The exact next required owner input is the canonical
+`AOSCODEXOWNERDIGEST/1` statement containing the independently authenticated
+SHA-256 for the uncompressed `codex-x86_64-unknown-linux-musl` binary and naming
+exactly one pre-existing authenticated delivery mode and identity.
 
-1. approve or deny gate A for the exact §1 selection;
-2. if approving A, approve the §6.2 owner-digest authority branch and deliver
-   the canonical, independently authenticated SHA-256 for the uncompressed
-   `codex-x86_64-unknown-linux-musl` binary; and
-3. leave B unapproved until that statement is recorded and a separate review
-   authorizes the exact GitHub/CDN acquisition path.
+Gate B remains unapproved after that input and requires a later separate owner
+decision authorizing the exact GitHub/CDN acquisition path.
 
 Do not approve a Sigstore verifier, gate B, installation, or execution on the
 basis of this addendum.
