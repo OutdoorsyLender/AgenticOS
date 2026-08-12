@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -182,7 +184,7 @@ class ControllerAuthHelper:
         self._ipc_sock: Optional[socket.socket] = None
         self._ipc_endpoint: Optional[str] = None
         self._process_identity: Optional[AuthHelperProcessIdentity] = None
-        self._ipc_lock = threading.Lock()
+        self._ipc_lock = threading.RLock()
         self._launch_argv: tuple[str, ...] = ()
         self._test_inherited_fds = _test_inherited_fds
         self._test_inherited_fds_closed: tuple[int, ...] = ()
@@ -190,6 +192,8 @@ class ControllerAuthHelper:
         self._test_denied_probe_paths = _test_denied_probe_paths
         self._test_allowed_probe_name = _test_allowed_probe_name
         self._filesystem_probe_results: tuple[tuple[str, str, str], ...] = ()
+        self._attempt_sequences: dict[tuple[Any, ...], int] = {}
+        self._registered_brokers: list[Any] = []
         if _test_auth_root_mutator is not None:
             _test_auth_root_mutator(self._private_root)
         self._ready_standard_fds_null = False
@@ -484,21 +488,33 @@ class ControllerAuthHelper:
         request = _encode_packet(
             {"protocol_version": IPC_PROTOCOL_VERSION, **payload}
         )
-        with self._ipc_lock:
-            if sys.platform.startswith("linux"):
-                _send_linux_packet(self._ipc_sock, request)
-                assert self._proc is not None
-                response = _recv_linux_packet(
-                    self._ipc_sock,
-                    expected_pid=self._proc.pid,
-                    expected_uid=os.getuid(),
-                    expected_gid=os.getgid(),
-                    allowed_fds=self._current_controller_fds(),
-                )
-            else:
-                _send_stream_packet(self._ipc_sock, request)
-                response = _recv_stream_packet(self._ipc_sock)
-        return _decode_response_packet(response)
+        try:
+            with self._ipc_lock:
+                if sys.platform.startswith("linux"):
+                    _send_linux_packet(self._ipc_sock, request)
+                    assert self._proc is not None
+                    response = _recv_linux_packet(
+                        self._ipc_sock,
+                        expected_pid=self._proc.pid,
+                        expected_uid=os.getuid(),
+                        expected_gid=os.getgid(),
+                        allowed_fds=self._current_controller_fds(),
+                    )
+                else:
+                    _send_stream_packet(self._ipc_sock, request)
+                    response = _recv_stream_packet(self._ipc_sock)
+                decoded = _decode_response_packet(response)
+        except Exception:
+            self._revoke_registered_brokers()
+            raise
+        return decoded
+
+    def _revoke_registered_brokers(self) -> None:
+        for broker in tuple(self._registered_brokers):
+            try:
+                broker.cancel_auth_capability()
+            except Exception:
+                pass
 
     @property
     def auth_mode(self) -> str:
@@ -531,9 +547,33 @@ class ControllerAuthHelper:
         upstream_host: str = "chatgpt.example.test",
         upstream_port: int = 443,
         provider_purpose: str = "responses_sse",
+        _request_nonce: str | None = None,
     ) -> ProviderAuthCapability:
         """Return a short-lived task-bound SubscriptionAuthCapability over IPC."""
-        request_nonce = secrets.token_hex(16)
+        with self._ipc_lock:
+            return self._get_auth_capability_locked(
+                task_id, generation, attempt_id, launch_nonce, provider_id,
+                upstream_scheme=upstream_scheme,
+                upstream_host=upstream_host,
+                upstream_port=upstream_port,
+                provider_purpose=provider_purpose,
+                request_nonce=_request_nonce or secrets.token_hex(16),
+            )
+
+    def _get_auth_capability_locked(
+        self,
+        task_id: str,
+        generation: int,
+        attempt_id: int,
+        launch_nonce: str,
+        provider_id: str,
+        *,
+        upstream_scheme: str,
+        upstream_host: str,
+        upstream_port: int,
+        provider_purpose: str,
+        request_nonce: str,
+    ) -> ProviderAuthCapability:
         req = {
             "action": "GET_TASK_PROVIDER_CAPABILITY",
             "request_nonce": request_nonce,
@@ -550,7 +590,14 @@ class ControllerAuthHelper:
         resp = self._send_ipc(req)
         if resp.get("status") != "OK":
             err = resp.get("error", "UNKNOWN_ERROR")
-            if err in ("TASK_CAPABILITY_CANCELLED", "PROVIDER_AUTH_UNAVAILABLE", "REPLAYED_CAPABILITY_REQUEST"):
+            if err in (
+                "TASK_CAPABILITY_CANCELLED",
+                "PROVIDER_AUTH_UNAVAILABLE",
+                "REPLAYED_CAPABILITY_REQUEST",
+                "CAPABILITY_ISSUANCE_LIMIT",
+                "REPLAY_CACHE_EXHAUSTED",
+                "ATTEMPT_CONTEXT_EXHAUSTED",
+            ):
                 raise RuntimeError(f"Auth capability request denied: {err}")
             raise ValueError(f"Auth capability request failed: {err}")
 
@@ -568,6 +615,25 @@ class ControllerAuthHelper:
         }
         if any(resp.get(name) != value for name, value in expected_response.items()):
             raise ValueError("Auth capability response binding mismatch")
+        context_key = (
+            task_id, generation, attempt_id, launch_nonce, provider_id,
+            upstream_scheme, upstream_host, upstream_port, provider_purpose,
+        )
+        expected_sequence = self._attempt_sequences.get(context_key, 0) + 1
+        now = int(time.time())
+        if (
+            self._process_identity is None
+            or resp.get("helper_epoch") != self._process_identity.helper_epoch
+            or resp.get("capability_sequence") != expected_sequence
+            or type(resp.get("issued_at")) is not int
+            or type(resp.get("expires_at")) is not int
+            or not resp["issued_at"] <= now + 1
+            or not resp["issued_at"] < resp["expires_at"] <= resp["issued_at"] + 300
+            or type(resp.get("capability_nonce")) is not str
+            or not re.fullmatch(r"[0-9a-f]{32}", resp["capability_nonce"])
+        ):
+            raise ValueError("Auth capability response issuance mismatch")
+        self._attempt_sequences[context_key] = expected_sequence
         binding = ProviderAuthBinding(
             task_id=resp["task_id"],
             generation=resp["generation"],
@@ -591,23 +657,92 @@ class ControllerAuthHelper:
             binding=binding,
         )
 
-    def cancel_task(self, task_id: str) -> None:
-        """Revoke capabilities for a task in the auth helper process."""
-        self._send_ipc({"action": "CANCEL_TASK", "task_id": task_id})
+    def cancel_task(
+        self,
+        task_id: str,
+        generation: int = 1,
+        attempt_id: int = 1,
+        launch_nonce: str = "c3d4e5f60718293a4b5c6d7e8f90a1b2",
+        provider_id: str = "chatgpt_subscription",
+        *,
+        upstream_scheme: str = "https",
+        upstream_host: str = "chatgpt.example.test",
+        upstream_port: int = 443,
+        provider_purpose: str = "responses_sse",
+    ) -> None:
+        """Revoke one exact attempt context in the auth helper process."""
+        response = self._send_ipc(
+            {
+                "action": "CANCEL_ATTEMPT",
+                "task_id": task_id,
+                "generation": generation,
+                "attempt_id": attempt_id,
+                "launch_nonce": launch_nonce,
+                "provider_id": provider_id,
+                "upstream_scheme": upstream_scheme,
+                "upstream_host": upstream_host,
+                "upstream_port": upstream_port,
+                "provider_purpose": provider_purpose,
+            }
+        )
+        if response.get("status") != "OK":
+            raise RuntimeError(
+                f"Auth capability cancellation denied: {response.get('error', 'UNKNOWN_ERROR')}"
+            )
+
+    def register_broker(self, broker: Any) -> None:
+        """Register a live broker whose slot is bound to this helper epoch."""
+        if broker not in self._registered_brokers:
+            self._registered_brokers.append(broker)
+
+    def replace_broker_auth_capability(self, broker: Any) -> ProviderAuthCapability:
+        """Issue and atomically install the next capability for a live broker."""
+        with self._ipc_lock:
+            self.register_broker(broker)
+            policy = broker.policy
+            context_key = (
+                policy.task_id, policy.generation, policy.attempt_id,
+                policy.launch_nonce, policy.upstream_provider_id,
+                policy.upstream_scheme, policy.upstream_host,
+                policy.upstream_port, "responses_sse",
+            )
+            expected_sequence = self._attempt_sequences.get(context_key, 0)
+            candidate = self.get_auth_capability(
+                policy.task_id,
+                policy.generation,
+                policy.attempt_id,
+                policy.launch_nonce,
+                policy.upstream_provider_id,
+                upstream_scheme=policy.upstream_scheme,
+                upstream_host=policy.upstream_host,
+                upstream_port=policy.upstream_port,
+                provider_purpose="responses_sse",
+            )
+            broker.replace_auth_capability(
+                candidate,
+                expected_sequence=expected_sequence,
+            )
+            return candidate
+
+    def cancel_broker_auth_capability(self, broker: Any) -> None:
+        """Cancel the exact helper context before atomically revoking the broker."""
+        policy = broker.policy
+        self.cancel_task(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+            policy.upstream_provider_id,
+            upstream_scheme=policy.upstream_scheme,
+            upstream_host=policy.upstream_host,
+            upstream_port=policy.upstream_port,
+            provider_purpose="responses_sse",
+        )
+        broker.cancel_auth_capability()
 
     def trigger_refresh_failure(self) -> None:
         """Trigger simulated refresh rejection in daemon for failure testing."""
         self._send_ipc({"action": "TRIGGER_REFRESH_FAILURE"})
-
-    def refresh_access_token(self, new_access_token: str, new_expires_in: int = 3600) -> None:
-        """Update synthetic access token out-of-process when refreshed."""
-        resp = self._send_ipc({
-            "action": "REFRESH_TOKENS",
-            "new_access_token": new_access_token,
-            "expires_in": new_expires_in,
-        })
-        if resp.get("status") != "OK":
-            raise ValueError(f"Token refresh update failed: {resp.get('error')}")
 
     def _abort_startup(self) -> None:
         """Close partial startup authority without attempting protocol shutdown."""
@@ -634,6 +769,8 @@ class ControllerAuthHelper:
 
     def stop(self) -> None:
         """Stop auth helper daemon process and clean up private temp state."""
+        self._revoke_registered_brokers()
+        self._registered_brokers.clear()
         if self._ipc_endpoint:
             try:
                 self._send_ipc({"action": "SHUTDOWN"})

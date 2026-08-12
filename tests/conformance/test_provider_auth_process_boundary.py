@@ -6,6 +6,7 @@ import json
 import socket
 import sys
 import tempfile
+import threading
 import pytest
 
 from agenticos.sandbox.controller_auth_helper import ControllerAuthHelper
@@ -293,8 +294,24 @@ def test_auth_capability_task_binding_and_nonces(auth_fixture_data) -> None:
         assert isinstance(cap1, SubscriptionAuthCapability)
         assert cap1.get_auth_header("task-001", 1).reveal_secret() == f"Bearer {CANARY_ACCESS}"
 
-        # Replay attempt with exact same task parameters fails closed
-        with pytest.raises(RuntimeError, match="REPLAYED_CAPABILITY_REQUEST"):
+        # Replacement issuance reuses the attempt tuple but advances sequence.
+        replacements = [
+            helper.get_auth_capability(
+                task_id="task-001",
+                generation=1,
+                attempt_id=1,
+                launch_nonce="a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            )
+            for _ in range(7)
+        ]
+        assert [cap.binding.capability_sequence for cap in [cap1, *replacements]] == list(
+            range(1, 9)
+        )
+        assert len({cap.binding.capability_nonce for cap in [cap1, *replacements]}) == 8
+        assert {cap.binding.helper_epoch for cap in [cap1, *replacements]} == {
+            helper.process_identity.helper_epoch
+        }
+        with pytest.raises(RuntimeError, match="CAPABILITY_ISSUANCE_LIMIT"):
             helper.get_auth_capability(
                 task_id="task-001",
                 generation=1,
@@ -310,6 +327,7 @@ def test_auth_capability_task_binding_and_nonces(auth_fixture_data) -> None:
             launch_nonce="b2c3d4e5f60718293a4b5c6d7e8f90a1",
         )
         assert cap2.get_auth_header("task-001", 1).reveal_secret() == f"Bearer {CANARY_ACCESS}"
+        assert cap2.binding.capability_sequence == 1
 
 
 def test_task_cancellation_invalidates_capabilities(auth_fixture_data) -> None:
@@ -324,6 +342,141 @@ def test_task_cancellation_invalidates_capabilities(auth_fixture_data) -> None:
                 attempt_id=1,
                 launch_nonce="c3d4e5f60718293a4b5c6d7e8f90a1b2",
             )
+
+
+def test_request_nonce_is_single_use_without_burning_attempt_tuple(
+    auth_fixture_data,
+) -> None:
+    nonce = "11111111111111111111111111111111"
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        first = helper.get_auth_capability("task-nonce", 1, _request_nonce=nonce)
+        assert first.binding.capability_sequence == 1
+        with pytest.raises(RuntimeError, match="REPLAYED_CAPABILITY_REQUEST"):
+            helper.get_auth_capability("task-nonce", 1, _request_nonce=nonce)
+        replacement = helper.get_auth_capability("task-nonce", 1)
+        assert replacement.binding.capability_sequence == 2
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["GET_REFRESH_TOKEN", "GET_ACCESS_TOKEN", "DUMP_AUTH_STATE", "SHOW_AUTH_JSON"],
+)
+def test_ambient_auth_operations_are_unknown_and_secret_free(
+    auth_fixture_data, operation: str
+) -> None:
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        response = helper._send_ipc({"action": operation})
+        assert response == {
+            "protocol_version": "AOSAUTH/1",
+            "status": "ERROR",
+            "error": "IPC_UNKNOWN_OPERATION",
+        }
+        assert CANARY_ACCESS not in repr(response)
+        assert CANARY_REFRESH not in repr(response)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_id", "../../bad"),
+        ("generation", 0),
+        ("generation", 2**64),
+        ("attempt_id", 0),
+        ("launch_nonce", "not-a-nonce"),
+        ("provider_id", ""),
+        ("upstream_scheme", "ftp"),
+        ("upstream_host", ""),
+        ("upstream_port", 0),
+        ("upstream_port", 65_536),
+        ("provider_purpose", "wrong"),
+        ("_request_nonce", "x"),
+    ],
+)
+def test_capability_semantic_substitutions_never_return_credentials(
+    auth_fixture_data, field: str, value: object
+) -> None:
+    kwargs = {
+        "task_id": "task-valid",
+        "generation": 1,
+        "attempt_id": 1,
+        "launch_nonce": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "provider_id": "chatgpt_subscription",
+        "upstream_scheme": "https",
+        "upstream_host": "chatgpt.example.test",
+        "upstream_port": 443,
+        "provider_purpose": "responses_sse",
+    }
+    kwargs[field] = value
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        with pytest.raises(ValueError) as exc_info:
+            helper.get_auth_capability(**kwargs)
+        assert "CAPABILITY_BINDING_INVALID" in str(exc_info.value)
+        assert CANARY_ACCESS not in str(exc_info.value)
+        assert CANARY_REFRESH not in str(exc_info.value)
+
+
+def test_concurrent_same_context_issuance_remains_monotonic(auth_fixture_data) -> None:
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        results: list[SubscriptionAuthCapability] = []
+        errors: list[BaseException] = []
+
+        def issue() -> None:
+            try:
+                results.append(helper.get_auth_capability("task-concurrent", 1))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=issue) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5.0)
+        assert errors == []
+        assert sorted(cap.binding.capability_sequence for cap in results) == list(
+            range(1, 9)
+        )
+
+
+def test_helper_disconnect_synchronously_revokes_registered_broker(
+    auth_fixture_data,
+) -> None:
+    class BrokerProbe:
+        cancelled = False
+
+        def cancel_auth_capability(self) -> None:
+            self.cancelled = True
+
+    broker = BrokerProbe()
+    helper = ControllerAuthHelper(auth_fixture_data)
+    helper.register_broker(broker)
+    assert helper._proc is not None
+    helper._proc.kill()
+    helper._proc.wait(timeout=2.0)
+    with pytest.raises(Exception):
+        helper._send_ipc({"action": "PING"})
+    assert broker.cancelled is True
+    helper.stop()
+
+
+def test_malformed_helper_response_synchronously_revokes_registered_broker(
+    auth_fixture_data, monkeypatch
+) -> None:
+    class BrokerProbe:
+        cancelled = False
+
+        def cancel_auth_capability(self) -> None:
+            self.cancelled = True
+
+    broker = BrokerProbe()
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        helper.register_broker(broker)
+        monkeypatch.setattr(
+            "agenticos.sandbox.controller_auth_helper._recv_linux_packet",
+            lambda *args, **kwargs: b'{"protocol_version":"AOSAUTH/1","status":"OK","error":"bad"}',
+        )
+        with pytest.raises(Exception):
+            helper._send_ipc({"action": "PING"})
+        assert broker.cancelled is True
 
 
 def test_expired_token_synthetic_refresh(auth_fixture_data) -> None:
@@ -355,3 +508,10 @@ def test_refresh_rejection_fails_closed(auth_fixture_data) -> None:
                 attempt_id=1,
                 launch_nonce="e5f60718293a4b5c6d7e8f90a1b2c3d4",
             )
+        recovered = helper.get_auth_capability(
+            task_id="task-fail-1",
+            generation=1,
+            attempt_id=1,
+            launch_nonce="e5f60718293a4b5c6d7e8f90a1b2c3d4",
+        )
+        assert recovered.binding.capability_sequence == 1

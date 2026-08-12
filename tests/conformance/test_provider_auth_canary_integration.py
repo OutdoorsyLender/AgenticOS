@@ -121,6 +121,9 @@ def test_chatgpt_subscription_auth_injection_flow(fake_chatgpt_upstream: Tuple[s
 
         broker = TaskProviderBroker(policy, auth_cap)
         grant = broker.start()
+        auth_helper.register_broker(broker)
+        replacement = auth_helper.replace_broker_auth_capability(broker)
+        assert replacement.binding.capability_sequence == 2
 
         try:
             req_url = f"http://{grant.listener_address}:{grant.listener_port}/backend-api/codex/responses"

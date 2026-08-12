@@ -25,6 +25,7 @@ from agenticos.sandbox.auth_helper_daemon import (
     IPC_PROTOCOL_VERSION,
     AuthProtocolError,
     _encode_packet,
+    _decode_response_packet,
     _read_windows_bootstrap,
     _recv_linux_packet,
     _recv_stream_packet,
@@ -101,6 +102,32 @@ def test_ipc_codec_rejects_malformed_input_without_echo(
 def test_ipc_codec_rejects_oversized_encoded_response() -> None:
     with pytest.raises(AuthProtocolError, match="^IPC_RESPONSE_OVERSIZED$"):
         _encode_packet({"status": "X" * 16_385})
+
+
+def test_capability_response_schema_allows_optional_account_id_only() -> None:
+    response = {
+        "protocol_version": "AOSAUTH/1",
+        "status": "OK",
+        "request_nonce": "1" * 32,
+        "task_id": "task-1",
+        "generation": 1,
+        "attempt_id": 1,
+        "launch_nonce": "2" * 32,
+        "provider_id": "chatgpt_subscription",
+        "upstream_scheme": "https",
+        "upstream_host": "chatgpt.example.test",
+        "upstream_port": 443,
+        "provider_purpose": "responses_sse",
+        "helper_epoch": "3" * 32,
+        "access_token": "SYNTHETIC_ACCESS",
+        "issued_at": 1_800_000_000,
+        "expires_at": 1_800_000_300,
+        "capability_nonce": "4" * 32,
+        "capability_sequence": 1,
+    }
+    assert _decode_response_packet(_encode_packet(response)) == response
+    response["account_id"] = "acct-synthetic"
+    assert _decode_response_packet(_encode_packet(response)) == response
 
 
 def _open_linux_fds() -> frozenset[int]:
@@ -611,8 +638,7 @@ def test_controller_auth_helper_dict_init() -> None:
         assert cap.get_auth_header("task-99", 1).reveal_secret() == "Bearer SYNTHETIC_ACCESS_ABC"
         assert cap.get_extra_headers("task-99", 1)["ChatGPT-Account-ID"].reveal_secret() == "acct_test_789"
 
-        # Test token refresh and new capability request with distinct nonce
-        helper.refresh_access_token("SYNTHETIC_ACCESS_NEW_XYZ")
+        # A distinct attempt has an independent issuance sequence.
         new_cap = helper.get_auth_capability(
             "task-99",
             2,
@@ -622,7 +648,8 @@ def test_controller_auth_helper_dict_init() -> None:
             upstream_port=443,
             provider_purpose="responses_sse",
         )
-        assert new_cap.get_auth_header("task-99", 2).reveal_secret() == "Bearer SYNTHETIC_ACCESS_NEW_XYZ"
+        assert new_cap.get_auth_header("task-99", 2).reveal_secret() == "Bearer SYNTHETIC_ACCESS_ABC"
+        assert new_cap.binding.capability_sequence == 1
 
 
 def test_controller_auth_helper_file_init(tmp_path) -> None:

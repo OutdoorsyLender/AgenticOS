@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import secrets
 import socket
 import stat
@@ -32,6 +33,12 @@ IPC_MAX_RESPONSE_BYTES = 16_384
 IPC_REQUEST_TIMEOUT_SECONDS = 2.0
 IPC_RESPONSE_TIMEOUT_SECONDS = 2.0
 IPC_MAX_MESSAGES_PER_HELPER = 4_096
+IPC_MAX_REPLAY_ENTRIES = 4_096
+IPC_MAX_ATTEMPT_CONTEXTS = 4_096
+IPC_MAX_CAPABILITIES_PER_ATTEMPT = 8
+_TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_HEX_32_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+_HOST_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\Z")
 
 _PR_GET_DUMPABLE = 3
 _PR_SET_DUMPABLE = 4
@@ -53,6 +60,36 @@ class AuthProtocolError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def _validate_capability_context(request: Mapping[str, Any]) -> tuple[Any, ...]:
+    if not _TASK_ID_PATTERN.fullmatch(request["task_id"]):
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    if not _HEX_32_PATTERN.fullmatch(request["request_nonce"]):
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    if not _HEX_32_PATTERN.fullmatch(request["launch_nonce"]):
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    if not 1 <= request["generation"] <= (1 << 64) - 1:
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    if not 1 <= request["attempt_id"] <= (1 << 64) - 1:
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    if request["provider_id"] != "chatgpt_subscription":
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    if request["upstream_scheme"] not in ("http", "https"):
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    if not _HOST_PATTERN.fullmatch(request["upstream_host"]):
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    if not 1 <= request["upstream_port"] <= 65_535:
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    if request["provider_purpose"] != "responses_sse":
+        raise AuthProtocolError("CAPABILITY_BINDING_INVALID")
+    return tuple(
+        request[name]
+        for name in (
+            "task_id", "generation", "attempt_id", "launch_nonce", "provider_id",
+            "upstream_scheme", "upstream_host", "upstream_port", "provider_purpose",
+        )
+    )
 
 
 class _OpenHow(ctypes.Structure):
@@ -479,11 +516,22 @@ _REQUEST_FIELDS: dict[str, frozenset[str]] = {
             "provider_purpose",
         }
     ),
-    "CANCEL_TASK": frozenset({"protocol_version", "action", "task_id"}),
-    "TRIGGER_REFRESH_FAILURE": frozenset({"protocol_version", "action"}),
-    "REFRESH_TOKENS": frozenset(
-        {"protocol_version", "action", "new_access_token", "expires_in"}
+    "CANCEL_ATTEMPT": frozenset(
+        {
+            "protocol_version",
+            "action",
+            "task_id",
+            "generation",
+            "attempt_id",
+            "launch_nonce",
+            "provider_id",
+            "upstream_scheme",
+            "upstream_host",
+            "upstream_port",
+            "provider_purpose",
+        }
     ),
+    "TRIGGER_REFRESH_FAILURE": frozenset({"protocol_version", "action"}),
     "SHUTDOWN": frozenset({"protocol_version", "action"}),
 }
 
@@ -498,7 +546,7 @@ def _decode_request_packet(payload: bytes) -> dict[str, Any]:
     )
     required = _REQUEST_FIELDS.get(envelope["action"])
     if required is None:
-        raise AuthProtocolError("IPC_ACTION")
+        raise AuthProtocolError("IPC_UNKNOWN_OPERATION")
     return _strict_json_loads(
         payload,
         required_fields=required,
@@ -533,12 +581,40 @@ _RESPONSE_FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
 
 
 def _decode_response_packet(payload: bytes) -> dict[str, Any]:
-    return _strict_json_loads(
+    response = _strict_json_loads(
         payload,
         required_fields=frozenset({"protocol_version", "status"}),
         optional_fields=frozenset(_RESPONSE_FIELD_TYPES) - {"protocol_version", "status"},
         field_types=_RESPONSE_FIELD_TYPES,
     )
+    status = response["status"]
+    if status == "ERROR":
+        exact_fields = frozenset({"protocol_version", "status", "error"})
+    elif status == "READY":
+        exact_fields = frozenset({"protocol_version", "status", "identity"})
+    elif status in ("PONG",):
+        exact_fields = frozenset({"protocol_version", "status"})
+    elif status == "OK" and "access_token" in response:
+        exact_fields = frozenset(
+            {
+                "protocol_version", "status", "request_nonce", "task_id",
+                "generation", "attempt_id", "launch_nonce", "provider_id",
+                "upstream_scheme", "upstream_host", "upstream_port",
+                "provider_purpose", "helper_epoch", "access_token",
+                "issued_at", "expires_at", "capability_nonce", "capability_sequence",
+            }
+        )
+        if "account_id" in response:
+            exact_fields |= {"account_id"}
+    elif status == "OK" and "identity" in response:
+        exact_fields = frozenset({"protocol_version", "status", "identity"})
+    elif status == "OK":
+        exact_fields = frozenset({"protocol_version", "status"})
+    else:
+        raise AuthProtocolError("IPC_RESPONSE_STATUS")
+    if frozenset(response) != exact_fields:
+        raise AuthProtocolError("IPC_RESPONSE_SCHEMA")
+    return response
 
 
 def _encode_response(response: Mapping[str, Any]) -> bytes:
@@ -699,8 +775,8 @@ class AuthHelperDaemon:
         self.parent_pid = parent_pid
         self.started_at_monotonic_ns = time.monotonic_ns()
         self.helper_epoch = secrets.token_hex(16)
-        self.revoked_tasks: set[str] = set()
-        self.issued_nonces: set[str] = set()
+        self.request_nonces: set[str] = set()
+        self.attempt_contexts: dict[tuple[Any, ...], tuple[int, bool]] = {}
         self._startup_identity = dict(startup_identity)
 
         if auth_data is None:
@@ -814,27 +890,27 @@ class AuthHelperDaemon:
             upstream_port = request.get("upstream_port")
             provider_purpose = request.get("provider_purpose")
 
-            if not task_id or not isinstance(task_id, str):
-                return {"status": "ERROR", "error": "Invalid task_id"}
-            if type(generation) is not int or generation <= 0:
-                return {"status": "ERROR", "error": "Invalid generation"}
-            if type(attempt_id) is not int or attempt_id <= 0:
-                return {"status": "ERROR", "error": "Invalid attempt_id"}
-            if not launch_nonce or not isinstance(launch_nonce, str):
-                return {"status": "ERROR", "error": "Invalid launch_nonce"}
-
-            # Check revocation
-            if task_id in self.revoked_tasks:
+            try:
+                context_key = _validate_capability_context(request)
+            except AuthProtocolError as exc:
+                return {"status": "ERROR", "error": exc.code}
+            previous_sequence, cancelled = self.attempt_contexts.get(context_key, (0, False))
+            if cancelled:
                 return {"status": "ERROR", "error": "TASK_CAPABILITY_CANCELLED"}
-
-            # Check replay prevention on capability nonce
-            cap_key = f"{task_id}:{generation}:{attempt_id}:{launch_nonce}"
-            if cap_key in self.issued_nonces:
+            if request_nonce in self.request_nonces:
                 return {"status": "ERROR", "error": "REPLAYED_CAPABILITY_REQUEST"}
-            self.issued_nonces.add(cap_key)
+            if len(self.request_nonces) >= IPC_MAX_REPLAY_ENTRIES:
+                return {"status": "ERROR", "error": "REPLAY_CACHE_EXHAUSTED"}
+            if context_key not in self.attempt_contexts:
+                if len(self.attempt_contexts) >= IPC_MAX_ATTEMPT_CONTEXTS:
+                    return {"status": "ERROR", "error": "ATTEMPT_CONTEXT_EXHAUSTED"}
+            if previous_sequence >= IPC_MAX_CAPABILITIES_PER_ATTEMPT:
+                return {"status": "ERROR", "error": "CAPABILITY_ISSUANCE_LIMIT"}
+            capability_sequence = previous_sequence + 1
 
             # Check simulated refresh trigger failure
             if self._refresh_fail_trigger:
+                self._refresh_fail_trigger = False
                 return {"status": "ERROR", "error": "PROVIDER_AUTH_UNAVAILABLE"}
 
             # Perform synthetic token refresh if expired
@@ -845,8 +921,11 @@ class AuthHelperDaemon:
                 self._access_token = f"CANARY_ACCESS_TOKEN_REFRESHED_{int(time.time())}"
                 self._expires_at = int(time.time()) + 3600
 
+            self.request_nonces.add(request_nonce)
+            self.attempt_contexts[context_key] = (capability_sequence, False)
+
             issued_at = int(time.time())
-            cap_nonce = hashlib.sha256(f"{cap_key}:{time.time()}".encode("ascii")).hexdigest()[:32]
+            cap_nonce = secrets.token_hex(16)
             return {
                 "status": "OK",
                 "request_nonce": request_nonce,
@@ -865,31 +944,33 @@ class AuthHelperDaemon:
                 "issued_at": issued_at,
                 "expires_at": min(self._expires_at, issued_at + 300),
                 "capability_nonce": cap_nonce,
-                "capability_sequence": 1,
+                "capability_sequence": capability_sequence,
             }
 
-        if action == "CANCEL_TASK":
-            task_id = request.get("task_id")
-            if task_id and isinstance(task_id, str):
-                self.revoked_tasks.add(task_id)
+        if action == "CANCEL_ATTEMPT":
+            try:
+                context_key = _validate_capability_context(
+                    {**request, "request_nonce": "0" * 32}
+                )
+            except AuthProtocolError as exc:
+                return {"status": "ERROR", "error": exc.code}
+            if context_key not in self.attempt_contexts:
+                if len(self.attempt_contexts) >= IPC_MAX_ATTEMPT_CONTEXTS:
+                    return {"status": "ERROR", "error": "ATTEMPT_CONTEXT_EXHAUSTED"}
+                sequence = 0
+            else:
+                sequence = self.attempt_contexts[context_key][0]
+            self.attempt_contexts[context_key] = (sequence, True)
             return {"status": "OK"}
 
         if action == "TRIGGER_REFRESH_FAILURE":
             self.trigger_refresh_failure()
             return {"status": "OK"}
 
-        if action == "REFRESH_TOKENS":
-            new_access = request.get("new_access_token")
-            if not new_access or not isinstance(new_access, str):
-                return {"status": "ERROR", "error": "Invalid new_access_token"}
-            self._access_token = new_access
-            self._expires_at = int(time.time()) + request.get("expires_in", 3600)
-            return {"status": "OK"}
-
         if action == "SHUTDOWN":
             return {"status": "OK"}
 
-        return {"status": "ERROR", "error": "IPC_ACTION"}
+        return {"status": "ERROR", "error": "IPC_UNKNOWN_OPERATION"}
 
 
 def _run_authenticated_session(
