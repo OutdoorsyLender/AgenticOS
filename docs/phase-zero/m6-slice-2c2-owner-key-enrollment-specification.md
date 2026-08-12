@@ -1,10 +1,13 @@
 # M6 Slice 2C.2 — Owner Key Enrollment for Native Codex Digest Statements
 
 Status: documentation-only enrollment specification, prepared 2026-08-12;
-awaiting separate owner approval.
+approved by the owner on 2026-08-12 for the exact committed bytes identified
+below. No key-generation or later gate has been performed.
 
 ```text
-OWNER_KEY_ENROLLMENT_SPEC_APPROVED=NO
+OWNER_KEY_ENROLLMENT_SPEC_APPROVED=YES
+OWNER_KEY_ENROLLMENT_SPEC_COMMIT=a9bbbedc9104f59170268e3870b6de3bd11e5376
+OWNER_KEY_ENROLLMENT_SPEC_SHA256=c78b6bdbe956238aff9a8976b9d830fab4da248747ca63b313a0fea43563c156
 OWNER_KEY_GENERATED=NO
 OWNER_PRIVATE_KEY_ACCESSED=NO
 OWNER_PUBLIC_KEY_ENROLLED=NO
@@ -27,6 +30,24 @@ and its
 [trust-policy addendum](m6-slice-2c2-native-codex-sigstore-trust-policy-addendum.md).
 Those documents remain controlling. Gate A and Branch O are approved. Gate B
 remains blocked and unapproved.
+
+Owner decision received 2026-08-12: the owner approved the exact specification
+at commit `a9bbbedc9104f59170268e3870b6de3bd11e5376`, path
+`docs/phase-zero/m6-slice-2c2-owner-key-enrollment-specification.md`, whose
+blob has SHA-256
+`c78b6bdbe956238aff9a8976b9d830fab4da248747ca63b313a0fea43563c156`.
+The approved purpose is creation and enrollment of one dedicated Ed25519 owner
+key solely for signing canonical `AOSCODEXOWNERDIGEST/1` statements under the
+exact SSHSIG identity, namespace, protection, custody, backup, verification,
+rotation, and revocation rules in those committed bytes. This completes Gate 1
+only and permits the owner—not an agent—to proceed separately to the manual
+Gate 2 ceremony outside every agent session.
+
+This approval does not authorize an agent to generate or access the private
+key or passphrase. It does not authorize Codex or Sigstore acquisition, Gate B,
+installation, Codex execution, authentication, provider access, production
+integration, self-hosting, Git signing, SSH login, controller runtime use, or
+any other use of the key. All later gates remain separate.
 
 No command marked for the later owner ceremony was executed while preparing
 this specification. No key, passphrase, recovery material, public enrollment,
@@ -1181,25 +1202,30 @@ gate.
 
 1. **Approve this enrollment specification.** The owner reviews the exact
    committed specification and explicitly approves or rejects it. Current
-   state: not approved.
+   state: approved on 2026-08-12 for exact commit
+   `a9bbbedc9104f59170268e3870b6de3bd11e5376` and specification SHA-256
+   `c78b6bdbe956238aff9a8976b9d830fab4da248747ca63b313a0fea43563c156`.
 2. **Owner manually generates the key outside the agent session.** The owner
-   performs §§3–5 with all agents stopped. Current state: not performed.
+   performs §§3–5 with all agents stopped. Current state: authorized for the
+   owner alone as the next separate gate; not performed.
 3. **Record only the public key and fingerprint.** The owner supplies only the
-   bounded public values; no digest is received. Current state: not performed.
+   bounded public values; no digest is received. Current state: blocked on
+   Gate 2; not performed.
 4. **Adversarially review and commit the public enrollment.** Resolve every
    Critical and Important finding, publish the exact public-enrollment commit,
    synchronize both clones, and obtain separate owner fingerprint approval.
-   Current state: blocked on gates 1–3.
+   Current state: blocked on Gates 2–3.
 5. **Owner later obtains the independent binary digest.** Its authority is
    independent of GitHub release hosting, release metadata, the OpenAI
-   sidecar, and the later acquisition. Current state: not performed.
+   sidecar, and the later acquisition. Current state: blocked on Gates 2–4;
+   not performed.
 6. **Owner manually signs the exact canonical statement.** Use §§7–8 outside
    the agent session and disclose only public statement/signature evidence.
-   Current state: blocked on gates 1–5.
+   Current state: blocked on Gates 2–5.
 7. **Validate and record the statement before separately considering Gate B.**
    Apply §§9–11, commit only bounded public evidence, publish/synchronize it,
    and then stop. Gate B remains unapproved and requires a later explicit owner
-   decision. Current state: blocked on gates 1–6.
+   decision. Current state: blocked on Gates 2–6.
 
 No gate may be combined with its successor, inferred from silence, backdated,
 or treated as approval of acquisition, installation, execution,
@@ -1207,8 +1233,8 @@ authentication, provider access, or runtime work.
 
 ## 13. Explicit non-claims
 
-- No owner key exists, was generated, was accessed, or was enrolled by this
-  documentation task.
+- No owner key was generated, accessed, or enrolled by this approval-recording
+  task, and no public-key evidence was received.
 - No passphrase, private key, encrypted private-key bytes, backup, recovery
   material, volume identity, vault entry, or custody record was observed.
 - No independent uncompressed-binary digest was received, validated, signed,
@@ -1229,10 +1255,11 @@ authentication, provider access, or runtime work.
 - No Codex archive, Sigstore bundle, verifier, binary, installer, package,
   provider route, credential, or authentication material was acquired,
   installed, executed, or accessed.
-- Gate A and Branch O remain the only approved decisions. Gate B and every
-  acquisition, installation, execution, qualification, authentication,
-  provider, production, self-hosting, other-artifact, other-target, and
-  other-version authority remain blocked.
+- Gate A, Branch O, and Gate 1 approval of the exact owner-key enrollment
+  specification are the only approved decisions. Gate B and every acquisition,
+  installation, execution, qualification, authentication, provider,
+  production, self-hosting, other-artifact, other-target, and other-version
+  authority remain blocked.
 
 ## 14. Adversarial review record
 
@@ -1263,18 +1290,29 @@ Critical, and zero new Important findings. A final exact-byte confirmation of
 this recorded revision is required before staging; any later content change
 invalidates that confirmation and requires another review.
 
+A fresh read-only review of the later Gate 1 approval-recording diff inspected
+the complete governing authorization packet, trust-policy addendum, approved
+specification, execution plan, and preservation contract. It found zero
+Critical and zero Important issues. Its one Minor finding was that the plan's
+Gate-ledger step omitted Gate 5 even though the normative ledger correctly kept
+Gate 5 blocked; the plan now names Gate 5 explicitly. A scoped exact-byte
+re-review of this resolution and review record is required before staging. Any
+later content change invalidates that re-review.
+
 ## 15. Decision and exact next owner action
 
-This specification selects the dedicated offline Ed25519/SSHSIG design but
-does not approve or enroll it. The next action is Gate 1 only: the owner reviews
-the exact committed document and explicitly approves or rejects
-`OWNER_KEY_ENROLLMENT_SPEC_APPROVED`.
+The owner approved the exact committed specification identified above on
+2026-08-12. Gate 1 is complete. No key was generated, accessed, or enrolled by
+this approval-recording task.
 
-If approved, the following later action is manual and must occur with every
-agent/model/controller process stopped: provision and identify the exact
-`AOSOWNERKEY` and `AOSOWNERBACKUP` encrypted volumes and private vault, then run
-the §5 owner ceremony. Do not generate a key before the explicit specification
-approval.
+The exact next action is Gate 2, performed manually by the owner outside this
+agent session. Before beginning, the owner stops this session and every other
+agent/model/controller process, provisions and identifies the exact
+`AOSOWNERKEY` and `AOSOWNERBACKUP` encrypted volumes and private vault required
+by §§3–4, and then follows the exact §5 ceremony. The owner must not disclose or
+provide the private key, passphrase, backup, or recovery material to an agent;
+after Gate 2, only the bounded public evidence required by Gate 3 may be
+provided for separate review.
 
 Gate B remains unapproved after enrollment, digest receipt, signature, and
 validation. It can be considered only through a later separate owner decision.
