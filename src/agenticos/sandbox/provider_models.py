@@ -70,6 +70,10 @@ class ProviderAuthCapability(abc.ABC):
         """Return the authorization header value wrapped in a SecretValue."""
         raise NotImplementedError
 
+    def get_extra_headers(self, task_id: str, generation: int) -> dict[str, SecretValue]:
+        """Return any extra authorization headers (e.g. ChatGPT-Account-ID) to inject."""
+        return {}
+
 
 class SyntheticBearerAuth(ProviderAuthCapability):
     """Deterministic synthetic test authorization provider for Slice 1 qualification."""
@@ -81,6 +85,25 @@ class SyntheticBearerAuth(ProviderAuthCapability):
 
     def get_auth_header(self, task_id: str, generation: int) -> SecretValue:
         return SecretValue(f"Bearer {self._canary_token}")
+
+
+class SubscriptionAuthCapability(ProviderAuthCapability):
+    """Auth capability supporting bearer access token and optional ChatGPT account ID."""
+
+    def __init__(self, access_token: str, account_id: str | None = None) -> None:
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise ValueError("access_token must be a non-empty string")
+        self._access_token = access_token
+        self._account_id = account_id
+
+    def get_auth_header(self, task_id: str, generation: int) -> SecretValue:
+        return SecretValue(f"Bearer {self._access_token}")
+
+    def get_extra_headers(self, task_id: str, generation: int) -> dict[str, SecretValue]:
+        headers: dict[str, SecretValue] = {}
+        if self._account_id is not None:
+            headers["ChatGPT-Account-ID"] = SecretValue(self._account_id)
+        return headers
 
 
 def _require_positive_int(name: str, value: object) -> None:
@@ -310,6 +333,7 @@ __all__ = [
     "ProviderFailureClass",
     "ProviderGrant",
     "SecretValue",
+    "SubscriptionAuthCapability",
     "SyntheticBearerAuth",
     "canonical_provider_policy_bytes",
     "provider_policy_digest",

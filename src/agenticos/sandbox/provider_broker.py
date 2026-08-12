@@ -395,9 +395,10 @@ class TaskProviderBroker:
         with self._lock:
             self._request_byte_count += len(headers_raw) + len(body_bytes)
 
-        # 2. Get synthetic authorization from capability
+        # 2. Get synthetic authorization and extra headers from capability
         try:
             auth_val = self._auth_capability.get_auth_header(self._policy.task_id, self._policy.generation)
+            extra_headers = self._auth_capability.get_extra_headers(self._policy.task_id, self._policy.generation)
         except Exception as exc:
             self._send_error_and_close(
                 client_sock, 500, "Auth Unavailable", ProviderFailureClass.PROVIDER_AUTH_UNAVAILABLE
@@ -422,6 +423,8 @@ class TaskProviderBroker:
             req_lines = [f"POST {req_path} HTTP/1.1"]
             req_lines.append(f"Host: {self._policy.upstream_host}:{self._policy.upstream_port}")
             req_lines.append(f"Authorization: {auth_val.reveal_secret()}")
+            for h_name, h_sec in extra_headers.items():
+                req_lines.append(f"{h_name}: {h_sec.reveal_secret()}")
             req_lines.append(f"Content-Length: {len(body_bytes)}")
             req_lines.append("Connection: close")
 

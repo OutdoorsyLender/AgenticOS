@@ -23,6 +23,7 @@ from .network_models import (
     canonical_policy_bytes,
     policy_digest,
 )
+from .controller_auth_helper import ControllerAuthHelper
 from .provider_broker import TaskProviderBroker
 from .provider_models import (
     NetworkAuthority,
@@ -33,6 +34,7 @@ from .provider_models import (
     ProviderFailureClass,
     ProviderGrant,
     SecretValue,
+    SubscriptionAuthCapability,
     SyntheticBearerAuth,
     canonical_provider_policy_bytes,
     provider_policy_digest,
@@ -54,6 +56,7 @@ __all__ = [
     "BrokerProcessEvidence",
     "BrokerReadyEvidence",
     "CapabilityTransportRunner",
+    "ControllerAuthHelper",
     "HostQualificationError",
     "HostQualificationMismatchError",
     "ListenerEvidence",
@@ -66,6 +69,7 @@ __all__ = [
     "ProviderFailureClass",
     "ProviderGrant",
     "SecretValue",
+    "SubscriptionAuthCapability",
     "SyntheticBearerAuth",
     "TaskProviderBroker",
     "TransportMode",
