@@ -10,6 +10,7 @@ import pytest
 jsonschema = pytest.importorskip("jsonschema")
 
 from agenticos.sandbox.policy import default_policy
+from agenticos.sandbox.models import AttackResult
 from helpers import run_worker
 
 SCHEMAS_DIR = Path(__file__).resolve().parents[2] / "schemas"
@@ -36,3 +37,16 @@ def test_worker_error_result_conforms_to_schema(layout):
     res = run_worker("ENV-02", env_name=layout.env_secret_name, env=minimal_env())
     assert res["succeeded"] is False
     jsonschema.validate(res, load_schema("probe-result.schema.json"))
+
+
+def test_auth_probe_result_conforms_to_schema():
+    result = AttackResult(
+        scenario_id="AUTH-01",
+        attempted=True,
+        succeeded=False,
+        target="auth-domain",
+        started_at="2026-08-11T00:00:00+00:00",
+        finished_at="2026-08-11T00:00:01+00:00",
+        details={"operations": []},
+    )
+    jsonschema.validate(result.to_dict(), load_schema("probe-result.schema.json"))

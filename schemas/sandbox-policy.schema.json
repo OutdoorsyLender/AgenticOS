@@ -11,7 +11,7 @@
     "expectations": {
       "type": "object",
       "minProperties": 1,
-      "propertyNames": { "pattern": "^(FS|ENV|PROC|NET|SOCK|WRITE)-[0-9]{2}$" },
+      "propertyNames": { "pattern": "^(AUTH|FS|ENV|PROC|NET|SOCK|WRITE)-[0-9]{2}$" },
       "additionalProperties": {
         "type": "string",
         "enum": ["ALLOW", "DENY", "REQUIRE_APPROVAL"]
