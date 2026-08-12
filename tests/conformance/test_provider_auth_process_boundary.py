@@ -10,7 +10,13 @@ import threading
 import pytest
 
 from agenticos.sandbox.controller_auth_helper import ControllerAuthHelper
-from agenticos.sandbox.provider_models import AuthHelperProcessIdentity, SubscriptionAuthCapability
+from agenticos.sandbox.provider_broker import _AtomicCapabilitySlot
+from agenticos.sandbox.provider_models import (
+    AuthHelperProcessIdentity,
+    ProviderAuthBindingError,
+    ProviderBrokerPolicy,
+    SubscriptionAuthCapability,
+)
 
 
 CANARY_REFRESH = "CANARY_REFRESH_TOKEN_SECRET_77777"
@@ -344,6 +350,220 @@ def test_task_cancellation_invalidates_capabilities(auth_fixture_data) -> None:
             )
 
 
+def _subscription_policy() -> ProviderBrokerPolicy:
+    return ProviderBrokerPolicy(
+        version="AOSPROV/1",
+        task_id="task-current-only",
+        generation=1,
+        attempt_id=1,
+        launch_nonce="a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        upstream_provider_id="chatgpt_subscription",
+        upstream_scheme="https",
+        upstream_host="chatgpt.example.test",
+        upstream_port=443,
+        allowed_paths=("/backend-api/codex/responses",),
+        protocol_type="HTTP_SSE",
+        max_request_bytes=1024,
+        max_response_bytes=1024,
+        max_event_bytes=512,
+        max_header_count=16,
+        max_header_bytes=2048,
+        max_connections=1,
+        retry_budget=0,
+        idle_timeout_seconds=2.0,
+        total_lifetime_seconds=5.0,
+    )
+
+
+def test_older_materialized_capability_cannot_initialize_after_reissuance(
+    auth_fixture_data,
+) -> None:
+    policy = _subscription_policy()
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        first = helper.get_auth_capability(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
+        second = helper.get_auth_capability(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
+        assert second.binding.capability_sequence == 2
+        with pytest.raises(ProviderAuthBindingError, match="SEQUENCE"):
+            _AtomicCapabilitySlot(policy, first)
+
+
+def test_materialized_capability_cannot_initialize_after_helper_cancellation(
+    auth_fixture_data,
+) -> None:
+    policy = _subscription_policy()
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        capability = helper.get_auth_capability(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
+        helper.cancel_task(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
+        with pytest.raises(ProviderAuthBindingError, match="CANCELLED"):
+            _AtomicCapabilitySlot(policy, capability)
+
+
+def test_helper_cancellation_waits_for_post_validation_injection(
+    auth_fixture_data, monkeypatch,
+) -> None:
+    policy = _subscription_policy()
+    validated = threading.Event()
+    release = threading.Event()
+    injected: list[str] = []
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        capability = helper.get_auth_capability(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
+        slot = _AtomicCapabilitySlot(policy, capability)
+        original = SubscriptionAuthCapability.get_auth_header
+
+        def blocked_header(self, task_id: str, generation: int):
+            validated.set()
+            assert release.wait(timeout=5.0)
+            return original(self, task_id, generation)
+
+        monkeypatch.setattr(
+            SubscriptionAuthCapability, "get_auth_header", blocked_header
+        )
+        consumer = threading.Thread(
+            target=lambda: slot.validate_extract_and_send(
+                policy=policy,
+                sender=lambda auth, extra: injected.append(auth.reveal_secret()),
+            )
+        )
+        consumer.start()
+        assert validated.wait(timeout=5.0)
+        cancellation_done = threading.Event()
+        canceller = threading.Thread(
+            target=lambda: (
+                helper.cancel_task(
+                    policy.task_id,
+                    policy.generation,
+                    policy.attempt_id,
+                    policy.launch_nonce,
+                ),
+                cancellation_done.set(),
+            )
+        )
+        canceller.start()
+        assert not cancellation_done.wait(timeout=0.1)
+        release.set()
+        consumer.join(timeout=5.0)
+        canceller.join(timeout=5.0)
+        assert cancellation_done.is_set()
+        assert injected == ["Bearer " + CANARY_ACCESS]
+
+
+def test_subscription_capability_requires_trusted_issuance_state(
+    auth_fixture_data,
+) -> None:
+    policy = _subscription_policy()
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        capability = helper.get_auth_capability(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
+        with pytest.raises(TypeError, match="_issuance_state"):
+            SubscriptionAuthCapability(
+                access_token=CANARY_ACCESS,
+                binding=capability.binding,
+            )
+
+
+def test_same_context_issuance_and_cancellation_never_deadlock(
+    auth_fixture_data,
+) -> None:
+    policy = _subscription_policy()
+    with ControllerAuthHelper(auth_fixture_data) as helper:
+        helper.get_auth_capability(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
+        start = threading.Barrier(3)
+        outcomes: list[str] = []
+
+        def issue() -> None:
+            start.wait()
+            try:
+                helper.get_auth_capability(
+                    policy.task_id,
+                    policy.generation,
+                    policy.attempt_id,
+                    policy.launch_nonce,
+                )
+                outcomes.append("issued")
+            except RuntimeError as exc:
+                outcomes.append(str(exc))
+
+        def cancel() -> None:
+            start.wait()
+            helper.cancel_task(
+                policy.task_id,
+                policy.generation,
+                policy.attempt_id,
+                policy.launch_nonce,
+            )
+            outcomes.append("cancelled")
+
+        threads = [threading.Thread(target=issue), threading.Thread(target=cancel)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
+        assert "cancelled" in outcomes
+
+
+def test_helper_restart_revokes_prior_epoch_without_old_ipc_probe(
+    auth_fixture_data,
+) -> None:
+    policy = _subscription_policy()
+    first_helper = ControllerAuthHelper(auth_fixture_data)
+    try:
+        stale = first_helper.get_auth_capability(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
+        assert first_helper._proc is not None
+        first_helper._proc.kill()
+        first_helper._proc.wait(timeout=2.0)
+
+        with ControllerAuthHelper(auth_fixture_data) as replacement:
+            assert (
+                replacement.process_identity.helper_epoch
+                != stale.binding.helper_epoch
+            )
+            with pytest.raises(ProviderAuthBindingError, match="CANCELLED"):
+                _AtomicCapabilitySlot(policy, stale)
+    finally:
+        first_helper.stop()
+
+
 def test_request_nonce_is_single_use_without_burning_attempt_tuple(
     auth_fixture_data,
 ) -> None:
@@ -437,39 +657,35 @@ def test_concurrent_same_context_issuance_remains_monotonic(auth_fixture_data) -
         )
 
 
-def test_helper_disconnect_synchronously_revokes_registered_broker(
+def test_helper_disconnect_synchronously_revokes_materialized_capability(
     auth_fixture_data,
 ) -> None:
-    class BrokerProbe:
-        cancelled = False
-
-        def cancel_auth_capability(self) -> None:
-            self.cancelled = True
-
-    broker = BrokerProbe()
+    policy = _subscription_policy()
     helper = ControllerAuthHelper(auth_fixture_data)
-    helper.register_broker(broker)
+    capability = helper.get_auth_capability(
+        policy.task_id, policy.generation, policy.attempt_id, policy.launch_nonce
+    )
     assert helper._proc is not None
     helper._proc.kill()
     helper._proc.wait(timeout=2.0)
     with pytest.raises(Exception):
         helper._send_ipc({"action": "PING"})
-    assert broker.cancelled is True
+    with pytest.raises(ProviderAuthBindingError, match="CANCELLED"):
+        _AtomicCapabilitySlot(policy, capability)
     helper.stop()
 
 
-def test_malformed_helper_response_synchronously_revokes_registered_broker(
+def test_malformed_helper_response_synchronously_revokes_materialized_capability(
     auth_fixture_data, monkeypatch
 ) -> None:
-    class BrokerProbe:
-        cancelled = False
-
-        def cancel_auth_capability(self) -> None:
-            self.cancelled = True
-
-    broker = BrokerProbe()
+    policy = _subscription_policy()
     with ControllerAuthHelper(auth_fixture_data) as helper:
-        helper.register_broker(broker)
+        capability = helper.get_auth_capability(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
         receiver_name = (
             "_recv_linux_packet" if sys.platform.startswith("linux") else "_recv_stream_packet"
         )
@@ -479,7 +695,8 @@ def test_malformed_helper_response_synchronously_revokes_registered_broker(
         )
         with pytest.raises(Exception):
             helper._send_ipc({"action": "PING"})
-        assert broker.cancelled is True
+        with pytest.raises(ProviderAuthBindingError, match="CANCELLED"):
+            _AtomicCapabilitySlot(policy, capability)
 
 
 def test_expired_token_synthetic_refresh(auth_fixture_data) -> None:

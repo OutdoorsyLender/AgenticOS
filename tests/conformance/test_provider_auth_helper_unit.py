@@ -35,6 +35,8 @@ from agenticos.sandbox.auth_helper_daemon import (
 )
 from agenticos.sandbox.controller_auth_helper import ControllerAuthHelper
 from agenticos.sandbox.provider_models import (
+    CapabilityIssuanceAuthority,
+    CapabilityIssuanceState,
     ProviderAuthBinding,
     ProviderAuthBindingError,
     ProviderBrokerPolicy,
@@ -474,10 +476,21 @@ def _bound_capability() -> tuple[ProviderBrokerPolicy, SubscriptionAuthCapabilit
         issued_at=1_800_000_000,
         expires_at=1_800_000_300,
     )
+    context = (
+        binding.task_id, binding.generation, binding.attempt_id,
+        binding.launch_nonce, binding.provider_id, binding.upstream_scheme,
+        binding.upstream_host, binding.upstream_port, binding.provider_purpose,
+    )
+    issuance_state = CapabilityIssuanceState(
+        context, binding.helper_epoch, CapabilityIssuanceAuthority()
+    )
+    with issuance_state.transaction():
+        issuance_state.advance(binding)
     return policy, SubscriptionAuthCapability(
         access_token="SYNTHETIC_ACCESS_123",
         account_id="acct_synthetic_456",
         binding=binding,
+        _issuance_state=issuance_state,
     )
 
 
@@ -510,6 +523,7 @@ def test_subscription_capability_rejects_each_wrong_binding_field(
         access_token="SYNTHETIC_ACCESS_123",
         account_id="acct_synthetic_456",
         binding=wrong_binding,
+        _issuance_state=capability._issuance_state,
     )
 
     with pytest.raises(ProviderAuthBindingError) as exc_info:
@@ -666,8 +680,14 @@ def test_controller_auth_helper_file_init(tmp_path) -> None:
         ),
         encoding="utf-8",
     )
+    if os.name != "nt":
+        os.chmod(auth_file, 0o600)
 
-    with ControllerAuthHelper(str(auth_file)) as helper:
+    hostile_root = tmp_path / "hostile-workspace"
+    hostile_root.mkdir()
+    with ControllerAuthHelper(
+        str(auth_file), forbidden_storage_roots=(str(hostile_root),)
+    ) as helper:
         assert helper.auth_mode == "chatgpt"
         assert helper.account_id is None
 

@@ -39,7 +39,16 @@ def test_m4a_hostile_workspace_cannot_reach_auth_domain(
             "expires_at": 1_900_000_000,
         },
     }
-    with ControllerAuthHelper(auth_data) as helper:
+    hostile_roots = (
+        str(m4a_runner.workspace),
+        str(m4a_runner.task_tmp),
+        str(m4a_runner.synthetic_home),
+    )
+    with ControllerAuthHelper(
+        auth_data, forbidden_storage_roots=hostile_roots
+    ) as helper:
+        assert len(helper._forbidden_storage_identities) == len(hostile_roots)
+        assert all(device >= 0 and inode > 0 for _, device, inode in helper._forbidden_storage_identities)
         attack = m4a_runner.run_scenario(
             "AUTH-01",
             cwd="/workspace",

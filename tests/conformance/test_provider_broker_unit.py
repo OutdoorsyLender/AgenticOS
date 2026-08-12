@@ -14,6 +14,8 @@ from agenticos.sandbox.provider_broker import (
     _RESPONSE_ALLOWED_HEADERS,
 )
 from agenticos.sandbox.provider_models import (
+    CapabilityIssuanceAuthority,
+    CapabilityIssuanceState,
     NetworkAuthority,
     ProviderAuthCapability,
     ProviderAuthBinding,
@@ -66,26 +68,39 @@ def _make_subscription_capability(
     helper_epoch: str = "0123456789abcdef0123456789abcdef",
 ) -> SubscriptionAuthCapability:
     digit = str(sequence % 10)
+    binding = ProviderAuthBinding(
+        task_id=policy.task_id,
+        generation=policy.generation,
+        attempt_id=policy.attempt_id,
+        launch_nonce=policy.launch_nonce,
+        provider_id=policy.upstream_provider_id,
+        upstream_scheme=policy.upstream_scheme,
+        upstream_host=policy.upstream_host,
+        upstream_port=policy.upstream_port,
+        provider_purpose="responses_sse",
+        helper_epoch=helper_epoch,
+        request_nonce=digit * 32,
+        capability_nonce=(str((sequence + 1) % 10)) * 32,
+        capability_sequence=sequence,
+        issued_at=1_800_000_000,
+        expires_at=4_000_000_000,
+    )
+    context = (
+        binding.task_id, binding.generation, binding.attempt_id,
+        binding.launch_nonce, binding.provider_id, binding.upstream_scheme,
+        binding.upstream_host, binding.upstream_port, binding.provider_purpose,
+    )
+    state = CapabilityIssuanceState(
+        context, helper_epoch, CapabilityIssuanceAuthority()
+    )
+    with state.transaction():
+        for current in range(1, sequence + 1):
+            state.advance(replace(binding, capability_sequence=current))
     return SubscriptionAuthCapability(
         access_token=access_token,
         account_id="acct_synthetic",
-        binding=ProviderAuthBinding(
-            task_id=policy.task_id,
-            generation=policy.generation,
-            attempt_id=policy.attempt_id,
-            launch_nonce=policy.launch_nonce,
-            provider_id=policy.upstream_provider_id,
-            upstream_scheme=policy.upstream_scheme,
-            upstream_host=policy.upstream_host,
-            upstream_port=policy.upstream_port,
-            provider_purpose="responses_sse",
-            helper_epoch=helper_epoch,
-            request_nonce=digit * 32,
-            capability_nonce=(str((sequence + 1) % 10)) * 32,
-            capability_sequence=sequence,
-            issued_at=1_800_000_000,
-            expires_at=4_000_000_000,
-        ),
+        binding=binding,
+        _issuance_state=state,
     )
 
 
@@ -165,6 +180,7 @@ def test_subscription_binding_is_rejected_before_broker_start() -> None:
     wrong = SubscriptionAuthCapability(
         access_token="SYNTHETIC_ACCESS_1",
         binding=replace(valid.binding, task_id="other-task"),
+        _issuance_state=valid._issuance_state,
     )
 
     with pytest.raises(ProviderAuthBindingError, match="^PROVIDER_AUTH_BINDING_REJECTED$"):

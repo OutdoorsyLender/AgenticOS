@@ -38,10 +38,61 @@ from .auth_helper_daemon import (
 
 from .provider_models import (
     AuthHelperProcessIdentity,
+    CapabilityIssuanceAuthority,
+    CapabilityIssuanceState,
     ProviderAuthCapability,
     ProviderAuthBinding,
     SubscriptionAuthCapability,
 )
+
+
+_ACTIVE_HELPER_EPOCH_LOCK = threading.RLock()
+_ACTIVE_HELPER_AUTHORITY: CapabilityIssuanceAuthority | None = None
+
+
+def _reject_repository_storage(path: Path) -> None:
+    """Reject auth storage below any Git repository/worktree marker."""
+    absolute = path.absolute()
+    for candidate in (absolute, *absolute.parents):
+        if candidate.name == ".git":
+            raise RuntimeError("auth storage cannot overlap a repository or worktree")
+        marker = candidate / ".git"
+        if marker.exists() or marker.is_symlink():
+            raise RuntimeError("auth storage cannot overlap a repository or worktree")
+
+
+def _open_forbidden_storage_roots(
+    forbidden_roots: tuple[Path, ...]
+) -> tuple[tuple[Path, int, int], ...]:
+    identities: list[tuple[Path, int, int]] = []
+    for forbidden in forbidden_roots:
+        resolved = forbidden.resolve(strict=True)
+        metadata = resolved.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError("hostile storage root must be a real directory")
+        identities.append((resolved, metadata.st_dev, metadata.st_ino))
+    return tuple(identities)
+
+
+def _reject_forbidden_storage_roots(
+    path: Path, forbidden_roots: tuple[tuple[Path, int, int], ...]
+) -> None:
+    candidate = path.resolve(strict=False)
+    for root, _, _ in forbidden_roots:
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        raise RuntimeError("auth storage cannot overlap a hostile root")
+
+
+def _verify_forbidden_storage_roots(
+    forbidden_roots: tuple[tuple[Path, int, int], ...]
+) -> None:
+    for root, device, inode in forbidden_roots:
+        metadata = root.stat(follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) != (device, inode):
+            raise RuntimeError("hostile storage root identity changed")
 
 
 def _trusted_file_identity(path: Path) -> tuple[str, int, int, str]:
@@ -113,6 +164,7 @@ class ControllerAuthHelper:
         auth_json_path_or_dict: str | Dict[str, Any],
         private_dir: Optional[str] = None,
         *,
+        forbidden_storage_roots: tuple[str, ...] = (),
         _test_inherited_fds: tuple[int, ...] = (),
         _test_startup_fault: str | None = None,
         _test_denied_probe_paths: tuple[str, ...] = (),
@@ -120,12 +172,31 @@ class ControllerAuthHelper:
         _test_allowed_probe_name: str | None = None,
         _test_expose_process_probe: bool = False,
     ) -> None:
+        forbidden_paths = tuple(Path(root) for root in forbidden_storage_roots)
+        if (
+            (private_dir is not None or isinstance(auth_json_path_or_dict, str))
+            and not forbidden_paths
+        ):
+            raise ValueError(
+                "forbidden_storage_roots is required for persistent auth storage"
+            )
+        forbidden_roots = _open_forbidden_storage_roots(forbidden_paths)
+        self._forbidden_storage_identities = tuple(
+            (str(root), device, inode) for root, device, inode in forbidden_roots
+        )
         if private_dir is None:
             self._temp_dir: Optional[str] = tempfile.mkdtemp(prefix="aos-auth-private-")
             self._private_root = Path(self._temp_dir)
         else:
             self._temp_dir = None
             self._private_root = Path(private_dir)
+        try:
+            _reject_repository_storage(self._private_root)
+            _reject_forbidden_storage_roots(self._private_root, forbidden_roots)
+        except Exception:
+            if self._temp_dir:
+                shutil.rmtree(self._temp_dir, ignore_errors=True)
+            raise
         auth_root_fd = _open_or_create_auth_root(self._private_root)
         auth_created = False
         try:
@@ -138,9 +209,41 @@ class ControllerAuthHelper:
             self._auth_json_path = self._private_root / "auth.json"
 
             if isinstance(auth_json_path_or_dict, str):
-                if not os.path.exists(auth_json_path_or_dict):
-                    raise FileNotFoundError(f"Auth file not found: {auth_json_path_or_dict}")
-                with open(auth_json_path_or_dict, "r", encoding="utf-8") as f:
+                source_path = Path(auth_json_path_or_dict)
+                _reject_repository_storage(source_path)
+                _reject_forbidden_storage_roots(source_path, forbidden_roots)
+                source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                if hasattr(os, "O_NOFOLLOW"):
+                    source_flags |= os.O_NOFOLLOW
+                try:
+                    source_fd = os.open(source_path, source_flags)
+                except FileNotFoundError:
+                    raise FileNotFoundError(
+                        f"Auth file not found: {auth_json_path_or_dict}"
+                    ) from None
+                except OSError as exc:
+                    raise RuntimeError(
+                        "persistent auth source must be an owner-only regular file"
+                    ) from exc
+                source_metadata = os.fstat(source_fd)
+                expected_uid = os.getuid() if hasattr(os, "getuid") else None
+                if (
+                    not stat.S_ISREG(source_metadata.st_mode)
+                    or (os.name != "nt" and (
+                        expected_uid is not None
+                        and source_metadata.st_uid != expected_uid
+                    ))
+                    or (
+                        os.name != "nt"
+                        and stat.S_IMODE(source_metadata.st_mode) & ~0o600
+                    )
+                    or (os.name != "nt" and source_metadata.st_nlink != 1)
+                ):
+                    os.close(source_fd)
+                    raise RuntimeError(
+                        "persistent auth source must be an owner-only regular file"
+                    )
+                with os.fdopen(source_fd, "r", encoding="utf-8") as f:
                     data = json.load(f)
             elif isinstance(auth_json_path_or_dict, dict):
                 data = auth_json_path_or_dict
@@ -180,12 +283,15 @@ class ControllerAuthHelper:
         finally:
             if auth_root_fd is not None:
                 os.close(auth_root_fd)
+        _verify_forbidden_storage_roots(forbidden_roots)
 
         self._proc: Optional[subprocess.Popen[Any]] = None
         self._ipc_sock: Optional[socket.socket] = None
         self._ipc_endpoint: Optional[str] = None
         self._process_identity: Optional[AuthHelperProcessIdentity] = None
         self._ipc_lock = threading.RLock()
+        self._state_registry_lock = threading.RLock()
+        self._broker_operation_lock = threading.RLock()
         self._launch_argv: tuple[str, ...] = ()
         self._test_inherited_fds = _test_inherited_fds
         self._test_inherited_fds_closed: tuple[int, ...] = ()
@@ -196,6 +302,8 @@ class ControllerAuthHelper:
         self._test_process_probe_address: int | None = None
         self._test_expose_process_probe = _test_expose_process_probe
         self._attempt_sequences: dict[tuple[Any, ...], int] = {}
+        self._issuance_authority = CapabilityIssuanceAuthority()
+        self._issuance_states: dict[tuple[Any, ...], CapabilityIssuanceState] = {}
         self._registered_brokers: list[Any] = []
         if _test_auth_root_mutator is not None:
             _test_auth_root_mutator(self._private_root)
@@ -204,9 +312,35 @@ class ControllerAuthHelper:
 
         try:
             self._start_daemon()
+            self._activate_helper_epoch()
         except Exception as exc:
             self._abort_startup()
             raise RuntimeError("Auth helper startup failed closed") from exc
+
+    def _activate_helper_epoch(self) -> None:
+        """Atomically retire prior helper capabilities before this epoch is usable."""
+        global _ACTIVE_HELPER_AUTHORITY
+        with _ACTIVE_HELPER_EPOCH_LOCK:
+            previous = _ACTIVE_HELPER_AUTHORITY
+            _ACTIVE_HELPER_AUTHORITY = self._issuance_authority
+            if previous is not None and previous is not self._issuance_authority:
+                previous.cancel()
+
+    def _issuance_state_for(
+        self, context_key: tuple[Any, ...]
+    ) -> CapabilityIssuanceState:
+        if self._process_identity is None:
+            raise RuntimeError("Auth helper process identity not available")
+        with self._state_registry_lock:
+            state = self._issuance_states.get(context_key)
+            if state is None:
+                state = CapabilityIssuanceState(
+                    context_key,
+                    self._process_identity.helper_epoch,
+                    self._issuance_authority,
+                )
+                self._issuance_states[context_key] = state
+            return state
 
     def _validate_schema(self, data: Dict[str, Any]) -> None:
         if not isinstance(data, dict):
@@ -513,7 +647,7 @@ class ControllerAuthHelper:
                     response = _recv_stream_packet(self._ipc_sock)
                 decoded = _decode_response_packet(response)
         except Exception:
-            self._revoke_registered_brokers()
+            self._revoke_all_capabilities()
             raise
         return decoded
 
@@ -523,6 +657,9 @@ class ControllerAuthHelper:
                 broker.cancel_auth_capability()
             except Exception:
                 pass
+
+    def _revoke_all_capabilities(self) -> None:
+        self._issuance_authority.cancel()
 
     @property
     def auth_mode(self) -> str:
@@ -558,15 +695,14 @@ class ControllerAuthHelper:
         _request_nonce: str | None = None,
     ) -> ProviderAuthCapability:
         """Return a short-lived task-bound SubscriptionAuthCapability over IPC."""
-        with self._ipc_lock:
-            return self._get_auth_capability_locked(
-                task_id, generation, attempt_id, launch_nonce, provider_id,
-                upstream_scheme=upstream_scheme,
-                upstream_host=upstream_host,
-                upstream_port=upstream_port,
-                provider_purpose=provider_purpose,
-                request_nonce=_request_nonce or secrets.token_hex(16),
-            )
+        return self._get_auth_capability_locked(
+            task_id, generation, attempt_id, launch_nonce, provider_id,
+            upstream_scheme=upstream_scheme,
+            upstream_host=upstream_host,
+            upstream_port=upstream_port,
+            provider_purpose=provider_purpose,
+            request_nonce=_request_nonce or secrets.token_hex(16),
+        )
 
     def _get_auth_capability_locked(
         self,
@@ -582,6 +718,11 @@ class ControllerAuthHelper:
         provider_purpose: str,
         request_nonce: str,
     ) -> ProviderAuthCapability:
+        context_key = (
+            task_id, generation, attempt_id, launch_nonce, provider_id,
+            upstream_scheme, upstream_host, upstream_port, provider_purpose,
+        )
+        issuance_state = self._issuance_state_for(context_key)
         req = {
             "action": "GET_TASK_PROVIDER_CAPABILITY",
             "request_nonce": request_nonce,
@@ -595,75 +736,77 @@ class ControllerAuthHelper:
             "upstream_port": upstream_port,
             "provider_purpose": provider_purpose,
         }
-        resp = self._send_ipc(req)
-        if resp.get("status") != "OK":
-            err = resp.get("error", "UNKNOWN_ERROR")
-            if err in (
-                "TASK_CAPABILITY_CANCELLED",
-                "PROVIDER_AUTH_UNAVAILABLE",
-                "REPLAYED_CAPABILITY_REQUEST",
-                "CAPABILITY_ISSUANCE_LIMIT",
-                "REPLAY_CACHE_EXHAUSTED",
-                "ATTEMPT_CONTEXT_EXHAUSTED",
-            ):
-                raise RuntimeError(f"Auth capability request denied: {err}")
-            raise ValueError(f"Auth capability request failed: {err}")
+        with issuance_state.transaction():
+            resp = self._send_ipc(req)
+            if resp.get("status") != "OK":
+                err = resp.get("error", "UNKNOWN_ERROR")
+                if err in (
+                    "TASK_CAPABILITY_CANCELLED",
+                    "PROVIDER_AUTH_UNAVAILABLE",
+                    "REPLAYED_CAPABILITY_REQUEST",
+                    "CAPABILITY_ISSUANCE_LIMIT",
+                    "REPLAY_CACHE_EXHAUSTED",
+                    "ATTEMPT_CONTEXT_EXHAUSTED",
+                ):
+                    raise RuntimeError(f"Auth capability request denied: {err}")
+                raise ValueError(f"Auth capability request failed: {err}")
 
-        expected_response = {
-            "request_nonce": request_nonce,
-            "task_id": task_id,
-            "generation": generation,
-            "attempt_id": attempt_id,
-            "launch_nonce": launch_nonce,
-            "provider_id": provider_id,
-            "upstream_scheme": upstream_scheme,
-            "upstream_host": upstream_host,
-            "upstream_port": upstream_port,
-            "provider_purpose": provider_purpose,
-        }
-        if any(resp.get(name) != value for name, value in expected_response.items()):
-            raise ValueError("Auth capability response binding mismatch")
-        context_key = (
-            task_id, generation, attempt_id, launch_nonce, provider_id,
-            upstream_scheme, upstream_host, upstream_port, provider_purpose,
-        )
-        expected_sequence = self._attempt_sequences.get(context_key, 0) + 1
-        now = int(time.time())
-        if (
-            self._process_identity is None
-            or resp.get("helper_epoch") != self._process_identity.helper_epoch
-            or resp.get("capability_sequence") != expected_sequence
-            or type(resp.get("issued_at")) is not int
-            or type(resp.get("expires_at")) is not int
-            or not resp["issued_at"] <= now + 1
-            or not resp["issued_at"] < resp["expires_at"] <= resp["issued_at"] + 300
-            or type(resp.get("capability_nonce")) is not str
-            or not re.fullmatch(r"[0-9a-f]{32}", resp["capability_nonce"])
-        ):
-            raise ValueError("Auth capability response issuance mismatch")
-        self._attempt_sequences[context_key] = expected_sequence
-        binding = ProviderAuthBinding(
-            task_id=resp["task_id"],
-            generation=resp["generation"],
-            attempt_id=resp["attempt_id"],
-            launch_nonce=resp["launch_nonce"],
-            provider_id=resp["provider_id"],
-            upstream_scheme=resp["upstream_scheme"],
-            upstream_host=resp["upstream_host"],
-            upstream_port=resp["upstream_port"],
-            provider_purpose=resp["provider_purpose"],
-            helper_epoch=resp["helper_epoch"],
-            request_nonce=resp["request_nonce"],
-            capability_nonce=resp["capability_nonce"],
-            capability_sequence=resp["capability_sequence"],
-            issued_at=resp["issued_at"],
-            expires_at=resp["expires_at"],
-        )
-        return SubscriptionAuthCapability(
-            access_token=resp["access_token"],
-            account_id=resp.get("account_id"),
-            binding=binding,
-        )
+            expected_response = {
+                "request_nonce": request_nonce,
+                "task_id": task_id,
+                "generation": generation,
+                "attempt_id": attempt_id,
+                "launch_nonce": launch_nonce,
+                "provider_id": provider_id,
+                "upstream_scheme": upstream_scheme,
+                "upstream_host": upstream_host,
+                "upstream_port": upstream_port,
+                "provider_purpose": provider_purpose,
+            }
+            if any(
+                resp.get(name) != value for name, value in expected_response.items()
+            ):
+                raise ValueError("Auth capability response binding mismatch")
+            expected_sequence = self._attempt_sequences.get(context_key, 0) + 1
+            now = int(time.time())
+            if (
+                resp.get("helper_epoch") != self._process_identity.helper_epoch
+                or resp.get("capability_sequence") != expected_sequence
+                or type(resp.get("issued_at")) is not int
+                or type(resp.get("expires_at")) is not int
+                or not resp["issued_at"] <= now + 1
+                or not resp["issued_at"]
+                < resp["expires_at"]
+                <= resp["issued_at"] + 300
+                or type(resp.get("capability_nonce")) is not str
+                or not re.fullmatch(r"[0-9a-f]{32}", resp["capability_nonce"])
+            ):
+                raise ValueError("Auth capability response issuance mismatch")
+            binding = ProviderAuthBinding(
+                task_id=resp["task_id"],
+                generation=resp["generation"],
+                attempt_id=resp["attempt_id"],
+                launch_nonce=resp["launch_nonce"],
+                provider_id=resp["provider_id"],
+                upstream_scheme=resp["upstream_scheme"],
+                upstream_host=resp["upstream_host"],
+                upstream_port=resp["upstream_port"],
+                provider_purpose=resp["provider_purpose"],
+                helper_epoch=resp["helper_epoch"],
+                request_nonce=resp["request_nonce"],
+                capability_nonce=resp["capability_nonce"],
+                capability_sequence=resp["capability_sequence"],
+                issued_at=resp["issued_at"],
+                expires_at=resp["expires_at"],
+            )
+            issuance_state.advance(binding)
+            self._attempt_sequences[context_key] = expected_sequence
+            return SubscriptionAuthCapability(
+                access_token=resp["access_token"],
+                account_id=resp.get("account_id"),
+                binding=binding,
+                _issuance_state=issuance_state,
+            )
 
     def cancel_task(
         self,
@@ -679,24 +822,31 @@ class ControllerAuthHelper:
         provider_purpose: str = "responses_sse",
     ) -> None:
         """Revoke one exact attempt context in the auth helper process."""
-        response = self._send_ipc(
-            {
-                "action": "CANCEL_ATTEMPT",
-                "task_id": task_id,
-                "generation": generation,
-                "attempt_id": attempt_id,
-                "launch_nonce": launch_nonce,
-                "provider_id": provider_id,
-                "upstream_scheme": upstream_scheme,
-                "upstream_host": upstream_host,
-                "upstream_port": upstream_port,
-                "provider_purpose": provider_purpose,
-            }
+        context_key = (
+            task_id, generation, attempt_id, launch_nonce, provider_id,
+            upstream_scheme, upstream_host, upstream_port, provider_purpose,
         )
-        if response.get("status") != "OK":
-            raise RuntimeError(
-                f"Auth capability cancellation denied: {response.get('error', 'UNKNOWN_ERROR')}"
+        issuance_state = self._issuance_state_for(context_key)
+        with issuance_state.transaction():
+            response = self._send_ipc(
+                {
+                    "action": "CANCEL_ATTEMPT",
+                    "task_id": task_id,
+                    "generation": generation,
+                    "attempt_id": attempt_id,
+                    "launch_nonce": launch_nonce,
+                    "provider_id": provider_id,
+                    "upstream_scheme": upstream_scheme,
+                    "upstream_host": upstream_host,
+                    "upstream_port": upstream_port,
+                    "provider_purpose": provider_purpose,
+                }
             )
+            if response.get("status") != "OK":
+                raise RuntimeError(
+                    f"Auth capability cancellation denied: {response.get('error', 'UNKNOWN_ERROR')}"
+                )
+            issuance_state.cancel()
 
     def register_broker(self, broker: Any) -> None:
         """Register a live broker whose slot is bound to this helper epoch."""
@@ -705,7 +855,7 @@ class ControllerAuthHelper:
 
     def replace_broker_auth_capability(self, broker: Any) -> ProviderAuthCapability:
         """Issue and atomically install the next capability for a live broker."""
-        with self._ipc_lock:
+        with self._broker_operation_lock:
             self.register_broker(broker)
             policy = broker.policy
             context_key = (
@@ -734,19 +884,20 @@ class ControllerAuthHelper:
 
     def cancel_broker_auth_capability(self, broker: Any) -> None:
         """Cancel the exact helper context before atomically revoking the broker."""
-        policy = broker.policy
-        self.cancel_task(
-            policy.task_id,
-            policy.generation,
-            policy.attempt_id,
-            policy.launch_nonce,
-            policy.upstream_provider_id,
-            upstream_scheme=policy.upstream_scheme,
-            upstream_host=policy.upstream_host,
-            upstream_port=policy.upstream_port,
-            provider_purpose="responses_sse",
-        )
-        broker.cancel_auth_capability()
+        with self._broker_operation_lock:
+            policy = broker.policy
+            self.cancel_task(
+                policy.task_id,
+                policy.generation,
+                policy.attempt_id,
+                policy.launch_nonce,
+                policy.upstream_provider_id,
+                upstream_scheme=policy.upstream_scheme,
+                upstream_host=policy.upstream_host,
+                upstream_port=policy.upstream_port,
+                provider_purpose="responses_sse",
+            )
+            broker.cancel_auth_capability()
 
     def trigger_refresh_failure(self) -> None:
         """Trigger simulated refresh rejection in daemon for failure testing."""
@@ -778,6 +929,7 @@ class ControllerAuthHelper:
     def stop(self) -> None:
         """Stop auth helper daemon process and clean up private temp state."""
         self._revoke_registered_brokers()
+        self._revoke_all_capabilities()
         self._registered_brokers.clear()
         if self._ipc_endpoint:
             try:

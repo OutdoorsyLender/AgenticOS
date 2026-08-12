@@ -7,7 +7,9 @@ import hashlib
 import ipaddress
 import json
 import re
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 
@@ -150,6 +152,92 @@ class SyntheticBearerAuth(ProviderAuthCapability):
         return SecretValue(f"Bearer {self._canary_token}")
 
 
+class CapabilityIssuanceAuthority:
+    """One helper-epoch lock and active flag shared by every attempt state."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.active = True
+
+    def cancel(self) -> None:
+        with self.lock:
+            self.active = False
+
+
+class CapabilityIssuanceState:
+    """Trusted controller state shared by every materialized attempt capability."""
+
+    def __init__(
+        self,
+        context: tuple[object, ...],
+        helper_epoch: str,
+        authority: CapabilityIssuanceAuthority,
+    ) -> None:
+        if not isinstance(authority, CapabilityIssuanceAuthority):
+            raise TypeError("authority must be CapabilityIssuanceAuthority")
+        self._context = context
+        self._helper_epoch = helper_epoch
+        self._current_sequence = 0
+        self._active = True
+        self._authority = authority
+
+    @contextmanager
+    def transaction(self):
+        """Linearize helper issuance/cancellation with broker consumption."""
+        with self._authority.lock:
+            yield self
+
+    @contextmanager
+    def validate_transaction(self, binding: ProviderAuthBinding):
+        """Hold current/active state across credential extraction and injection."""
+        with self._authority.lock:
+            self._validate_locked(binding)
+            yield
+
+    def advance(self, binding: ProviderAuthBinding) -> None:
+        if not self._active:
+            raise ProviderAuthBindingError("PROVIDER_AUTH_CANCELLED")
+        if (
+            self._binding_context(binding) != self._context
+            or binding.helper_epoch != self._helper_epoch
+            or binding.capability_sequence != self._current_sequence + 1
+        ):
+            raise ProviderAuthBindingError("PROVIDER_AUTH_SEQUENCE_REJECTED")
+        self._current_sequence = binding.capability_sequence
+
+    def cancel(self) -> None:
+        with self._authority.lock:
+            self._active = False
+
+    def validate(self, binding: ProviderAuthBinding) -> None:
+        with self._authority.lock:
+            self._validate_locked(binding)
+
+    def _validate_locked(self, binding: ProviderAuthBinding) -> None:
+        if not self._active or not self._authority.active:
+            raise ProviderAuthBindingError("PROVIDER_AUTH_CANCELLED")
+        if (
+            self._binding_context(binding) != self._context
+            or binding.helper_epoch != self._helper_epoch
+            or binding.capability_sequence != self._current_sequence
+        ):
+            raise ProviderAuthBindingError("PROVIDER_AUTH_SEQUENCE_REJECTED")
+
+    @staticmethod
+    def _binding_context(binding: ProviderAuthBinding) -> tuple[object, ...]:
+        return (
+            binding.task_id,
+            binding.generation,
+            binding.attempt_id,
+            binding.launch_nonce,
+            binding.provider_id,
+            binding.upstream_scheme,
+            binding.upstream_host,
+            binding.upstream_port,
+            binding.provider_purpose,
+        )
+
+
 @dataclass(frozen=True, slots=True, init=False, repr=False)
 class SubscriptionAuthCapability(ProviderAuthCapability):
     """Auth capability supporting bearer access token and optional ChatGPT account ID."""
@@ -157,6 +245,7 @@ class SubscriptionAuthCapability(ProviderAuthCapability):
     _access_token: SecretValue
     _account_id: SecretValue | None
     binding: ProviderAuthBinding
+    _issuance_state: CapabilityIssuanceState | None
 
     def __init__(
         self,
@@ -164,6 +253,7 @@ class SubscriptionAuthCapability(ProviderAuthCapability):
         account_id: str | None = None,
         *,
         binding: ProviderAuthBinding,
+        _issuance_state: CapabilityIssuanceState,
     ) -> None:
         if not isinstance(access_token, str) or not access_token.strip():
             raise ValueError("access_token must be a non-empty string")
@@ -171,9 +261,12 @@ class SubscriptionAuthCapability(ProviderAuthCapability):
             raise ValueError("account_id must be a non-empty string or None")
         if not isinstance(binding, ProviderAuthBinding):
             raise TypeError("binding must be a ProviderAuthBinding instance")
+        if not isinstance(_issuance_state, CapabilityIssuanceState):
+            raise TypeError("trusted issuance state is required")
         object.__setattr__(self, "_access_token", SecretValue(access_token))
         object.__setattr__(self, "_account_id", SecretValue(account_id) if account_id is not None else None)
         object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "_issuance_state", _issuance_state)
 
     def get_auth_header(self, task_id: str, generation: int) -> SecretValue:
         return SecretValue(f"Bearer {self._access_token.reveal_secret()}")
@@ -205,6 +298,13 @@ class SubscriptionAuthCapability(ProviderAuthCapability):
             raise TypeError("now must be an int, float, or None")
         if any(actual != required for actual, required in expected) or current_time >= binding.expires_at:
             raise ProviderAuthBindingError("PROVIDER_AUTH_BINDING_REJECTED")
+        self._issuance_state.validate(binding)
+
+    @contextmanager
+    def consumption_transaction(self):
+        """Keep helper issuance state current through upstream injection."""
+        with self._issuance_state.validate_transaction(self.binding):
+            yield
 
 
 def _require_positive_int(name: str, value: object) -> None:

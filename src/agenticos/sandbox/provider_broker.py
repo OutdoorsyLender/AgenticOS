@@ -8,6 +8,7 @@ import select
 import time
 import uuid
 import threading
+from contextlib import nullcontext
 from typing import Callable, Tuple
 
 from .provider_models import (
@@ -102,16 +103,22 @@ class _AtomicCapabilitySlot:
             if not self._active or self._capability is None:
                 raise ProviderAuthBindingError("PROVIDER_AUTH_CANCELLED")
             capability = self._capability
-            capability.validate_for_policy(policy)
-            if isinstance(capability, SubscriptionAuthCapability):
-                binding = capability.binding
-                if binding.helper_epoch != self._helper_epoch:
-                    raise ProviderAuthBindingError("PROVIDER_AUTH_EPOCH_REJECTED")
-                if binding.capability_sequence != self._sequence:
-                    raise ProviderAuthBindingError("PROVIDER_AUTH_SEQUENCE_REJECTED")
-            auth_value = capability.get_auth_header(policy.task_id, policy.generation)
-            extra_headers = capability.get_extra_headers(policy.task_id, policy.generation)
-            sender(auth_value, extra_headers)
+            transaction = (
+                capability.consumption_transaction()
+                if isinstance(capability, SubscriptionAuthCapability)
+                else nullcontext()
+            )
+            with transaction:
+                capability.validate_for_policy(policy)
+                if isinstance(capability, SubscriptionAuthCapability):
+                    binding = capability.binding
+                    if binding.helper_epoch != self._helper_epoch:
+                        raise ProviderAuthBindingError("PROVIDER_AUTH_EPOCH_REJECTED")
+                    if binding.capability_sequence != self._sequence:
+                        raise ProviderAuthBindingError("PROVIDER_AUTH_SEQUENCE_REJECTED")
+                auth_value = capability.get_auth_header(policy.task_id, policy.generation)
+                extra_headers = capability.get_extra_headers(policy.task_id, policy.generation)
+                sender(auth_value, extra_headers)
 
 _CLIENT_FORBIDDEN_HEADERS = {
     "authorization",

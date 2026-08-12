@@ -33,9 +33,19 @@ def _auth_data() -> dict[str, object]:
     }
 
 
+def _storage_contract(tmp_path: Path) -> tuple[str, ...]:
+    hostile_root = tmp_path / "declared-hostile-root"
+    hostile_root.mkdir(exist_ok=True)
+    return (str(hostile_root),)
+
+
 def test_auth_root_and_file_are_owner_only_and_identity_bound(tmp_path: Path) -> None:
     auth_root = tmp_path / "auth-private"
-    with ControllerAuthHelper(_auth_data(), private_dir=str(auth_root)) as helper:
+    with ControllerAuthHelper(
+        _auth_data(),
+        private_dir=str(auth_root),
+        forbidden_storage_roots=_storage_contract(tmp_path),
+    ) as helper:
         root_metadata = auth_root.stat()
         auth_metadata = (auth_root / "auth.json").stat()
         identity = helper.process_identity
@@ -74,20 +84,72 @@ def test_auth_root_symlink_and_non_directory_are_rejected(tmp_path: Path) -> Non
     symlink = tmp_path / "auth-link"
     symlink.symlink_to(actual, target_is_directory=True)
     with pytest.raises(RuntimeError, match="auth root"):
-        ControllerAuthHelper(_auth_data(), private_dir=str(symlink))
+        ControllerAuthHelper(
+            _auth_data(), private_dir=str(symlink),
+            forbidden_storage_roots=_storage_contract(tmp_path),
+        )
 
     regular = tmp_path / "not-a-directory"
     regular.write_text("x", encoding="ascii")
     with pytest.raises(RuntimeError, match="auth root"):
-        ControllerAuthHelper(_auth_data(), private_dir=str(regular))
+        ControllerAuthHelper(
+            _auth_data(), private_dir=str(regular),
+            forbidden_storage_roots=_storage_contract(tmp_path),
+        )
 
     symlink_parent = tmp_path / "parent-link"
     symlink_parent.symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(RuntimeError, match="auth root"):
         ControllerAuthHelper(
-            _auth_data(), private_dir=str(symlink_parent / "through-link")
+            _auth_data(), private_dir=str(symlink_parent / "through-link"),
+            forbidden_storage_roots=_storage_contract(tmp_path),
         )
     assert not (tmp_path / "through-link" / "auth.json").exists()
+
+
+def test_auth_storage_cannot_overlap_a_repository_or_worktree(tmp_path: Path) -> None:
+    repository = tmp_path / "hostile-worktree"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+
+    with pytest.raises(RuntimeError, match="repository or worktree"):
+        ControllerAuthHelper(
+            _auth_data(), private_dir=str(repository / "auth-private"),
+            forbidden_storage_roots=(str(repository),),
+        )
+
+    source = repository / "persistent-auth.json"
+    source.write_text(json.dumps(_auth_data()), encoding="utf-8")
+    os.chmod(source, 0o600)
+    with pytest.raises(RuntimeError, match="repository or worktree"):
+        ControllerAuthHelper(str(source), forbidden_storage_roots=(str(repository),))
+
+    nongit_workspace = tmp_path / "nongit-hostile-workspace"
+    nongit_workspace.mkdir()
+    with pytest.raises(RuntimeError, match="hostile root"):
+        ControllerAuthHelper(
+            _auth_data(),
+            private_dir=str(nongit_workspace / "auth-private"),
+            forbidden_storage_roots=(str(nongit_workspace),),
+        )
+
+
+def test_persistent_auth_source_rejects_symlink_and_broad_mode(tmp_path: Path) -> None:
+    source = tmp_path / "persistent-auth.json"
+    source.write_text(json.dumps(_auth_data()), encoding="utf-8")
+    os.chmod(source, 0o644)
+    with pytest.raises(RuntimeError, match="owner-only regular file"):
+        ControllerAuthHelper(
+            str(source), forbidden_storage_roots=_storage_contract(tmp_path)
+        )
+
+    os.chmod(source, 0o600)
+    link = tmp_path / "auth-link.json"
+    link.symlink_to(source)
+    with pytest.raises(RuntimeError, match="owner-only regular file"):
+        ControllerAuthHelper(
+            str(link), forbidden_storage_roots=_storage_contract(tmp_path)
+        )
 
 
 def test_auth_root_path_replacement_race_fails_closed(tmp_path: Path) -> None:
@@ -107,6 +169,7 @@ def test_auth_root_path_replacement_race_fails_closed(tmp_path: Path) -> None:
         ControllerAuthHelper(
             _auth_data(),
             private_dir=str(auth_root),
+            forbidden_storage_roots=_storage_contract(tmp_path),
             _test_auth_root_mutator=replace_after_identity,
         )
 
@@ -120,6 +183,7 @@ def test_landlock_ready_evidence_and_post_policy_runtime(tmp_path: Path) -> None
     with ControllerAuthHelper(
         _auth_data(),
         private_dir=str(auth_root),
+        forbidden_storage_roots=_storage_contract(tmp_path),
         _test_denied_probe_paths=(str(denied), "/proc/self/status"),
         _test_allowed_probe_name="allowed.txt",
     ) as helper:
@@ -203,7 +267,11 @@ def test_pre_spawn_provisioning_failure_leaves_no_fd_root_or_partial_secret(
         "tokens": {"access_token": "SYNTHETIC_PARTIAL", "bad": object()},
     }
     with pytest.raises(TypeError):
-        ControllerAuthHelper(unserializable, private_dir=str(external_root))
+        ControllerAuthHelper(
+            unserializable,
+            private_dir=str(external_root),
+            forbidden_storage_roots=_storage_contract(tmp_path),
+        )
     assert open_fds() == before_fds
     assert external_root.is_dir()
     assert not (external_root / "auth.json").exists()
@@ -248,6 +316,7 @@ def test_real_helper_denies_auth_root_symlink_escape(tmp_path: Path) -> None:
     with ControllerAuthHelper(
         _auth_data(),
         private_dir=str(auth_root),
+        forbidden_storage_roots=_storage_contract(tmp_path),
         _test_denied_probe_paths=(str(auth_root / "escape"),),
     ) as helper:
         assert helper._filesystem_probe_results == (
@@ -362,6 +431,7 @@ def test_controller_supplied_auth_file_defects_are_rejected_before_ready(
         ControllerAuthHelper(
             _auth_data(),
             private_dir=str(auth_root),
+            forbidden_storage_roots=_storage_contract(tmp_path),
             _test_auth_root_mutator=damage_auth_file,
         )
 
