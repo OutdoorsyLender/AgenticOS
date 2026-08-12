@@ -538,16 +538,33 @@ def _adoption_fixture(tmp_path, *, policy=None, hostname="cdn.example.com",
         hostnames=(hostname,),
         policy_digest=policy_digest(policy),
     )
+    for attribute in (
+        "ca_cert_fd",
+        "leaf_cert_fd",
+        "leaf_key_fd",
+        "binding_fd",
+    ):
+        source = getattr(material, attribute)
+        staged = fcntl.fcntl(source, fcntl.F_DUPFD_CLOEXEC, 100)
+        os.close(source)
+        setattr(material, attribute, staged)
     changes = dict(network_policy_changes or {})
     network_policy = _network_policy(
         policy, changes.pop("hostname", hostname),
         changes.pop("ca_digest", material.binding.ca_cert_sha256),
         **changes,
     )
-    network_policy_fd = create_sealed_network_policy_fd(network_policy)
+    network_policy_source = create_sealed_network_policy_fd(network_policy)
+    network_policy_fd = fcntl.fcntl(
+        network_policy_source, fcntl.F_DUPFD_CLOEXEC, 100
+    )
+    os.close(network_policy_source)
     installed = []
     try:
-        installed.append(_move_fd(create_sealed_policy_fd(policy), 30))
+        policy_source = create_sealed_policy_fd(policy)
+        policy_fd = fcntl.fcntl(policy_source, fcntl.F_DUPFD_CLOEXEC, 100)
+        os.close(policy_source)
+        installed.append(_move_fd(policy_fd, 30))
         for target in (31, 32, 33):
             pair = socket.socketpair()
             keep, drop = pair[0].detach(), pair[1].detach()
@@ -575,6 +592,31 @@ def _cleanup_installed(installed):
             os.close(fd)
         except OSError:
             pass
+
+
+def test_adoption_fixture_stages_material_away_from_fixed_roles(
+    tmp_path, monkeypatch
+):
+    moves = []
+    original_move_fd = _move_fd
+
+    def recording_move_fd(fd, target):
+        moves.append((fd, target))
+        return original_move_fd(fd, target)
+
+    monkeypatch.setattr(sys.modules[__name__], "_move_fd", recording_move_fd)
+    _policy, _material, _network_policy, _contract, installed = (
+        _adoption_fixture(tmp_path)
+    )
+    try:
+        material_targets = {30, 36, 37, 38, 39, 43}
+        assert all(
+            source >= 100
+            for source, target in moves
+            if target in material_targets
+        )
+    finally:
+        _cleanup_installed(installed)
 
 
 def test_broker_adopts_https_material_and_proves_source_closure(tmp_path):
@@ -1922,13 +1964,21 @@ def test_serve_connection_limit_terminates(tmp_path, serve_leaf_material):
     )
     try:
         first = _tcp_worker()
-        second = _tcp_worker()
-        second.settimeout(5.0)
-        # The over-limit connection is aborted and the broker terminates.
         try:
-            assert second.recv(64) == b""
-        except OSError:
-            pass
+            second = _tcp_worker()
+        except OSError as exc:
+            # Linux may surface the broker's immediate abort during connect()
+            # instead of returning a connected socket whose first read resets.
+            assert exc.errno in {errno.EPIPE, errno.ECONNRESET}
+        else:
+            second.settimeout(5.0)
+            # The over-limit connection is aborted and the broker terminates.
+            try:
+                assert second.recv(64) == b""
+            except OSError:
+                pass
+            finally:
+                second.close()
         packets = _read_evidence_packets(serve.control_peer, 1)
         terminal = _join_serve_transport(serve)
         assert (
