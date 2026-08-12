@@ -187,7 +187,7 @@ class SubscriptionAuthCapability(ProviderAuthCapability):
     def validate_for_policy(
         self, policy: ProviderBrokerPolicy, now: int | float | None = None
     ) -> None:
-        super().validate_for_policy(policy, now)
+        ProviderAuthCapability.validate_for_policy(self, policy, now)
         binding = self.binding
         expected = (
             (binding.task_id, policy.task_id),
