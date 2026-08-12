@@ -1,4 +1,4 @@
-"""Unit test suite for controller auth helper and subscription auth capability."""
+"""Unit test suite for out-of-process controller auth helper and subscription auth capability."""
 
 import json
 import pytest
@@ -36,20 +36,26 @@ def test_controller_auth_helper_dict_init() -> None:
             "expires_at": 1900000000,
         },
     }
-    helper = ControllerAuthHelper(auth_data)
-    assert helper.auth_mode == "chatgpt"
-    assert helper.account_id == "acct_test_789"
-    assert helper.is_expired is False
+    with ControllerAuthHelper(auth_data) as helper:
+        assert helper.auth_mode == "chatgpt"
+        assert helper.account_id == "acct_test_789"
+        assert helper.is_expired is False
 
-    cap = helper.get_auth_capability("task-99", 1)
-    assert isinstance(cap, SubscriptionAuthCapability)
-    assert cap.get_auth_header("task-99", 1).reveal_secret() == "Bearer SYNTHETIC_ACCESS_ABC"
-    assert cap.get_extra_headers("task-99", 1)["ChatGPT-Account-ID"].reveal_secret() == "acct_test_789"
+        # Process identity checks
+        proc_id = helper.process_identity
+        assert proc_id.pid != 0
+        assert proc_id.executable_digest != ""
+        assert "auth.json" not in proc_id.cwd
 
-    # Test token refresh
-    helper.refresh_access_token("SYNTHETIC_ACCESS_NEW_XYZ")
-    new_cap = helper.get_auth_capability("task-99", 1)
-    assert new_cap.get_auth_header("task-99", 1).reveal_secret() == "Bearer SYNTHETIC_ACCESS_NEW_XYZ"
+        cap = helper.get_auth_capability("task-99", 1, launch_nonce="a1b2c3d4e5f60718293a4b5c6d7e8f90")
+        assert isinstance(cap, SubscriptionAuthCapability)
+        assert cap.get_auth_header("task-99", 1).reveal_secret() == "Bearer SYNTHETIC_ACCESS_ABC"
+        assert cap.get_extra_headers("task-99", 1)["ChatGPT-Account-ID"].reveal_secret() == "acct_test_789"
+
+        # Test token refresh and new capability request with distinct nonce
+        helper.refresh_access_token("SYNTHETIC_ACCESS_NEW_XYZ")
+        new_cap = helper.get_auth_capability("task-99", 2, launch_nonce="c9d8e7f6a5b403211234567890abcdef")
+        assert new_cap.get_auth_header("task-99", 2).reveal_secret() == "Bearer SYNTHETIC_ACCESS_NEW_XYZ"
 
 
 def test_controller_auth_helper_file_init(tmp_path) -> None:
@@ -67,13 +73,13 @@ def test_controller_auth_helper_file_init(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    helper = ControllerAuthHelper(str(auth_file))
-    assert helper.auth_mode == "chatgpt"
-    assert helper.account_id is None
+    with ControllerAuthHelper(str(auth_file)) as helper:
+        assert helper.auth_mode == "chatgpt"
+        assert helper.account_id is None
 
-    cap = helper.get_auth_capability("task-1", 1)
-    assert cap.get_auth_header("task-1", 1).reveal_secret() == "Bearer FILE_ACCESS_TOKEN_111"
-    assert cap.get_extra_headers("task-1", 1) == {}
+        cap = helper.get_auth_capability("task-1", 1, launch_nonce="f1e2d3c4b5a60718293a4b5c6d7e8f90")
+        assert cap.get_auth_header("task-1", 1).reveal_secret() == "Bearer FILE_ACCESS_TOKEN_111"
+        assert cap.get_extra_headers("task-1", 1) == {}
 
 
 def test_controller_auth_helper_invalid_schema() -> None:

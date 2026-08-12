@@ -40,7 +40,7 @@ implement → test → relevant/adversarial review → inspect diff
 - **Git authority.** Use Windows Git for `C:\AgenticOS` and WSL Git for
   `~/src/AgenticOS`. Never judge the Windows tree through WSL Git at
   `/mnt/c/AgenticOS` — CRLF/autocrlf differences make that view lie.
-- **Cross-clone synchronization.** Cross-clone synchronization must strictly use verified fast-forward operations (`git fetch --prune origin && git merge --ff-only origin/main` or `git pull --ff-only origin main`). Never use `git reset --hard` to synchronize clones.
+- **Cross-clone synchronization.** Cross-clone synchronization must strictly use verified fast-forward operations (`git fetch --prune origin && git merge --ff-only origin/main` or `git pull --ff-only origin main`). Never use `git reset --hard`, `git checkout -- .`, `git restore .`, or `git clean` to synchronize clones or make an authoritative clone match another clone. An authoritative clone must never be made disposable; cross-platform qualification must use dedicated temporary test worktrees or candidate commits.
 - **Existing work wins over recreation.** Modified files, untracked
   source/evidence, spikes, or local commits: establish provenance first,
   preserve valid work through an intentional commit, never recreate work

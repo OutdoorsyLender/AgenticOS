@@ -1,7 +1,9 @@
 """Integration and canary security test suite for ChatGPT subscription authentication flow."""
 
 import http.server
+import os
 import socketserver
+import sys
 import threading
 import urllib.request
 import pytest
@@ -104,32 +106,54 @@ def test_chatgpt_subscription_auth_injection_flow(fake_chatgpt_upstream: Tuple[s
             "account_id": CANARY_ACCT,
         },
     }
-    auth_helper = ControllerAuthHelper(auth_data)
-    auth_cap = auth_helper.get_auth_capability(policy.task_id, policy.generation)
 
-    broker = TaskProviderBroker(policy, auth_cap)
-    grant = broker.start()
+    with ControllerAuthHelper(auth_data) as auth_helper:
+        auth_cap = auth_helper.get_auth_capability(
+            policy.task_id,
+            policy.generation,
+            policy.attempt_id,
+            policy.launch_nonce,
+        )
 
-    try:
-        req_url = f"http://{grant.listener_address}:{grant.listener_port}/backend-api/codex/responses"
-        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        broker = TaskProviderBroker(policy, auth_cap)
+        grant = broker.start()
 
-        req = urllib.request.Request(req_url, data=b'{"prompt":"test"}', headers=headers, method="POST")
-        with urllib.request.urlopen(req) as resp:
-            assert resp.status == 200
-            resp_body = resp.read().decode("utf-8")
+        try:
+            req_url = f"http://{grant.listener_address}:{grant.listener_port}/backend-api/codex/responses"
+            headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
 
-        # Verify upstream received access token and account ID
-        assert FakeChatGPTUpstreamHandler.received_authorization == f"Bearer {CANARY_ACCESS}"
-        assert FakeChatGPTUpstreamHandler.received_account_id == CANARY_ACCT
-        assert FakeChatGPTUpstreamHandler.received_path == "/backend-api/codex/responses"
+            req = urllib.request.Request(req_url, data=b'{"prompt":"test"}', headers=headers, method="POST")
+            with urllib.request.urlopen(req) as resp:
+                assert resp.status == 200
+                resp_body = resp.read().decode("utf-8")
 
-        # Expanded Canary Isolation Assertions
-        for canary in (CANARY_REFRESH, CANARY_ACCESS, CANARY_ACCT, CANARY_COOKIE):
-            assert canary not in resp_body
-            assert canary not in repr(broker.get_evidence())
-            assert canary not in repr(broker.grant)
-            assert canary not in repr(broker.identity)
+            # Verify upstream received access token and account ID
+            assert FakeChatGPTUpstreamHandler.received_authorization == f"Bearer {CANARY_ACCESS}"
+            assert FakeChatGPTUpstreamHandler.received_account_id == CANARY_ACCT
+            assert FakeChatGPTUpstreamHandler.received_path == "/backend-api/codex/responses"
 
-    finally:
-        broker.stop()
+            # Expanded Canary Isolation Assertions
+            for canary in (CANARY_REFRESH, CANARY_ACCESS, CANARY_ACCT, CANARY_COOKIE):
+                assert canary not in resp_body
+                assert canary not in repr(broker.get_evidence())
+                assert canary not in repr(broker.grant)
+                assert canary not in repr(broker.identity)
+
+            # Explicit invariant: refresh secret visible count outside auth helper process domain
+            refresh_secret_visible_outside_auth_helper = 0
+            for surface in (
+                " ".join(sys.argv),
+                str(dict(os.environ)),
+                resp_body,
+                repr(broker.get_evidence()),
+                repr(broker.grant),
+                repr(broker.identity),
+                repr(auth_helper.process_identity),
+            ):
+                if CANARY_REFRESH in surface:
+                    refresh_secret_visible_outside_auth_helper += 1
+
+            assert refresh_secret_visible_outside_auth_helper == 0
+
+        finally:
+            broker.stop()

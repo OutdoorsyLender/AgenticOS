@@ -238,6 +238,36 @@ class ProviderBrokerIdentity:
 
 
 @dataclass(frozen=True)
+class AuthHelperProcessIdentity:
+    """Host process identity snapshot for the out-of-process auth helper process."""
+
+    pid: int
+    executable: str
+    executable_digest: str
+    cwd: str
+    env_keys: tuple[str, ...]
+    open_fd_count: int
+    ipc_endpoint: str
+    parent_pid: int
+    started_at_monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        _require_positive_int("pid", self.pid)
+        if not isinstance(self.executable, str) or not self.executable:
+            raise ValueError("executable must be a non-empty string")
+        if not isinstance(self.executable_digest, str) or not _LOWER_HEX_64_RE.fullmatch(self.executable_digest):
+            raise ValueError("executable_digest must be 64 lowercase hex characters")
+        if not isinstance(self.cwd, str) or not self.cwd:
+            raise ValueError("cwd must be a non-empty string")
+        if not isinstance(self.ipc_endpoint, str) or not self.ipc_endpoint:
+            raise ValueError("ipc_endpoint must be a non-empty string")
+        _require_positive_int("parent_pid", self.parent_pid)
+        _require_positive_int("started_at_monotonic_ns", self.started_at_monotonic_ns)
+        _require_non_negative_int("open_fd_count", self.open_fd_count)
+
+
+
+@dataclass(frozen=True)
 class ProviderBrokerEvidence:
     """Immutable evidence record summarizing provider broker execution for a task attempt."""
 
@@ -325,6 +355,7 @@ def provider_policy_digest(policy: ProviderBrokerPolicy) -> str:
 
 
 __all__ = [
+    "AuthHelperProcessIdentity",
     "NetworkAuthority",
     "ProviderAuthCapability",
     "ProviderBrokerEvidence",
