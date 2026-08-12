@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -20,6 +21,7 @@ from typing import Any, Dict, Optional
 from .provider_models import (
     AuthHelperProcessIdentity,
     ProviderAuthCapability,
+    ProviderAuthBinding,
     SecretValue,
     SubscriptionAuthCapability,
 )
@@ -198,15 +200,26 @@ class ControllerAuthHelper:
         attempt_id: int = 1,
         launch_nonce: str = "a1b2c3d4e5f60718293a4b5c6d7e8f90",
         provider_id: str = "chatgpt_subscription",
+        *,
+        upstream_scheme: str = "https",
+        upstream_host: str = "chatgpt.example.test",
+        upstream_port: int = 443,
+        provider_purpose: str = "responses_sse",
     ) -> ProviderAuthCapability:
         """Return a short-lived task-bound SubscriptionAuthCapability over IPC."""
+        request_nonce = secrets.token_hex(16)
         req = {
             "action": "GET_TASK_PROVIDER_CAPABILITY",
+            "request_nonce": request_nonce,
             "task_id": task_id,
             "generation": generation,
             "attempt_id": attempt_id,
             "launch_nonce": launch_nonce,
             "provider_id": provider_id,
+            "upstream_scheme": upstream_scheme,
+            "upstream_host": upstream_host,
+            "upstream_port": upstream_port,
+            "provider_purpose": provider_purpose,
         }
         resp = self._send_ipc(req)
         if resp.get("status") != "OK":
@@ -215,9 +228,42 @@ class ControllerAuthHelper:
                 raise RuntimeError(f"Auth capability request denied: {err}")
             raise ValueError(f"Auth capability request failed: {err}")
 
-        access_token = resp["access_token"]
-        account_id = resp.get("account_id")
-        return SubscriptionAuthCapability(access_token=access_token, account_id=account_id)
+        expected_response = {
+            "request_nonce": request_nonce,
+            "task_id": task_id,
+            "generation": generation,
+            "attempt_id": attempt_id,
+            "launch_nonce": launch_nonce,
+            "provider_id": provider_id,
+            "upstream_scheme": upstream_scheme,
+            "upstream_host": upstream_host,
+            "upstream_port": upstream_port,
+            "provider_purpose": provider_purpose,
+        }
+        if any(resp.get(name) != value for name, value in expected_response.items()):
+            raise ValueError("Auth capability response binding mismatch")
+        binding = ProviderAuthBinding(
+            task_id=resp["task_id"],
+            generation=resp["generation"],
+            attempt_id=resp["attempt_id"],
+            launch_nonce=resp["launch_nonce"],
+            provider_id=resp["provider_id"],
+            upstream_scheme=resp["upstream_scheme"],
+            upstream_host=resp["upstream_host"],
+            upstream_port=resp["upstream_port"],
+            provider_purpose=resp["provider_purpose"],
+            helper_epoch=resp["helper_epoch"],
+            request_nonce=resp["request_nonce"],
+            capability_nonce=resp["capability_nonce"],
+            capability_sequence=resp["capability_sequence"],
+            issued_at=resp["issued_at"],
+            expires_at=resp["expires_at"],
+        )
+        return SubscriptionAuthCapability(
+            access_token=resp["access_token"],
+            account_id=resp.get("account_id"),
+            binding=binding,
+        )
 
     def cancel_task(self, task_id: str) -> None:
         """Revoke capabilities for a task in the auth helper process."""

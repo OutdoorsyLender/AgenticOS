@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 
@@ -43,13 +44,68 @@ class ProviderFailureClass(str, Enum):
     PROVIDER_CANCELLED = "PROVIDER_CANCELLED"
 
 
+class ProviderAuthBindingError(RuntimeError):
+    """Stable secret-free failure raised when a capability is not current for a policy."""
+
+
+@dataclass(frozen=True)
+class ProviderAuthBinding:
+    """Complete immutable authority binding for a short-lived provider capability."""
+
+    task_id: str
+    generation: int
+    attempt_id: int
+    launch_nonce: str
+    provider_id: str
+    upstream_scheme: str
+    upstream_host: str
+    upstream_port: int
+    provider_purpose: str
+    helper_epoch: str
+    request_nonce: str
+    capability_nonce: str
+    capability_sequence: int
+    issued_at: int
+    expires_at: int
+
+    def __post_init__(self) -> None:
+        _require_task_id(self.task_id)
+        _require_positive_int("generation", self.generation)
+        _require_positive_int("attempt_id", self.attempt_id)
+        _require_nonce(self.launch_nonce)
+        if not isinstance(self.provider_id, str) or not self.provider_id:
+            raise ValueError("provider_id must be a non-empty string")
+        if self.upstream_scheme not in ("http", "https"):
+            raise ValueError("upstream_scheme must be 'http' or 'https'")
+        if not isinstance(self.upstream_host, str) or not self.upstream_host:
+            raise ValueError("upstream_host must be a non-empty string")
+        if type(self.upstream_port) is not int or not 1 <= self.upstream_port <= 65535:
+            raise ValueError("upstream_port must be in range 1..65535")
+        if not isinstance(self.provider_purpose, str) or not self.provider_purpose:
+            raise ValueError("provider_purpose must be a non-empty string")
+        for name, value in (
+            ("helper_epoch", self.helper_epoch),
+            ("request_nonce", self.request_nonce),
+            ("capability_nonce", self.capability_nonce),
+        ):
+            if not isinstance(value, str) or not _LOWER_HEX_32_RE.fullmatch(value):
+                raise ValueError(f"{name} must be exactly 32 lowercase hexadecimal characters")
+        _require_positive_int("capability_sequence", self.capability_sequence)
+        _require_positive_int("issued_at", self.issued_at)
+        _require_positive_int("expires_at", self.expires_at)
+        if self.expires_at <= self.issued_at:
+            raise ValueError("expires_at must be after issued_at")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class SecretValue:
     """Wrapper for secret material that prevents accidental printing or stringification."""
 
-    def __init__(self, value: str) -> None:
-        if not isinstance(value, str):
+    _value: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self._value, str):
             raise TypeError("SecretValue requires a string value")
-        self._value = value
 
     def __repr__(self) -> str:
         return "SecretValue(REDACTED)"
@@ -74,6 +130,13 @@ class ProviderAuthCapability(abc.ABC):
         """Return any extra authorization headers (e.g. ChatGPT-Account-ID) to inject."""
         return {}
 
+    def validate_for_policy(
+        self, policy: ProviderBrokerPolicy, now: int | float | None = None
+    ) -> None:
+        """Validate this capability at its broker consumption point."""
+        if not isinstance(policy, ProviderBrokerPolicy):
+            raise TypeError("policy must be a ProviderBrokerPolicy instance")
+
 
 class SyntheticBearerAuth(ProviderAuthCapability):
     """Deterministic synthetic test authorization provider for Slice 1 qualification."""
@@ -87,23 +150,61 @@ class SyntheticBearerAuth(ProviderAuthCapability):
         return SecretValue(f"Bearer {self._canary_token}")
 
 
+@dataclass(frozen=True, slots=True, init=False, repr=False)
 class SubscriptionAuthCapability(ProviderAuthCapability):
     """Auth capability supporting bearer access token and optional ChatGPT account ID."""
 
-    def __init__(self, access_token: str, account_id: str | None = None) -> None:
+    _access_token: SecretValue
+    _account_id: SecretValue | None
+    binding: ProviderAuthBinding
+
+    def __init__(
+        self,
+        access_token: str,
+        account_id: str | None = None,
+        *,
+        binding: ProviderAuthBinding,
+    ) -> None:
         if not isinstance(access_token, str) or not access_token.strip():
             raise ValueError("access_token must be a non-empty string")
-        self._access_token = access_token
-        self._account_id = account_id
+        if account_id is not None and (not isinstance(account_id, str) or not account_id.strip()):
+            raise ValueError("account_id must be a non-empty string or None")
+        if not isinstance(binding, ProviderAuthBinding):
+            raise TypeError("binding must be a ProviderAuthBinding instance")
+        object.__setattr__(self, "_access_token", SecretValue(access_token))
+        object.__setattr__(self, "_account_id", SecretValue(account_id) if account_id is not None else None)
+        object.__setattr__(self, "binding", binding)
 
     def get_auth_header(self, task_id: str, generation: int) -> SecretValue:
-        return SecretValue(f"Bearer {self._access_token}")
+        return SecretValue(f"Bearer {self._access_token.reveal_secret()}")
 
     def get_extra_headers(self, task_id: str, generation: int) -> dict[str, SecretValue]:
         headers: dict[str, SecretValue] = {}
         if self._account_id is not None:
-            headers["ChatGPT-Account-ID"] = SecretValue(self._account_id)
+            headers["ChatGPT-Account-ID"] = SecretValue(self._account_id.reveal_secret())
         return headers
+
+    def validate_for_policy(
+        self, policy: ProviderBrokerPolicy, now: int | float | None = None
+    ) -> None:
+        super().validate_for_policy(policy, now)
+        binding = self.binding
+        expected = (
+            (binding.task_id, policy.task_id),
+            (binding.generation, policy.generation),
+            (binding.attempt_id, policy.attempt_id),
+            (binding.launch_nonce, policy.launch_nonce),
+            (binding.provider_id, policy.upstream_provider_id),
+            (binding.upstream_scheme, policy.upstream_scheme),
+            (binding.upstream_host, policy.upstream_host),
+            (binding.upstream_port, policy.upstream_port),
+            (binding.provider_purpose, "responses_sse"),
+        )
+        current_time = time.time() if now is None else now
+        if type(current_time) not in (int, float):
+            raise TypeError("now must be an int, float, or None")
+        if any(actual != required for actual, required in expected) or current_time >= binding.expires_at:
+            raise ProviderAuthBindingError("PROVIDER_AUTH_BINDING_REJECTED")
 
 
 def _require_positive_int(name: str, value: object) -> None:
@@ -358,6 +459,8 @@ __all__ = [
     "AuthHelperProcessIdentity",
     "NetworkAuthority",
     "ProviderAuthCapability",
+    "ProviderAuthBinding",
+    "ProviderAuthBindingError",
     "ProviderBrokerEvidence",
     "ProviderBrokerIdentity",
     "ProviderBrokerPolicy",

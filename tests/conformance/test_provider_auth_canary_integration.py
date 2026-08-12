@@ -113,6 +113,10 @@ def test_chatgpt_subscription_auth_injection_flow(fake_chatgpt_upstream: Tuple[s
             policy.generation,
             policy.attempt_id,
             policy.launch_nonce,
+            upstream_scheme=policy.upstream_scheme,
+            upstream_host=policy.upstream_host,
+            upstream_port=policy.upstream_port,
+            provider_purpose="responses_sse",
         )
 
         broker = TaskProviderBroker(policy, auth_cap)

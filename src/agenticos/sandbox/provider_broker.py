@@ -8,17 +8,19 @@ import select
 import time
 import uuid
 import threading
-from typing import Tuple
+from typing import Callable, Tuple
 
 from .provider_models import (
     NetworkAuthority,
     ProviderAuthCapability,
+    ProviderAuthBindingError,
     ProviderBrokerEvidence,
     ProviderBrokerIdentity,
     ProviderBrokerPolicy,
     ProviderFailureClass,
     ProviderGrant,
     SecretValue,
+    SubscriptionAuthCapability,
     provider_policy_digest,
 )
 
@@ -34,6 +36,82 @@ _CLIENT_ALLOWED_HEADERS = {
     "x-codex-turn-metadata",
     "content-length",
 }
+
+
+class _AtomicCapabilitySlot:
+    """Linearize capability validation, injection, replacement, and cancellation."""
+
+    def __init__(
+        self, policy: ProviderBrokerPolicy, capability: ProviderAuthCapability
+    ) -> None:
+        if not isinstance(policy, ProviderBrokerPolicy):
+            raise TypeError("policy must be a ProviderBrokerPolicy instance")
+        if not isinstance(capability, ProviderAuthCapability):
+            raise TypeError("capability must be a ProviderAuthCapability instance")
+        capability.validate_for_policy(policy)
+        self._lock = threading.RLock()
+        self._capability: ProviderAuthCapability | None = capability
+        self._active = True
+        if isinstance(capability, SubscriptionAuthCapability):
+            self._sequence: int | None = capability.binding.capability_sequence
+            self._helper_epoch: str | None = capability.binding.helper_epoch
+        else:
+            self._sequence = None
+            self._helper_epoch = None
+
+    def replace(
+        self,
+        candidate: ProviderAuthCapability,
+        *,
+        policy: ProviderBrokerPolicy,
+        expected_sequence: int,
+    ) -> None:
+        """Atomically replace the current subscription capability by sequence CAS."""
+        if not isinstance(candidate, ProviderAuthCapability):
+            raise TypeError("candidate must be a ProviderAuthCapability instance")
+        with self._lock:
+            if not self._active or self._capability is None:
+                raise ProviderAuthBindingError("PROVIDER_AUTH_CANCELLED")
+            if not isinstance(candidate, SubscriptionAuthCapability):
+                raise ProviderAuthBindingError("PROVIDER_AUTH_REPLACEMENT_REJECTED")
+            if self._sequence is None or expected_sequence != self._sequence:
+                raise ProviderAuthBindingError("PROVIDER_AUTH_SEQUENCE_REJECTED")
+            candidate.validate_for_policy(policy)
+            binding = candidate.binding
+            if binding.helper_epoch != self._helper_epoch:
+                raise ProviderAuthBindingError("PROVIDER_AUTH_EPOCH_REJECTED")
+            if binding.capability_sequence != self._sequence + 1:
+                raise ProviderAuthBindingError("PROVIDER_AUTH_SEQUENCE_REJECTED")
+            self._capability = candidate
+            self._sequence = binding.capability_sequence
+
+    def cancel(self) -> None:
+        """Atomically revoke the slot and clear its credential reference."""
+        with self._lock:
+            self._active = False
+            self._capability = None
+
+    def validate_extract_and_send(
+        self,
+        *,
+        policy: ProviderBrokerPolicy,
+        sender: Callable[[SecretValue, dict[str, SecretValue]], None],
+    ) -> None:
+        """Validate and inject while holding the slot's single synchronization boundary."""
+        with self._lock:
+            if not self._active or self._capability is None:
+                raise ProviderAuthBindingError("PROVIDER_AUTH_CANCELLED")
+            capability = self._capability
+            capability.validate_for_policy(policy)
+            if isinstance(capability, SubscriptionAuthCapability):
+                binding = capability.binding
+                if binding.helper_epoch != self._helper_epoch:
+                    raise ProviderAuthBindingError("PROVIDER_AUTH_EPOCH_REJECTED")
+                if binding.capability_sequence != self._sequence:
+                    raise ProviderAuthBindingError("PROVIDER_AUTH_SEQUENCE_REJECTED")
+            auth_value = capability.get_auth_header(policy.task_id, policy.generation)
+            extra_headers = capability.get_extra_headers(policy.task_id, policy.generation)
+            sender(auth_value, extra_headers)
 
 _CLIENT_FORBIDDEN_HEADERS = {
     "authorization",
@@ -82,7 +160,7 @@ class TaskProviderBroker:
             raise TypeError("auth_capability must be a ProviderAuthCapability instance")
 
         self._policy = policy
-        self._auth_capability = auth_capability
+        self._auth_slot = _AtomicCapabilitySlot(policy, auth_capability)
         self._bind_address = bind_address
         self._policy_digest = provider_policy_digest(policy)
 
@@ -161,8 +239,26 @@ class TaskProviderBroker:
 
             return self.grant
 
+    def replace_auth_capability(
+        self,
+        candidate: ProviderAuthCapability,
+        *,
+        expected_sequence: int,
+    ) -> None:
+        """Atomically install the next capability for this broker policy."""
+        self._auth_slot.replace(
+            candidate,
+            policy=self._policy,
+            expected_sequence=expected_sequence,
+        )
+
+    def cancel_auth_capability(self) -> None:
+        """Atomically revoke the broker's current provider credential."""
+        self._auth_slot.cancel()
+
     def stop(self) -> None:
         """Revoke capability, close active connections, and terminate broker thread."""
+        self._auth_slot.cancel()
         with self._lock:
             self._cancellation_state = True
             if self._terminal_failure_class is None:
@@ -395,17 +491,7 @@ class TaskProviderBroker:
         with self._lock:
             self._request_byte_count += len(headers_raw) + len(body_bytes)
 
-        # 2. Get synthetic authorization and extra headers from capability
-        try:
-            auth_val = self._auth_capability.get_auth_header(self._policy.task_id, self._policy.generation)
-            extra_headers = self._auth_capability.get_extra_headers(self._policy.task_id, self._policy.generation)
-        except Exception as exc:
-            self._send_error_and_close(
-                client_sock, 500, "Auth Unavailable", ProviderFailureClass.PROVIDER_AUTH_UNAVAILABLE
-            )
-            return
-
-        # 3. Connect to locked upstream destination
+        # 2. Connect to locked upstream destination without credential authority.
         try:
             upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             upstream_sock.settimeout(self._policy.idle_timeout_seconds)
@@ -418,22 +504,55 @@ class TaskProviderBroker:
             )
             return
 
-        # Construct upstream request
+        # 3. Validate, extract, and inject under the capability slot lock.
         try:
-            req_lines = [f"POST {req_path} HTTP/1.1"]
-            req_lines.append(f"Host: {self._policy.upstream_host}:{self._policy.upstream_port}")
-            req_lines.append(f"Authorization: {auth_val.reveal_secret()}")
-            for h_name, h_sec in extra_headers.items():
-                req_lines.append(f"{h_name}: {h_sec.reveal_secret()}")
-            req_lines.append(f"Content-Length: {len(body_bytes)}")
-            req_lines.append("Connection: close")
+            def inject_and_send(
+                auth_value: SecretValue,
+                extra_headers: dict[str, SecretValue],
+            ) -> None:
+                req_lines = [f"POST {req_path} HTTP/1.1"]
+                req_lines.append(
+                    f"Host: {self._policy.upstream_host}:{self._policy.upstream_port}"
+                )
+                req_lines.append(f"Authorization: {auth_value.reveal_secret()}")
+                for header_name, header_secret in extra_headers.items():
+                    req_lines.append(f"{header_name}: {header_secret.reveal_secret()}")
+                req_lines.append(f"Content-Length: {len(body_bytes)}")
+                req_lines.append("Connection: close")
+                for name, value in parsed_headers:
+                    req_lines.append(f"{name}: {value}")
+                upstream_request = (
+                    "\r\n".join(req_lines).encode("utf-8")
+                    + b"\r\n\r\n"
+                    + bytes(body_bytes)
+                )
+                upstream_sock.sendall(upstream_request)
 
-            for name, val in parsed_headers:
-                req_lines.append(f"{name}: {val}")
-
-            upstream_req = "\r\n".join(req_lines).encode("utf-8") + b"\r\n\r\n" + bytes(body_bytes)
-            upstream_sock.sendall(upstream_req)
-        except Exception as exc:
+            self._auth_slot.validate_extract_and_send(
+                policy=self._policy,
+                sender=inject_and_send,
+            )
+        except ProviderAuthBindingError:
+            with self._lock:
+                self._active_upstream_sock = None
+            try:
+                upstream_sock.close()
+            except Exception:
+                pass
+            self._send_error_and_close(
+                client_sock,
+                500,
+                "Auth Unavailable",
+                ProviderFailureClass.PROVIDER_AUTH_UNAVAILABLE,
+            )
+            return
+        except Exception:
+            with self._lock:
+                self._active_upstream_sock = None
+            try:
+                upstream_sock.close()
+            except Exception:
+                pass
             self._send_error_and_close(
                 client_sock, 502, "Upstream Send Error", ProviderFailureClass.PROVIDER_UPSTREAM_CONNECT_ERROR
             )

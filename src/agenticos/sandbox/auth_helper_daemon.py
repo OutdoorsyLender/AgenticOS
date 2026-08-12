@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import signal
 import socket
 import sys
@@ -46,6 +47,7 @@ class AuthHelperDaemon:
         self.auth_file = os.path.abspath(auth_file)
         self.parent_pid = parent_pid
         self.started_at_monotonic_ns = time.monotonic_ns()
+        self.helper_epoch = secrets.token_hex(16)
         self.revoked_tasks: set[str] = set()
         self.issued_nonces: set[str] = set()
 
@@ -107,6 +109,11 @@ class AuthHelperDaemon:
             attempt_id = request.get("attempt_id")
             launch_nonce = request.get("launch_nonce")
             provider_id = request.get("provider_id", "chatgpt_subscription")
+            request_nonce = request.get("request_nonce")
+            upstream_scheme = request.get("upstream_scheme")
+            upstream_host = request.get("upstream_host")
+            upstream_port = request.get("upstream_port")
+            provider_purpose = request.get("provider_purpose")
 
             if not task_id or not isinstance(task_id, str):
                 return {"status": "ERROR", "error": "Invalid task_id"}
@@ -139,19 +146,27 @@ class AuthHelperDaemon:
                 self._access_token = f"CANARY_ACCESS_TOKEN_REFRESHED_{int(time.time())}"
                 self._expires_at = int(time.time()) + 3600
 
+            issued_at = int(time.time())
             cap_nonce = hashlib.sha256(f"{cap_key}:{time.time()}".encode("ascii")).hexdigest()[:32]
             return {
                 "status": "OK",
+                "request_nonce": request_nonce,
                 "task_id": task_id,
                 "generation": generation,
                 "attempt_id": attempt_id,
                 "launch_nonce": launch_nonce,
                 "provider_id": provider_id,
-                "upstream_identity": request.get("requested_upstream_identity", "chatgpt_subscription"),
+                "upstream_scheme": upstream_scheme,
+                "upstream_host": upstream_host,
+                "upstream_port": upstream_port,
+                "provider_purpose": provider_purpose,
+                "helper_epoch": self.helper_epoch,
                 "access_token": self._access_token,
                 "account_id": self._account_id,
-                "expires_at": self._expires_at,
+                "issued_at": issued_at,
+                "expires_at": min(self._expires_at, issued_at + 300),
                 "capability_nonce": cap_nonce,
+                "capability_sequence": 1,
             }
 
         if action == "CANCEL_TASK":
