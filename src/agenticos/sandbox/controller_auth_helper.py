@@ -118,6 +118,7 @@ class ControllerAuthHelper:
         _test_denied_probe_paths: tuple[str, ...] = (),
         _test_auth_root_mutator: Callable[[Path], None] | None = None,
         _test_allowed_probe_name: str | None = None,
+        _test_expose_process_probe: bool = False,
     ) -> None:
         if private_dir is None:
             self._temp_dir: Optional[str] = tempfile.mkdtemp(prefix="aos-auth-private-")
@@ -192,6 +193,8 @@ class ControllerAuthHelper:
         self._test_denied_probe_paths = _test_denied_probe_paths
         self._test_allowed_probe_name = _test_allowed_probe_name
         self._filesystem_probe_results: tuple[tuple[str, str, str], ...] = ()
+        self._test_process_probe_address: int | None = None
+        self._test_expose_process_probe = _test_expose_process_probe
         self._attempt_sequences: dict[tuple[Any, ...], int] = {}
         self._registered_brokers: list[Any] = []
         if _test_auth_root_mutator is not None:
@@ -208,6 +211,8 @@ class ControllerAuthHelper:
     def _validate_schema(self, data: Dict[str, Any]) -> None:
         if not isinstance(data, dict):
             raise ValueError("Auth data must be a dictionary")
+        if data.get("auth_mode", "chatgpt") != "chatgpt":
+            raise ValueError("Auth mode must be chatgpt")
         if "tokens" not in data or not isinstance(data["tokens"], dict):
             raise ValueError("Auth data missing required 'tokens' dictionary")
         tokens = data["tokens"]
@@ -268,6 +273,8 @@ class ControllerAuthHelper:
                 argv.extend(["--test-denied-probe", probe_path])
             if self._test_allowed_probe_name is not None:
                 argv.extend(["--test-allowed-probe", self._test_allowed_probe_name])
+            if self._test_expose_process_probe:
+                argv.append("--test-expose-process-probe")
             pass_fds = (child_socket.fileno(), *self._test_inherited_fds)
             self._launch_argv = tuple(argv)
             try:
@@ -395,6 +402,7 @@ class ControllerAuthHelper:
         self._filesystem_probe_results = tuple(
             tuple(result) for result in raw_id["filesystem_probe_results"]
         )
+        self._test_process_probe_address = raw_id["test_process_probe_address"]
         self._validate_ready_identity(
             self._process_identity,
             interpreter_identity=interpreter_identity,

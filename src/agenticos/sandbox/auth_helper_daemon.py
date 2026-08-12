@@ -52,6 +52,7 @@ _LANDLOCK_ALLOWED_AUTH_ACCESS = (
 _RESOLVE_NO_MAGICLINKS = 0x02
 _RESOLVE_NO_SYMLINKS = 0x04
 _RESOLVE_BENEATH = 0x08
+_TEST_PROCESS_PROBE_BUFFER: Any = None
 
 
 class AuthProtocolError(RuntimeError):
@@ -799,6 +800,8 @@ class AuthHelperDaemon:
     def _validate_schema(self, data: Dict[str, Any]) -> None:
         if not isinstance(data, dict):
             raise ValueError("Auth data must be a dictionary")
+        if data.get("auth_mode", "chatgpt") != "chatgpt":
+            raise ValueError("Auth mode must be chatgpt")
         if "tokens" not in data or not isinstance(data["tokens"], dict):
             raise ValueError("Auth data missing required 'tokens' dictionary")
         tokens = data["tokens"]
@@ -851,6 +854,9 @@ class AuthHelperDaemon:
             ),
             "filesystem_probe_results": list(
                 self._startup_identity.get("filesystem_probe_results", ())
+            ),
+            "test_process_probe_address": self._startup_identity.get(
+                "test_process_probe_address"
             ),
             "ipc_endpoint": ipc_endpoint,
             "ipc_type": self._startup_identity["ipc_type"],
@@ -1041,6 +1047,7 @@ def run_linux_daemon(
     test_inherited_fds: tuple[int, ...],
     test_denied_probe_paths: tuple[str, ...],
     test_allowed_probe_name: str | None,
+    test_expose_process_probe: bool,
 ) -> None:
     """Run one inherited Linux seqpacket endpoint with no listener or path."""
     ipc_socket, startup_identity = _normalize_linux_ipc_and_harden(
@@ -1095,6 +1102,12 @@ def run_linux_daemon(
                 "no_new_privs": no_new_privs,
             }
         )
+        if test_expose_process_probe:
+            global _TEST_PROCESS_PROBE_BUFFER
+            _TEST_PROCESS_PROBE_BUFFER = ctypes.create_string_buffer(b"probe")
+            startup_identity["test_process_probe_address"] = ctypes.addressof(
+                _TEST_PROCESS_PROBE_BUFFER
+            )
         if test_fault == "openat2":
             raise AuthProtocolError("OPENAT2")
         root_device = startup["auth_root_device"]
@@ -1275,6 +1288,7 @@ def main() -> None:
     parser.add_argument("--test-inherited-fds", default="")
     parser.add_argument("--test-denied-probe", action="append", default=[])
     parser.add_argument("--test-allowed-probe")
+    parser.add_argument("--test-expose-process-probe", action="store_true")
     args = parser.parse_args()
     if sys.platform.startswith("linux"):
         if args.ipc_fd is None or args.windows_loopback:
@@ -1289,6 +1303,7 @@ def main() -> None:
             test_inherited_fds=inherited_fds,
             test_denied_probe_paths=tuple(args.test_denied_probe),
             test_allowed_probe_name=args.test_allowed_probe,
+            test_expose_process_probe=args.test_expose_process_probe,
         )
     elif os.name == "nt":
         if args.ipc_fd is not None or not args.windows_loopback:

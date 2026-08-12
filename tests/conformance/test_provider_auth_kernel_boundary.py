@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import os
 from pathlib import Path
+import socket
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -204,3 +207,167 @@ def test_pre_spawn_provisioning_failure_leaves_no_fd_root_or_partial_secret(
     assert open_fds() == before_fds
     assert external_root.is_dir()
     assert not (external_root / "auth.json").exists()
+
+
+def test_real_helper_denies_existing_repo_workspace_home_and_traversal(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sentinel = workspace / "sentinel.txt"
+    sentinel.write_text("denied", encoding="ascii")
+    controller_state = tmp_path / "controller-state.txt"
+    controller_state.write_text("denied", encoding="ascii")
+    build_output = tmp_path / "build-output.txt"
+    build_output.write_text("denied", encoding="ascii")
+    probes = (
+        str(repo_root / "pyproject.toml"),
+        str(repo_root / ".git" / "HEAD"),
+        str(sentinel),
+        str(controller_state),
+        str(build_output),
+        str(Path.home()),
+        "/proc/self/status",
+        str(workspace / ".." / "controller-state.txt"),
+    )
+    with ControllerAuthHelper(_auth_data(), _test_denied_probe_paths=probes) as helper:
+        assert len(helper._filesystem_probe_results) == len(probes)
+        assert all(
+            outcome == "KERNEL_DENIED" and errno_name in ("EACCES", "EPERM", "EXDEV")
+            for _label, outcome, errno_name in helper._filesystem_probe_results
+        )
+
+
+def test_real_helper_denies_auth_root_symlink_escape(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("denied", encoding="ascii")
+    auth_root = tmp_path / "auth-private"
+    auth_root.mkdir(mode=0o700)
+    (auth_root / "escape").symlink_to(outside)
+    with ControllerAuthHelper(
+        _auth_data(),
+        private_dir=str(auth_root),
+        _test_denied_probe_paths=(str(auth_root / "escape"),),
+    ) as helper:
+        assert helper._filesystem_probe_results == (
+            ("probe-0", "KERNEL_DENIED", "EACCES"),
+        )
+
+
+def test_inherited_repo_workspace_and_socket_fds_are_ebadf_before_ready(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    peer_a, peer_b = socket.socketpair()
+    inherited = (
+        os.open(repo_root / "pyproject.toml", os.O_RDONLY | os.O_CLOEXEC),
+        os.open(repo_root / ".git", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC),
+        os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC),
+        peer_b.fileno(),
+    )
+    try:
+        with ControllerAuthHelper(
+            _auth_data(), _test_inherited_fds=inherited
+        ) as helper:
+            assert helper.process_identity.open_fds == (0, 1, 2, 3)
+            assert helper._test_inherited_fds_closed == inherited
+    finally:
+        for fd in inherited[:-1]:
+            os.close(fd)
+        peer_b.close()
+        peer_a.close()
+
+
+def test_same_uid_process_surfaces_are_denied_by_dumpability(tmp_path: Path) -> None:
+    child_probe = r'''
+import ctypes, errno, json, os, sys
+pid, address = int(sys.argv[1]), int(sys.argv[2])
+result = {}
+for surface in ("environ", "mem", "root", "cwd"):
+    try:
+        fd = os.open(f"/proc/{pid}/{surface}", os.O_RDONLY)
+    except OSError as exc:
+        result[surface] = errno.errorcode.get(exc.errno, str(exc.errno))
+    else:
+        os.close(fd); result[surface] = "ALLOWED"
+try:
+    os.listdir(f"/proc/{pid}/fd")
+except OSError as exc:
+    result["fd"] = errno.errorcode.get(exc.errno, str(exc.errno))
+else:
+    result["fd"] = "ALLOWED"
+libc = ctypes.CDLL(None, use_errno=True)
+ctypes.set_errno(0)
+result["ptrace_result"] = libc.ptrace(16, pid, 0, 0)
+result["ptrace_errno"] = errno.errorcode.get(ctypes.get_errno(), str(ctypes.get_errno()))
+class IOVec(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("length", ctypes.c_size_t)]
+local = ctypes.create_string_buffer(5)
+local_iovec = IOVec(ctypes.addressof(local), 5)
+remote_iovec = IOVec(address, 5)
+ctypes.set_errno(0)
+result["vm_result"] = libc.process_vm_readv(
+    pid, ctypes.byref(local_iovec), 1, ctypes.byref(remote_iovec), 1, 0
+)
+result["vm_errno"] = errno.errorcode.get(ctypes.get_errno(), str(ctypes.get_errno()))
+print(json.dumps(result, sort_keys=True))
+'''
+
+    with ControllerAuthHelper(
+        _auth_data(), _test_expose_process_probe=True
+    ) as helper:
+        pid = helper.process_identity.pid
+        assert helper._test_process_probe_address is not None
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                child_probe,
+                str(pid),
+                str(helper._test_process_probe_address),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        evidence = json.loads(completed.stdout)
+        for surface in ("environ", "mem", "root", "cwd", "fd"):
+            assert evidence[surface] in ("EPERM", "EACCES")
+        assert evidence["ptrace_result"] == -1
+        assert evidence["ptrace_errno"] in ("EPERM", "EACCES")
+        assert evidence["vm_result"] == -1
+        assert evidence["vm_errno"] in ("EPERM", "EACCES")
+
+
+@pytest.mark.parametrize("defect", ["broad_mode", "hardlink"])
+def test_controller_supplied_auth_file_defects_are_rejected_before_ready(
+    tmp_path: Path, defect: str
+) -> None:
+    auth_root = tmp_path / "auth-private"
+
+    def damage_auth_file(root: Path) -> None:
+        auth_file = root / "auth.json"
+        if defect == "broad_mode":
+            auth_file.chmod(0o644)
+        else:
+            os.link(auth_file, root / "auth-hardlink.json")
+
+    with pytest.raises(RuntimeError, match="Auth helper startup failed closed"):
+        ControllerAuthHelper(
+            _auth_data(),
+            private_dir=str(auth_root),
+            _test_auth_root_mutator=damage_auth_file,
+        )
+
+
+def test_non_chatgpt_auth_mode_is_rejected_before_ready() -> None:
+    with pytest.raises(ValueError, match="Auth mode must be chatgpt"):
+        ControllerAuthHelper(
+            {"auth_mode": "api_key", "tokens": {"access_token": "SYNTHETIC"}}
+        )
