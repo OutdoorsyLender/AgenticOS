@@ -68,6 +68,12 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
 
     name = "bubblewrap-landlock-native"
 
+    def build_scenario_argv(self, scenario_id: str, **kwargs) -> list[str]:
+        """Build the canonical worker argv using the stable in-namespace ABI."""
+        argv = super().build_scenario_argv(scenario_id, **kwargs)
+        argv[:2] = ["/usr/bin/python3", "/opt/agenticos/worker.py"]
+        return argv
+
     def __init__(
         self,
         worker_path: str | os.PathLike[str],

@@ -53,6 +53,10 @@ class SandboxRunner(abc.ABC):
         target: str | os.PathLike[str] | None = None,
         env_name: Optional[str] = None,
         base: str | os.PathLike[str] | None = None,
+        auth_root: str | os.PathLike[str] | None = None,
+        auth_file: str | os.PathLike[str] | None = None,
+        controller_state: str | os.PathLike[str] | None = None,
+        helper_pid: int | None = None,
     ) -> list[str]:
         argv = [sys.executable, str(self.worker_path), "--scenario", scenario_id]
         if target is not None:
@@ -61,6 +65,14 @@ class SandboxRunner(abc.ABC):
             argv += ["--env-name", env_name]
         if base is not None:
             argv += ["--base", str(base)]
+        if auth_root is not None:
+            argv += ["--auth-root", str(auth_root)]
+        if auth_file is not None:
+            argv += ["--auth-file", str(auth_file)]
+        if controller_state is not None:
+            argv += ["--controller-state", str(controller_state)]
+        if helper_pid is not None:
+            argv += ["--helper-pid", str(helper_pid)]
         return argv
 
     def run_scenario(
@@ -72,11 +84,22 @@ class SandboxRunner(abc.ABC):
         target: str | os.PathLike[str] | None = None,
         env_name: Optional[str] = None,
         base: str | os.PathLike[str] | None = None,
+        auth_root: str | os.PathLike[str] | None = None,
+        auth_file: str | os.PathLike[str] | None = None,
+        controller_state: str | os.PathLike[str] | None = None,
+        helper_pid: int | None = None,
         timeout: Optional[float] = None,
     ) -> AttackResult:
         """Run one hostile-worker scenario and parse its JSON result."""
         argv = self.build_scenario_argv(
-            scenario_id, target=target, env_name=env_name, base=base
+            scenario_id,
+            target=target,
+            env_name=env_name,
+            base=base,
+            auth_root=auth_root,
+            auth_file=auth_file,
+            controller_state=controller_state,
+            helper_pid=helper_pid,
         )
         proc = self.run(argv, cwd=cwd, env=env, timeout=timeout)
         result = self._parse_result(scenario_id, proc, target)

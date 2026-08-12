@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -29,6 +30,93 @@ from helpers import (
 
 def test_worker_path_exists():
     assert WORKER_PATH.is_file()
+
+
+def test_auth_01_reports_only_content_free_authority_results(tmp_path):
+    auth_root = tmp_path / "auth-root"
+    auth_root.mkdir()
+    auth_file = auth_root / "auth.json"
+    auth_file.write_text("AOS_CANARY_auth_must_not_appear", encoding="ascii")
+    controller_state = tmp_path / "controller-state"
+    controller_state.write_text("AOS_CANARY_controller_must_not_appear", encoding="ascii")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(WORKER_PATH),
+            "--scenario", "AUTH-01",
+            "--auth-root", str(auth_root),
+            "--auth-file", str(auth_file),
+            "--controller-state", str(controller_state),
+            "--helper-pid", str(os.getpid()),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+    )
+    result = json.loads(completed.stdout)
+    assert result["scenario_id"] == "AUTH-01"
+    assert result["succeeded"] is True
+    assert result["details"]["canary_found"] is True
+    assert result["details"]["auth_environment_authority_present"] is False
+    assert all(set(item) == {"operation", "succeeded", "errno_name"}
+               for item in result["details"]["operations"])
+    assert "AOS_CANARY_" not in completed.stdout
+    assert str(auth_root) not in completed.stdout
+
+
+def test_auth_01_treats_environment_authority_as_attack_success(tmp_path):
+    missing = tmp_path / "missing-auth-root"
+    env = os.environ.copy()
+    env["AUTHORITY_LOCATOR"] = str(missing)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(WORKER_PATH),
+            "--scenario", "AUTH-01",
+            "--auth-root", str(missing),
+            "--auth-file", str(missing / "auth.json"),
+            "--controller-state", str(tmp_path / "missing-controller"),
+            "--helper-pid", "999999999",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        env=env,
+    )
+    result = json.loads(completed.stdout)
+    assert result["details"]["auth_environment_authority_present"] is True
+    assert result["succeeded"] is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="pass_fds is POSIX-only")
+def test_auth_01_treats_any_inherited_socket_as_attack_success(tmp_path):
+    missing = tmp_path / "missing-auth-root"
+    inherited = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(WORKER_PATH),
+                "--scenario", "AUTH-01",
+                "--auth-root", str(missing),
+                "--auth-file", str(missing / "auth.json"),
+                "--controller-state", str(tmp_path / "missing-controller"),
+                "--helper-pid", "999999999",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            env={"PATH": os.environ.get("PATH", "")},
+            pass_fds=(inherited.fileno(),),
+        )
+    finally:
+        inherited.close()
+    result = json.loads(completed.stdout)
+    assert result["details"]["socket_fds"]
+    assert result["succeeded"] is True
 
 
 # --------------------------------------------------------------------------

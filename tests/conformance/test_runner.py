@@ -134,6 +134,32 @@ def test_run_scenario_parses_json(runner, layout, fixture_env):
         assert result.process.process_group_id is not None
 
 
+def test_run_scenario_executes_auth_01_through_canonical_contract(
+    runner, tmp_path,
+):
+    auth_root = tmp_path / "auth-root"
+    auth_root.mkdir()
+    auth_file = auth_root / "auth.json"
+    auth_file.write_text("AOS_CANARY_auth_runner", encoding="ascii")
+    controller_state = tmp_path / "controller-state"
+    controller_state.write_text("AOS_CANARY_controller_runner", encoding="ascii")
+
+    result = runner.run_scenario(
+        "AUTH-01",
+        cwd=tmp_path,
+        env=minimal_env(),
+        auth_root=auth_root,
+        auth_file=auth_file,
+        controller_state=controller_state,
+        helper_pid=os.getpid(),
+    )
+
+    assert result.attempted is True
+    assert result.succeeded is True
+    assert result.error_type is None
+    assert evaluate_result(result, PolicyExpectation.DENY) is ConformanceStatus.FAIL
+
+
 def test_run_scenario_parse_failure_is_runner_error(runner, tmp_path, monkeypatch):
     # Point the runner at a "worker" that emits garbage instead of JSON.
     fake_worker = tmp_path / "fake_worker.py"

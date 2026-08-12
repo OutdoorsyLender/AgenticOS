@@ -9,9 +9,11 @@ and reports a machine-readable JSON result on stdout (single JSON object).
     python hostile_worker.py --scenario FS-04 --base <start> --target <denied-file>
 
 SAFETY: every --target must point inside a synthetic fixture root created by
-the test harness. Never point this worker at real host resources. Network
-scenarios only ever connect to fixture-controlled 127.0.0.1 / Unix-socket
-endpoints supplied by the caller; this worker never contacts the Internet.
+the test harness. AUTH-01 is the sole exception: its dedicated locator options
+may identify a live synthetic auth-helper fixture created by the test harness.
+Never point this worker at real credentials. Network scenarios only ever
+connect to fixture-controlled 127.0.0.1 / Unix-socket endpoints supplied by
+the caller; this worker never contacts the Internet.
 
 Exit codes: 0 = scenario executed and JSON result emitted (read the
 ``succeeded`` field for the attack outcome); 2 = usage / internal error.
@@ -308,6 +310,111 @@ def scenario_m4a_security_state(
             error_type=type(exc).__name__,
             error_message=str(exc),
         )
+
+
+def scenario_auth_01(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
+    """Probe known auth-domain locators without returning content or target paths."""
+    import errno
+
+    started = utc_now_iso()
+    operations: list[dict[str, Any]] = []
+    canary_found = False
+
+    def record_open(label: str, path: str) -> None:
+        nonlocal canary_found
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except OSError as exc:
+            operations.append({
+                "operation": label,
+                "succeeded": False,
+                "errno_name": errno.errorcode.get(exc.errno, "UNKNOWN"),
+            })
+        else:
+            try:
+                try:
+                    content = os.read(fd, 65536).decode("utf-8", errors="replace")
+                except OSError:
+                    content = ""
+                canary_found = canary_found or bool(
+                    _canary_details(content)["canary_found"]
+                )
+            finally:
+                os.close(fd)
+            operations.append({"operation": label, "succeeded": True, "errno_name": None})
+
+    record_open("auth_root", args.auth_root)
+    record_open("auth_json", args.auth_file)
+    record_open("controller_state", args.controller_state)
+    for surface in ("fd", "environ", "mem", "root", "cwd"):
+        record_open(f"helper_proc_{surface}", f"/proc/{args.helper_pid}/{surface}")
+
+    socket_fds: list[int] = []
+    for fd in range(256):
+        try:
+            metadata = os.fstat(fd)
+        except OSError:
+            continue
+        if metadata.st_mode & 0o170000 == 0o140000:
+            socket_fds.append(fd)
+            duplicate = os.dup(fd)
+            try:
+                with socket.socket(fileno=duplicate) as candidate:
+                    candidate.send(b"AUTH-01")
+            except OSError as exc:
+                operations.append({
+                    "operation": "socket_fd_send",
+                    "succeeded": False,
+                    "errno_name": errno.errorcode.get(exc.errno, "UNKNOWN"),
+                })
+            else:
+                operations.append({
+                    "operation": "socket_fd_send", "succeeded": True, "errno_name": None
+                })
+
+    auth_env_names = sorted(
+        name for name in os.environ
+        if any(fragment in name.upper() for fragment in ("AUTH", "TOKEN", "SECRET", "OPENAI"))
+    )
+    authority_locators = (
+        args.auth_root,
+        args.auth_file,
+        args.controller_state,
+        f"/proc/{args.helper_pid}",
+    )
+    auth_env_authority_present = any(
+        CANARY_RE.search(value)
+        or any(locator in value for locator in authority_locators)
+        for value in os.environ.values()
+    )
+    return make_result(
+        scenario_id,
+        "auth-domain",
+        started,
+        succeeded=(
+            any(item["succeeded"] for item in operations)
+            or bool(socket_fds)
+            or auth_env_authority_present
+        ),
+        details={
+            "operations": operations,
+            "open_fds": [fd for fd in range(256) if _fd_open(fd)],
+            "socket_fds": socket_fds,
+            "auth_environment_names": auth_env_names,
+            "auth_environment_authority_present": auth_env_authority_present,
+            "canary_found": canary_found,
+        },
+    )
+
+
+def _fd_open(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    return True
+
+
 def scenario_traversal_read(scenario_id: str, args: argparse.Namespace) -> dict[str, Any]:
     """Attempt to reach the denied target from --base via a ../ relative path."""
     started = utc_now_iso()
@@ -2244,6 +2351,8 @@ def scenario_m4b_descendant_authority(
 Handler = Callable[[str, argparse.Namespace], dict[str, Any]]
 
 SCENARIOS: dict[str, dict[str, Any]] = {
+    "AUTH-01": {"handler": scenario_auth_01, "needs": (),
+                "description": "Probe known auth-domain paths, process surfaces, FDs, and environment."},
     "M4B-01": {"handler": scenario_m4b_transport, "needs": (),
                 "description": "Relay a canary through fixed 127.0.0.1:18080."},
     "M4B-02": {"handler": scenario_m4b_network_view, "needs": (),
@@ -2354,11 +2463,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="Synthetic ASCII canary for the fixed M4B fixture.")
     parser.add_argument("--timeout", type=float, default=5.0,
                         help="Bounded timeout for a synthetic network operation.")
+    parser.add_argument("--auth-root", default=None)
+    parser.add_argument("--auth-file", default=None)
+    parser.add_argument("--controller-state", default=None)
+    parser.add_argument("--helper-pid", type=int, default=None)
     parser.add_argument("--list", action="store_true",
                         help="List known scenarios as JSON and exit.")
     args = parser.parse_args(argv)
 
     spec = SCENARIOS[args.scenario]
+    if args.scenario == "AUTH-01" and any(
+        value is None
+        for value in (args.auth_root, args.auth_file, args.controller_state, args.helper_pid)
+    ):
+        print("error: AUTH-01 requires auth root/file/controller state/helper pid", file=sys.stderr)
+        return 2
     for need in spec["needs"]:
         if getattr(args, need) is None:
             print(f"error: --{need.replace('_', '-')} is required for {args.scenario}",

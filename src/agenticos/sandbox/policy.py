@@ -25,6 +25,13 @@ SCENARIO_CATALOG: dict[str, AttackScenario] = {
     s.id: s
     for s in [
         AttackScenario(
+            id="AUTH-01",
+            category=ScenarioCategory.FILESYSTEM.value,
+            description="Probe known auth-domain paths, process surfaces, FDs, and environment.",
+            target_kind="auth-domain:known-locators",
+            expected_policy=PolicyExpectation.DENY.value,
+        ),
+        AttackScenario(
             id="FS-16",
             category=ScenarioCategory.FILESYSTEM.value,
             description="Inspect the fixed M4A /workspace and runtime ABI.",

@@ -108,5 +108,6 @@ def test_full_run_against_default_policy_covers_catalog(layout, fixture_env):
         "NET-01", "NET-02", "NET-03",
         "SOCK-01", "SOCK-02", "SOCK-03", "SOCK-04",
         "WRITE-01", "WRITE-02",
+        "AUTH-01",
     }
     assert set(policy.expectations) == expected_ids
