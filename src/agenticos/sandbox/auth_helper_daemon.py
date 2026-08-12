@@ -38,6 +38,13 @@ _PR_SET_DUMPABLE = 4
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_GET_NO_NEW_PRIVS = 39
 _UINT_MAX = (1 << 32) - 1
+_LANDLOCK_HANDLED_ACCESS_FS = 0x7FFF
+_LANDLOCK_ALLOWED_AUTH_ACCESS = (
+    (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 13) | (1 << 14)
+)
+_RESOLVE_NO_MAGICLINKS = 0x02
+_RESOLVE_NO_SYMLINKS = 0x04
+_RESOLVE_BENEATH = 0x08
 
 
 class AuthProtocolError(RuntimeError):
@@ -46,6 +53,88 @@ class AuthProtocolError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class _OpenHow(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_uint64), ("mode", ctypes.c_uint64), ("resolve", ctypes.c_uint64)]
+
+
+class _LandlockRulesetAttr(ctypes.Structure):
+    _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+
+class _LandlockPathBeneathAttr(ctypes.Structure):
+    _fields_ = [
+        ("allowed_access", ctypes.c_uint64),
+        ("parent_fd", ctypes.c_int32),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
+def _syscall(number: int, *arguments: Any) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.syscall(number, *arguments)
+    if result == -1:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return int(result)
+
+
+def _openat2(directory_fd: int, path: str, *, flags: int) -> int:
+    how = _OpenHow(
+        flags=flags,
+        mode=0,
+        resolve=_RESOLVE_BENEATH | _RESOLVE_NO_SYMLINKS | _RESOLVE_NO_MAGICLINKS,
+    )
+    return _syscall(437, directory_fd, path.encode(), ctypes.byref(how), ctypes.sizeof(how))
+
+
+def _openat2_auth_root(path: str, expected_device: int, expected_inode: int) -> int:
+    root_fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        auth_root_fd = _openat2(
+            root_fd,
+            path.lstrip("/"),
+            flags=os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+    finally:
+        os.close(root_fd)
+    metadata = os.fstat(auth_root_fd)
+    if (metadata.st_dev, metadata.st_ino) != (expected_device, expected_inode):
+        os.close(auth_root_fd)
+        raise AuthProtocolError("AUTH_ROOT_IDENTITY")
+    return auth_root_fd
+
+
+def _apply_auth_landlock(auth_root_fd: int) -> int:
+    abi = _syscall(444, 0, 0, 1)
+    if abi < 3:
+        raise AuthProtocolError("LANDLOCK_ABI")
+    ruleset_attr = _LandlockRulesetAttr(_LANDLOCK_HANDLED_ACCESS_FS)
+    ruleset_fd = _syscall(444, ctypes.byref(ruleset_attr), ctypes.sizeof(ruleset_attr), 0)
+    try:
+        path_attr = _LandlockPathBeneathAttr(
+            _LANDLOCK_ALLOWED_AUTH_ACCESS, auth_root_fd, 0
+        )
+        _syscall(445, ruleset_fd, 1, ctypes.byref(path_attr), 0)
+        _syscall(446, ruleset_fd, 0)
+    finally:
+        os.close(ruleset_fd)
+    return abi
+
+
+def _openat2_auth_json(auth_root_fd: int) -> int:
+    auth_fd = _openat2(auth_root_fd, "auth.json", flags=os.O_RDONLY | os.O_CLOEXEC)
+    metadata = os.fstat(auth_fd)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & ~0o600
+        or metadata.st_nlink != 1
+    ):
+        os.close(auth_fd)
+        raise AuthProtocolError("AUTH_FILE_IDENTITY")
+    return auth_fd
 
 
 def _strict_json_loads(
@@ -342,6 +431,8 @@ _REQUEST_FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "controller_pid": int,
     "controller_uid": int,
     "controller_gid": int,
+    "auth_root_device": int,
+    "auth_root_inode": int,
     "request_nonce": str,
     "task_id": str,
     "generation": int,
@@ -366,6 +457,8 @@ _REQUEST_FIELDS: dict[str, frozenset[str]] = {
             "controller_pid",
             "controller_uid",
             "controller_gid",
+            "auth_root_device",
+            "auth_root_inode",
         }
     ),
     "PING": frozenset({"protocol_version", "action"}),
@@ -600,6 +693,7 @@ class AuthHelperDaemon:
         parent_pid: int,
         *,
         startup_identity: Mapping[str, Any],
+        auth_data: Mapping[str, Any] | None = None,
     ) -> None:
         self.auth_file = os.path.abspath(auth_file)
         self.parent_pid = parent_pid
@@ -609,11 +703,13 @@ class AuthHelperDaemon:
         self.issued_nonces: set[str] = set()
         self._startup_identity = dict(startup_identity)
 
-        if not os.path.exists(self.auth_file):
-            raise FileNotFoundError(f"Auth file not found: {self.auth_file}")
-
-        with open(self.auth_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        if auth_data is None:
+            if not os.path.exists(self.auth_file):
+                raise FileNotFoundError("Auth file not found")
+            with open(self.auth_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = dict(auth_data)
 
         self._validate_schema(data)
         tokens = data.get("tokens", {})
@@ -642,12 +738,14 @@ class AuthHelperDaemon:
         self._refresh_fail_trigger = True
 
     def get_identity_dict(self, ipc_endpoint: str) -> Dict[str, Any]:
-        executable, executable_device, executable_inode, executable_digest = (
-            _file_identity(sys.executable)
-        )
-        entrypoint, entrypoint_device, entrypoint_inode, entrypoint_digest = (
-            _file_identity(__file__)
-        )
+        executable_identity = self._startup_identity.get("executable_identity")
+        entrypoint_identity = self._startup_identity.get("entrypoint_identity")
+        if executable_identity is None:
+            executable_identity = _file_identity(sys.executable)
+        if entrypoint_identity is None:
+            entrypoint_identity = _file_identity(__file__)
+        executable, executable_device, executable_inode, executable_digest = executable_identity
+        entrypoint, entrypoint_device, entrypoint_inode, entrypoint_digest = entrypoint_identity
         return {
             "pid": os.getpid(),
             "uid": os.getuid() if hasattr(os, "getuid") else 0,
@@ -675,6 +773,9 @@ class AuthHelperDaemon:
             "closed_inherited_fds": list(
                 self._startup_identity.get("closed_inherited_fds", ())
             ),
+            "filesystem_probe_results": list(
+                self._startup_identity.get("filesystem_probe_results", ())
+            ),
             "ipc_endpoint": ipc_endpoint,
             "ipc_type": self._startup_identity["ipc_type"],
             "ipc_peer_auth": self._startup_identity["ipc_peer_auth"],
@@ -684,10 +785,12 @@ class AuthHelperDaemon:
             "core_hard_limit": self._startup_identity["core_hard_limit"],
             "dumpable": self._startup_identity["dumpable"],
             "no_new_privs": self._startup_identity["no_new_privs"],
-            "landlock_abi": None,
-            "landlock_handled_access_fs": None,
-            "auth_root_device": None,
-            "auth_root_inode": None,
+            "landlock_abi": self._startup_identity.get("landlock_abi"),
+            "landlock_handled_access_fs": self._startup_identity.get(
+                "landlock_handled_access_fs"
+            ),
+            "auth_root_device": self._startup_identity.get("auth_root_device"),
+            "auth_root_inode": self._startup_identity.get("auth_root_inode"),
             "parent_pid": self.parent_pid,
             "started_at_monotonic_ns": self.started_at_monotonic_ns,
         }
@@ -855,6 +958,8 @@ def run_linux_daemon(
     *,
     test_fault: str | None,
     test_inherited_fds: tuple[int, ...],
+    test_denied_probe_paths: tuple[str, ...],
+    test_allowed_probe_name: str | None,
 ) -> None:
     """Run one inherited Linux seqpacket endpoint with no listener or path."""
     ipc_socket, startup_identity = _normalize_linux_ipc_and_harden(
@@ -862,6 +967,8 @@ def run_linux_daemon(
         test_fault=test_fault,
         test_inherited_fds=test_inherited_fds,
     )
+    startup_identity["executable_identity"] = _file_identity(sys.executable)
+    startup_identity["entrypoint_identity"] = _file_identity(__file__)
     ipc_socket.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
     endpoint_str = f"fd://{ipc_socket.fileno()}"
     try:
@@ -907,10 +1014,75 @@ def run_linux_daemon(
                 "no_new_privs": no_new_privs,
             }
         )
+        if test_fault == "openat2":
+            raise AuthProtocolError("OPENAT2")
+        root_device = startup["auth_root_device"]
+        root_inode = startup["auth_root_inode"]
+        if test_fault == "auth_root_identity":
+            root_inode += 1
+        auth_root_fd = _openat2_auth_root(auth_file.rsplit("/", 1)[0], root_device, root_inode)
+        try:
+            if test_fault == "landlock_abi":
+                raise AuthProtocolError("LANDLOCK_ABI")
+            if test_fault == "landlock_create":
+                raise AuthProtocolError("LANDLOCK_CREATE")
+            if test_fault == "landlock_add":
+                raise AuthProtocolError("LANDLOCK_ADD")
+            if test_fault == "landlock_restrict":
+                raise AuthProtocolError("LANDLOCK_RESTRICT")
+            landlock_abi = _apply_auth_landlock(auth_root_fd)
+            probe_results: list[tuple[str, str, str]] = []
+            for index, probe_path in enumerate(test_denied_probe_paths):
+                try:
+                    probe_fd = os.open(probe_path, os.O_RDONLY | os.O_CLOEXEC)
+                except OSError as exc:
+                    probe_results.append(
+                        (f"probe-{index}", "KERNEL_DENIED", errno.errorcode.get(exc.errno, "UNKNOWN"))
+                    )
+                else:
+                    os.close(probe_fd)
+                    raise AuthProtocolError("LANDLOCK_PROBE_ALLOWED")
+            if test_allowed_probe_name is not None:
+                if "/" in test_allowed_probe_name or test_allowed_probe_name in ("", ".", ".."):
+                    raise AuthProtocolError("LANDLOCK_ALLOWED_PROBE_NAME")
+                allowed_fd = _openat2(
+                    auth_root_fd,
+                    test_allowed_probe_name,
+                    flags=os.O_RDONLY | os.O_CLOEXEC,
+                )
+                try:
+                    if os.read(allowed_fd, 8) != b"allowed\n":
+                        raise AuthProtocolError("LANDLOCK_ALLOWED_PROBE_CONTENT")
+                finally:
+                    os.close(allowed_fd)
+            if test_fault == "auth_open":
+                raise AuthProtocolError("AUTH_OPEN")
+            auth_fd = _openat2_auth_json(auth_root_fd)
+            try:
+                with os.fdopen(os.dup(auth_fd), "r", encoding="utf-8") as auth_stream:
+                    if test_fault == "auth_json":
+                        raise AuthProtocolError("AUTH_JSON")
+                    auth_data = json.load(auth_stream)
+            finally:
+                os.close(auth_fd)
+        finally:
+            os.close(auth_root_fd)
+        startup_identity.update(
+            {
+                "landlock_abi": landlock_abi,
+                "landlock_handled_access_fs": _LANDLOCK_HANDLED_ACCESS_FS,
+                "auth_root_device": root_device,
+                "auth_root_inode": root_inode,
+                "filesystem_probe_results": tuple(probe_results),
+            }
+        )
+        if _linux_open_fds_fcntl() != (0, 1, 2, 3):
+            raise AuthProtocolError("LANDLOCK_READY_FD_CENSUS")
         daemon = AuthHelperDaemon(
             auth_file,
             parent_pid,
             startup_identity=startup_identity,
+            auth_data=auth_data,
         )
         _send_linux_packet(
             ipc_socket,
@@ -992,6 +1164,7 @@ def run_windows_daemon(parent_pid: int) -> None:
                 "standard_fds_null": False,
                 "windows_stdin_bootstrap_closed": True,
                 "closed_inherited_fds": tuple(),
+                "filesystem_probe_results": tuple(),
             },
         )
         _send_stream_packet(
@@ -1017,8 +1190,10 @@ def main() -> None:
         action="store_true",
         help="Use the bounded Windows functional fallback",
     )
-    parser.add_argument("--test-startup-fault", choices=("core", "dumpable", "fd_sanitize", "no_new_privs"))
+    parser.add_argument("--test-startup-fault", choices=("core", "dumpable", "fd_sanitize", "no_new_privs", "openat2", "auth_root_identity", "landlock_abi", "landlock_create", "landlock_add", "landlock_restrict", "auth_open", "auth_json"))
     parser.add_argument("--test-inherited-fds", default="")
+    parser.add_argument("--test-denied-probe", action="append", default=[])
+    parser.add_argument("--test-allowed-probe")
     args = parser.parse_args()
     if sys.platform.startswith("linux"):
         if args.ipc_fd is None or args.windows_loopback:
@@ -1031,6 +1206,8 @@ def main() -> None:
             args.ipc_fd,
             test_fault=args.test_startup_fault,
             test_inherited_fds=inherited_fds,
+            test_denied_probe_paths=tuple(args.test_denied_probe),
+            test_allowed_probe_name=args.test_allowed_probe,
         )
     elif os.name == "nt":
         if args.ipc_fd is not None or not args.windows_loopback:

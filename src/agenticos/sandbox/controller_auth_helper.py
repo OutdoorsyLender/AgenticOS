@@ -20,7 +20,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from . import auth_helper_daemon as _auth_helper_daemon
 from .auth_helper_daemon import (
@@ -63,6 +63,46 @@ def _trusted_file_identity(path: Path) -> tuple[str, int, int, str]:
         os.close(fd)
 
 
+def _open_or_create_auth_root(path: Path) -> int | None:
+    """Resolve every root component without symlinks and return the exact directory FD."""
+    if os.name == "nt":
+        if path.exists() or path.is_symlink():
+            metadata = path.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError("auth root must be a real directory")
+        else:
+            path.mkdir(parents=True, mode=0o700)
+        return None
+    absolute = path.absolute()
+    components = absolute.parts[1:]
+    if not components:
+        raise RuntimeError("auth root cannot be filesystem root")
+    current_fd = os.open(
+        os.path.sep,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        for index, component in enumerate(components):
+            flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except OSError as exc:
+                raise RuntimeError("auth root path must contain only real directories") from exc
+            os.close(current_fd)
+            current_fd = next_fd
+            if index == len(components) - 1:
+                os.fchmod(current_fd, 0o700)
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
 class ControllerAuthHelper:
     """Manages synthetic provider authentication state out-of-process in a dedicated daemon."""
 
@@ -73,6 +113,9 @@ class ControllerAuthHelper:
         *,
         _test_inherited_fds: tuple[int, ...] = (),
         _test_startup_fault: str | None = None,
+        _test_denied_probe_paths: tuple[str, ...] = (),
+        _test_auth_root_mutator: Callable[[Path], None] | None = None,
+        _test_allowed_probe_name: str | None = None,
     ) -> None:
         if private_dir is None:
             self._temp_dir: Optional[str] = tempfile.mkdtemp(prefix="aos-auth-private-")
@@ -80,28 +123,60 @@ class ControllerAuthHelper:
         else:
             self._temp_dir = None
             self._private_root = Path(private_dir)
-            self._private_root.mkdir(parents=True, exist_ok=True)
+        auth_root_fd = _open_or_create_auth_root(self._private_root)
+        auth_created = False
+        try:
+            root_metadata = (
+                os.fstat(auth_root_fd)
+                if auth_root_fd is not None
+                else self._private_root.stat(follow_symlinks=False)
+            )
+            self._auth_root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+            self._auth_json_path = self._private_root / "auth.json"
 
-        self._auth_json_path = self._private_root / "auth.json"
+            if isinstance(auth_json_path_or_dict, str):
+                if not os.path.exists(auth_json_path_or_dict):
+                    raise FileNotFoundError(f"Auth file not found: {auth_json_path_or_dict}")
+                with open(auth_json_path_or_dict, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            elif isinstance(auth_json_path_or_dict, dict):
+                data = auth_json_path_or_dict
+            else:
+                raise TypeError("auth_json_path_or_dict must be a file path string or a dict")
 
-        if isinstance(auth_json_path_or_dict, str):
-            if not os.path.exists(auth_json_path_or_dict):
-                raise FileNotFoundError(f"Auth file not found: {auth_json_path_or_dict}")
-            with open(auth_json_path_or_dict, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        elif isinstance(auth_json_path_or_dict, dict):
-            data = auth_json_path_or_dict
-        else:
-            raise TypeError("auth_json_path_or_dict must be a file path string or a dict")
+            self._validate_schema(data)
+            tokens = data.get("tokens", {})
+            self._auth_mode = data.get("auth_mode", "chatgpt")
+            self._account_id = tokens.get("account_id")
 
-        self._validate_schema(data)
-        tokens = data.get("tokens", {})
-        self._auth_mode: str = data.get("auth_mode", "chatgpt")
-        self._account_id: str | None = tokens.get("account_id")
-
-        # Write private auth file in non-repository root
-        with open(self._auth_json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+            auth_fd = os.open(
+                "auth.json" if auth_root_fd is not None else self._auth_json_path,
+                os.O_CREAT
+                | os.O_EXCL
+                | os.O_WRONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                **({"dir_fd": auth_root_fd} if auth_root_fd is not None else {}),
+            )
+            auth_created = True
+            with os.fdopen(auth_fd, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            if auth_created:
+                try:
+                    if auth_root_fd is not None:
+                        os.unlink("auth.json", dir_fd=auth_root_fd)
+                    else:
+                        os.unlink(self._auth_json_path)
+                except FileNotFoundError:
+                    pass
+            if self._temp_dir and os.path.exists(self._temp_dir):
+                shutil.rmtree(self._temp_dir, ignore_errors=True)
+            raise
+        finally:
+            if auth_root_fd is not None:
+                os.close(auth_root_fd)
 
         self._proc: Optional[subprocess.Popen[Any]] = None
         self._ipc_sock: Optional[socket.socket] = None
@@ -112,6 +187,11 @@ class ControllerAuthHelper:
         self._test_inherited_fds = _test_inherited_fds
         self._test_inherited_fds_closed: tuple[int, ...] = ()
         self._test_startup_fault = _test_startup_fault
+        self._test_denied_probe_paths = _test_denied_probe_paths
+        self._test_allowed_probe_name = _test_allowed_probe_name
+        self._filesystem_probe_results: tuple[tuple[str, str, str], ...] = ()
+        if _test_auth_root_mutator is not None:
+            _test_auth_root_mutator(self._private_root)
         self._ready_standard_fds_null = False
         self._windows_stdin_bootstrap_closed = False
 
@@ -180,6 +260,10 @@ class ControllerAuthHelper:
                         ",".join(str(fd) for fd in self._test_inherited_fds),
                     ]
                 )
+            for probe_path in self._test_denied_probe_paths:
+                argv.extend(["--test-denied-probe", probe_path])
+            if self._test_allowed_probe_name is not None:
+                argv.extend(["--test-allowed-probe", self._test_allowed_probe_name])
             pass_fds = (child_socket.fileno(), *self._test_inherited_fds)
             self._launch_argv = tuple(argv)
             try:
@@ -304,6 +388,9 @@ class ControllerAuthHelper:
         self._windows_stdin_bootstrap_closed = bool(
             raw_id["windows_stdin_bootstrap_closed"]
         )
+        self._filesystem_probe_results = tuple(
+            tuple(result) for result in raw_id["filesystem_probe_results"]
+        )
         self._validate_ready_identity(
             self._process_identity,
             interpreter_identity=interpreter_identity,
@@ -322,6 +409,8 @@ class ControllerAuthHelper:
                 "controller_pid": os.getpid(),
                 "controller_uid": controller_uid,
                 "controller_gid": controller_gid,
+                "auth_root_device": self._auth_root_identity[0],
+                "auth_root_inode": self._auth_root_identity[1],
             }
         )
 
@@ -368,6 +457,11 @@ class ControllerAuthHelper:
             or identity.ipc_type != "AF_UNIX/SOCK_SEQPACKET"
             or identity.ipc_peer_auth != "SO_PASSCRED/SCM_CREDENTIALS"
             or not self._ready_standard_fds_null
+            or identity.landlock_abi is None
+            or identity.landlock_abi < 3
+            or identity.landlock_handled_access_fs != 0x7FFF
+            or (identity.auth_root_device, identity.auth_root_inode)
+            != self._auth_root_identity
         ):
             raise RuntimeError("Auth helper READY hardening mismatch")
         if os.name == "nt" and (
