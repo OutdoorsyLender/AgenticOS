@@ -14,11 +14,15 @@
 
   ```text
   DESIGN_SHA=43196fca78a92d819aa1b3f117f964ecdd1659ea
-  PLAN_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
-  IMPLEMENTATION_BASE_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
+  REVIEWED_PLAN_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
+  FINAL_PLAN_SHA=57188a97a00f625264fc0c5997d53342a0996bfe
+  IMPLEMENTATION_BASE_SHA=57188a97a00f625264fc0c5997d53342a0996bfe
   ```
 
-- Begin implementation history from `IMPLEMENTATION_BASE_SHA`, with Windows, WSL, `origin/main`, and GitHub SHA-identical and clean. The subsequent amended-plan publication commit is documentation-only; Task 8 still compares the owner-designated implementation base with the candidate.
+- Begin implementation history from `IMPLEMENTATION_BASE_SHA`, the published
+  final-plan commit, with Windows, WSL, `origin/main`, and GitHub SHA-identical
+  and clean. Task 8 compares that owner-designated implementation base with the
+  candidate.
 - Author Linux security changes only in `/home/brand/src/AgenticOS`; synchronize `C:\AgenticOS` only through verified GitHub fast-forward operations.
 - Do not install native Codex, use a real OpenAI/ChatGPT credential, contact a live provider endpoint, or consume provider quota.
 - Target only `M6_SLICE2C1_STATUS=EARNED_LEVEL_A`; never claim whole-system Level B while the trusted same-UID controller can read persistent auth state.
@@ -980,21 +984,23 @@ exact SHA, fast-forward Windows, and prove clean/equal clones.
 - Modify production/tests only for independently reproduced review findings.
 
 **Interfaces:**
-- Consumes: exact approved design SHA, reviewed plan SHA, owner-designated
-  implementation-base SHA, candidate SHA, implementation diff, authority table,
-  targeted evidence, full-suite outputs, and residue audit.
+- Consumes: exact approved design SHA, reviewed-plan SHA, final-plan SHA,
+  owner-designated implementation-base SHA, candidate SHA, implementation diff,
+  authority table, targeted evidence, full-suite outputs, and residue audit.
 - Produces: independent review findings, exact test counts/durations, final
   Level A report, exact tested/pushed SHA, and preservation proof.
 
 - [ ] **Step 1: Run a fresh independent adversarial review before closure.**
 
 Invoke `superpowers:requesting-code-review` and give the reviewer the approved
-design and implementation plan as distinct review artifacts, with:
+design, earlier reviewed plan, and final amended plan as distinct review
+artifacts, with:
 
 ```text
 DESIGN_SHA=43196fca78a92d819aa1b3f117f964ecdd1659ea
-PLAN_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
-IMPLEMENTATION_BASE_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
+REVIEWED_PLAN_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
+FINAL_PLAN_SHA=57188a97a00f625264fc0c5997d53342a0996bfe
+IMPLEMENTATION_BASE_SHA=57188a97a00f625264fc0c5997d53342a0996bfe
 CANDIDATE_SHA=$(git rev-parse HEAD)
 ```
 
@@ -1019,8 +1025,8 @@ important findings.
 Run:
 
 ```bash
-git diff 72dedf962c20acbdddb4ec3930ab67f2daef8380...HEAD
-git diff --check 72dedf962c20acbdddb4ec3930ab67f2daef8380...HEAD
+git diff 57188a97a00f625264fc0c5997d53342a0996bfe...HEAD
+git diff --check 57188a97a00f625264fc0c5997d53342a0996bfe...HEAD
 ```
 
 If native code changed, run the repository's warning-clean GCC command and
