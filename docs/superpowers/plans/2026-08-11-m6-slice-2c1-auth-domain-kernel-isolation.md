@@ -10,7 +10,15 @@
 
 ## Global Constraints
 
-- Start implementation from published commit `43196fca78a92d819aa1b3f117f964ecdd1659ea` with Windows, WSL, `origin/main`, and GitHub SHA-identical and clean.
+- Preserve these distinct review identities throughout implementation and closure:
+
+  ```text
+  DESIGN_SHA=43196fca78a92d819aa1b3f117f964ecdd1659ea
+  PLAN_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
+  IMPLEMENTATION_BASE_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
+  ```
+
+- Begin implementation history from `IMPLEMENTATION_BASE_SHA`, with Windows, WSL, `origin/main`, and GitHub SHA-identical and clean. The subsequent amended-plan publication commit is documentation-only; Task 8 still compares the owner-designated implementation base with the candidate.
 - Author Linux security changes only in `/home/brand/src/AgenticOS`; synchronize `C:\AgenticOS` only through verified GitHub fast-forward operations.
 - Do not install native Codex, use a real OpenAI/ChatGPT credential, contact a live provider endpoint, or consume provider quota.
 - Target only `M6_SLICE2C1_STATUS=EARNED_LEVEL_A`; never claim whole-system Level B while the trusted same-UID controller can read persistent auth state.
@@ -26,10 +34,10 @@
 
 ## Planned file structure
 
-- Modify `src/agenticos/sandbox/provider_models.py`: immutable capability binding plus mutable trusted lease state and policy validation.
-- Modify `src/agenticos/sandbox/provider_broker.py`: validate complete subscription capability binding at broker construction and immediately before auth-header injection.
+- Modify `src/agenticos/sandbox/provider_models.py`: immutable capability binding and policy validation; no unsynchronized mutable lease integer.
+- Modify `src/agenticos/sandbox/provider_broker.py`: broker-owned, lock-protected atomic capability slot that validates/replaces/cancels and holds the same synchronization boundary through auth-header injection.
 - Rewrite `src/agenticos/sandbox/auth_helper_daemon.py`: standalone stdlib entrypoint, strict codec, bounded transports, Linux peer credentials, kernel hardening, Landlock, constrained auth loading, typed issuance state, and sanitized errors.
-- Rewrite `src/agenticos/sandbox/controller_auth_helper.py`: identity-bound launch, strict setup/READY validation, Linux socketpair, bounded Windows fallback, capability lease updates, and deterministic cleanup.
+- Rewrite `src/agenticos/sandbox/controller_auth_helper.py`: identity-bound launch, strict setup/READY validation, Linux socketpair, bounded Windows fallback, immutable capability construction, and deterministic cleanup.
 - Modify `src/agenticos/sandbox/provider_models.py` `AuthHelperProcessIdentity`: interpreter, entrypoint, root, hardening, FD, IPC, and helper-epoch evidence.
 - Modify `tests/conformance/test_provider_auth_helper_unit.py`: binding/model, strict codec, schema, Windows-compatible behavior, and identity unit contracts.
 - Modify `tests/conformance/test_provider_auth_process_boundary.py`: real process, peer, lifecycle, replay, issuance, hardening, and cleanup contracts.
@@ -51,22 +59,15 @@
 - Modify: `tests/conformance/test_provider_broker_unit.py`
 
 **Interfaces:**
-- Produces: `ProviderAuthBinding`, `CapabilityLease`, `ProviderAuthCapability.validate_for_policy(policy, now=None)`, and a fully bound `SubscriptionAuthCapability`.
+- Produces: `ProviderAuthBinding`, `ProviderAuthCapability.validate_for_policy(policy, now=None)`, an immutable fully bound `SubscriptionAuthCapability`, broker-private `_AtomicCapabilitySlot`, `TaskProviderBroker.replace_auth_capability(candidate, expected_sequence)`, and `TaskProviderBroker.cancel_auth_capability()`.
 - Consumes: existing `ProviderBrokerPolicy` task, generation, attempt, launch nonce, provider, upstream, and lifetime fields.
-- Invariant: `SyntheticBearerAuth` remains usable for pre-subscription synthetic tests, while every `SubscriptionAuthCapability` must have an exact binding and active lease.
+- Invariant: `SyntheticBearerAuth` remains usable for pre-subscription synthetic tests, while every `SubscriptionAuthCapability` has an exact immutable binding. The broker's slot—not a shared mutable integer—owns current capability, current sequence, helper epoch, expiry validation, and active/cancelled state under one lock.
 
-- [ ] **Step 1: Write failing model tests for complete binding, expiration, sequence, cancellation, and epoch invalidation.**
+- [ ] **Step 1: Write failing model tests for complete binding and expiration.**
 
-Add tests that construct a policy and the following exact objects:
+Add tests that construct a policy and the following exact object:
 
 ```python
-lease = CapabilityLease(
-    helper_epoch="0123456789abcdef0123456789abcdef",
-    task_id=policy.task_id,
-    generation=policy.generation,
-    attempt_id=policy.attempt_id,
-    current_sequence=1,
-)
 binding = ProviderAuthBinding(
     task_id=policy.task_id,
     generation=policy.generation,
@@ -77,7 +78,7 @@ binding = ProviderAuthBinding(
     upstream_host=policy.upstream_host,
     upstream_port=policy.upstream_port,
     provider_purpose="responses_sse",
-    helper_epoch=lease.helper_epoch,
+    helper_epoch="0123456789abcdef0123456789abcdef",
     request_nonce="11111111111111111111111111111111",
     capability_nonce="22222222222222222222222222222222",
     capability_sequence=1,
@@ -88,43 +89,33 @@ capability = SubscriptionAuthCapability(
     access_token="SYNTHETIC_ACCESS_123",
     account_id="acct_synthetic_456",
     binding=binding,
-    lease=lease,
 )
 capability.validate_for_policy(policy, now=1_800_000_001)
 ```
 
 Assert that altered task, generation, attempt, launch nonce, provider, scheme,
-host, or port; `now == expires_at`; `lease.current_sequence = 2`;
-`lease.active = False`; and a changed helper epoch each raise a stable
-`ProviderAuthBindingError` without embedding any secret.
+host, or port and `now == expires_at` each raise a stable
+`ProviderAuthBindingError` without embedding any secret. Slot-level tests below
+cover sequence, cancellation, and helper-epoch invalidation.
 
 - [ ] **Step 2: Run the new model tests and confirm RED.**
 
 Run:
 
 ```bash
-.venv/bin/python -m pytest tests/conformance/test_provider_auth_helper_unit.py -k "binding or lease" -v
+.venv/bin/python -m pytest tests/conformance/test_provider_auth_helper_unit.py -k "binding or capability" -v
 ```
 
-Expected: collection/import failure because `ProviderAuthBinding` and
-`CapabilityLease` do not exist.
+Expected: collection/import failure because `ProviderAuthBinding` does not
+exist.
 
-- [ ] **Step 3: Implement the minimal binding and lease types.**
+- [ ] **Step 3: Implement the minimal immutable binding type.**
 
 Add validated dataclasses with these fields and methods:
 
 ```python
 class ProviderAuthBindingError(RuntimeError):
     pass
-
-@dataclass
-class CapabilityLease:
-    helper_epoch: str
-    task_id: str
-    generation: int
-    attempt_id: int
-    current_sequence: int
-    active: bool = True
 
 @dataclass(frozen=True)
 class ProviderAuthBinding:
@@ -147,40 +138,93 @@ class ProviderAuthBinding:
 
 Give `ProviderAuthCapability` a default `validate_for_policy()` implementation
 for `SyntheticBearerAuth`. Require `SubscriptionAuthCapability` to compare every
-binding field with `ProviderBrokerPolicy`, check wall-clock expiry, and validate
-the shared lease's epoch, active state, task context, and current sequence.
-Keep `SecretValue.__repr__` and `__str__` redacted and export the new public
-binding, lease, and error names from `provider_models.__all__`.
+binding field with `ProviderBrokerPolicy` and check wall-clock expiry. Keep
+`SecretValue.__repr__` and `__str__` redacted and export the new public binding
+and error names from `provider_models.__all__`.
 
-- [ ] **Step 4: Add failing broker-consumption tests.**
+- [ ] **Step 4: Add failing broker-consumption and atomic-replacement tests.**
 
 Assert `TaskProviderBroker(policy, wrong_capability)` raises
-`ProviderAuthBindingError` before opening a listener. Then build a valid broker,
-advance `lease.current_sequence`, and assert a synthetic client request returns
-`PROVIDER_AUTH_UNAVAILABLE` before the fake upstream receives a connection.
+`ProviderAuthBindingError` before opening a listener. Then exercise these exact
+races with `threading.Barrier`-controlled test hooks around validation and
+injection:
+
+```text
+replacement during validation
+cancellation during validation
+replacement immediately before injection
+two concurrent replacement attempts with the same expected sequence
+stale sequence after a completed replacement
+```
+
+Assert one concurrent compare-and-swap replacement succeeds and the other gets
+`ProviderAuthBindingError`; cancellation wins permanently; and after
+replacement or cancellation returns, the superseded access token can never be
+observed by the fake upstream.
 
 - [ ] **Step 5: Run broker tests and confirm RED at the missing validation call.**
 
 Run:
 
 ```bash
-.venv/bin/python -m pytest tests/conformance/test_provider_broker_unit.py -k "subscription and binding" -v
+.venv/bin/python -m pytest tests/conformance/test_provider_broker_unit.py -k "subscription or binding or replacement or cancellation or sequence" -v
 ```
 
-Expected: the wrong capability is accepted by the current constructor.
+Expected: the wrong capability is accepted by the current constructor and no
+atomic replacement/cancellation API exists.
 
-- [ ] **Step 6: Validate at construction and immediately before header injection.**
+- [ ] **Step 6: Implement one atomic slot and define its linearization rule.**
 
-Call:
+`_AtomicCapabilitySlot` owns an `RLock`, current immutable capability, current
+sequence, helper epoch, and active/cancelled state. It exposes:
 
 ```python
-self._auth_capability.validate_for_policy(self._policy)
+def replace(
+    self,
+    candidate: ProviderAuthCapability,
+    *,
+    policy: ProviderBrokerPolicy,
+    expected_sequence: int,
+) -> None: ...
+
+def cancel(self) -> None: ...
+
+def validate_extract_and_send(
+    self,
+    *,
+    policy: ProviderBrokerPolicy,
+    sender: Callable[[SecretValue, dict[str, SecretValue]], None],
+) -> None: ...
 ```
 
-after constructor type checks and again immediately before
-`get_auth_header()`. Map a late failure to
-`ProviderFailureClass.PROVIDER_AUTH_UNAVAILABLE` without returning the exception
-text.
+`replace()` acquires the lock, requires the slot active, validates every policy
+field/epoch/expiry, requires `expected_sequence == current_sequence` and
+`candidate.sequence == current_sequence + 1`, then swaps current capability and
+sequence as one critical section. `cancel()` acquires the same lock, marks the
+slot cancelled, and clears its current capability before returning.
+
+`validate_extract_and_send()` acquires that same lock and holds it continuously
+while checking active state, helper epoch, current sequence, expiry, and policy;
+extracting the authorization/account headers; and invoking the bounded sender
+that completes the upstream `sendall()`. Its successful `sendall()` completion
+is the credential-injection linearization point. Replacement/cancellation
+linearizes at its state mutation while holding the same lock. Therefore, if an
+old injection acquired the lock first, replacement/cancellation cannot return
+until that bounded send completes; if replacement/cancellation returns first,
+the old capability cannot later validate or inject. Socket timeouts bound lock
+hold time. No secret-bearing header escapes the critical section for later use.
+
+`TaskProviderBroker.replace_auth_capability()` and
+`cancel_auth_capability()` delegate to the slot. Broker `stop()` cancels the
+slot before returning. Map slot validation/race failures to
+`PROVIDER_AUTH_UNAVAILABLE` without returning exception text.
+
+The capability-slot lock and existing broker lifecycle lock have a fixed
+non-nesting rule: the bounded sender callback may use the already-selected
+upstream socket but must not acquire the broker lifecycle lock, and `stop()`
+must cancel the slot before acquiring the lifecycle lock for socket teardown.
+No path holds one lock while waiting for the other, preventing replacement or
+cancellation from deadlocking behind an in-flight injection.
 
 - [ ] **Step 7: Verify GREEN and focused regressions.**
 
@@ -251,8 +295,17 @@ over 16,384 bytes before sending. `AuthProtocolError` stores only a fixed code.
 On Linux, create `socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)`,
 enable `SO_PASSCRED`, and assert the receiver obtains exactly one
 `SCM_CREDENTIALS` record matching the actual sender PID/UID/GID. Separately
-send a 16,385-byte packet, a zero-length packet, and an `SCM_RIGHTS` FD and
-assert truncation, empty input, and unexpected ancillary data fail closed.
+send a 16,385-byte packet, a zero-length packet, duplicate credential records,
+and one/multiple `SCM_RIGHTS` FDs. Assert `MSG_TRUNC`, synthetic `MSG_CTRUNC`,
+empty input, non-exact credential cardinality, and unexpected ancillary data
+all fail closed.
+
+For the `SCM_RIGHTS` attack, census the receiver's live FDs before and after
+the rejected packet with bounded `fcntl(F_GETFD)` probes. Assert every
+received descriptor is closed, its sentinel is unreadable, and the helper's
+allowed FD census is unchanged. Include a case combining valid
+`SCM_CREDENTIALS` with `SCM_RIGHTS` so valid sender identity cannot smuggle
+descriptor authority.
 Fork a bounded child to send on a deliberately inherited controller endpoint
 and assert its different SCM PID is rejected.
 
@@ -269,19 +322,50 @@ not implemented.
 
 - [ ] **Step 6: Implement fixed-buffer `recvmsg()` and credential validation.**
 
-Use `recvmsg(limit + 1, socket.CMSG_SPACE(struct.calcsize("3i")))`, reject
-`MSG_TRUNC`, require one `(SOL_SOCKET, SCM_CREDENTIALS)` record, reject all
-other ancillary records including `SCM_RIGHTS`, compare the three integers with
-the expected PID/UID/GID, and set a 2.0-second socket timeout. Count packets and
-fail at message 4,097. Use `sendmsg([encoded])` for one record.
+Use a fixed ancillary buffer large enough for one credentials record plus the
+Linux `SCM_MAX_FD` bound of 253 integer descriptors:
+
+```python
+ancillary_bytes = (
+    socket.CMSG_SPACE(struct.calcsize("3i"))
+    + socket.CMSG_SPACE(253 * array.array("i").itemsize)
+)
+payload, ancillary, flags, _ = sock.recvmsg(limit + 1, ancillary_bytes)
+```
+
+Before validating credentials or raising any protocol error, walk every
+ancillary record. Decode every complete integer in every `SCM_RIGHTS` payload
+into a quarantine list. In one `finally` block, close every quarantined FD,
+including FDs delivered alongside otherwise-valid credentials. Reject both
+`MSG_TRUNC` and `MSG_CTRUNC`; reject malformed/truncated rights payloads; require
+exactly one `(SOL_SOCKET, SCM_CREDENTIALS)` record; and reject every other or
+additional record. Descriptor cleanup precedes returning the fail-closed
+`IPC_UNEXPECTED_ANCILLARY`/`IPC_ANCILLARY_TRUNCATED` error. Compare the three
+credential integers with expected PID/UID/GID and set a 2.0-second socket
+timeout. Count packets and fail at message 4,097. Use `sendmsg([encoded])` for
+one record.
+
+On every ancillary failure—including `MSG_CTRUNC`, where a record may be only
+partially exposed—re-run bounded allowlist sanitation after closing decoded
+rights, retaining only standard streams and the current authenticated IPC FD,
+then revalidate that task's allowed census before sending the stable error or
+terminating. Task 3 normalizes the IPC FD to 3 and implements this as
+`close_range(4, UINT_MAX, 0)` plus exact `(0,1,2,3)` validation. Thus even a
+kernel-installed descriptor that cannot be safely attributed from truncated
+metadata is removed before the helper processes another request.
 
 - [ ] **Step 7: Implement the bounded Windows fallback without changing its claim level.**
 
 Retain one loopback TCP listener only on Windows. Deliver a 32-byte random
-bootstrap nonce through inherited stdin, authenticate the only accepted
+bootstrap nonce through inherited stdin. The helper applies a 2.0-second
+deadline, reads exactly 32 bytes with no delimiter or growth, rejects early EOF
+or any 33rd byte in the bounded bootstrap frame, consumes the nonce once, and
+immediately closes the inherited stdin/bootstrap handle (or rebinds FD 0 to
+null before normal protocol processing). Authenticate the only accepted
 connection, close the listener immediately, and use a four-byte big-endian
-length prefix with the same 16,384-byte limits and 2.0-second timeouts. Do not
-add Windows peer/kernel-isolation claims.
+length prefix with the same 16,384-byte limits and 2.0-second timeouts. The
+Windows bootstrap channel is functional-regression behavior only; it is not
+part of the Linux Level A FD or kernel claim.
 
 - [ ] **Step 8: Remove Linux TCP/line-delimited behavior and verify GREEN.**
 
@@ -320,6 +404,9 @@ SHA, fast-forward Windows, and prove both authoritative clones clean and equal.
   import variables or repository/user-site search authority.
 - Invariant: controller-created PID, per-packet SCM PID, protocol identity, and
   implementation identities all agree before READY is accepted.
+- Linux-only invariant: READY's exact live descriptor set is `(0, 1, 2, 3)`,
+  with `0/1/2` bound to null and FD 3 the connected `SOCK_SEQPACKET` endpoint.
+  This exact census is not asserted as a Windows kernel property.
 
 The expanded frozen evidence model retains existing names where compatible and
 uses this exact field set:
@@ -343,7 +430,7 @@ class AuthHelperProcessIdentity:
     cwd: str
     env_keys: tuple[str, ...]
     import_paths: tuple[str, ...]
-    open_fds: tuple[int, ...]
+    open_fds: tuple[int, ...]  # exact (0,1,2,3) only in qualified Linux READY
     ipc_endpoint: str
     ipc_type: str
     ipc_peer_auth: str
@@ -410,13 +497,18 @@ Landlock.
 
 - [ ] **Step 4: Write failing hardening/FD tests.**
 
-Launch with deliberate inherited repository file, repository directory,
+On Linux, launch with deliberate inherited repository file, repository directory,
 workspace, `.git`, unrelated-controller, and connected-socket FDs through a
 test-only constructor argument. Assert READY reports exactly `(0, 1, 2, 3)`,
 stdin/stdout/stderr target null, core soft/hard limits zero, dumpable zero,
 `NO_NEW_PRIVS` one, and every deliberate descriptor unusable with `EBADF`.
 Inject failures for core limit, dumpability, FD sanitation, and NNP; assert the
 controller never accepts READY.
+
+On Windows, separately assert the inherited stdin bootstrap contains only the
+bounded one-use nonce, is fully consumed once under its deadline, and is closed
+or rebound to null before READY/normal protocol processing. Do not require the
+Linux `(0,1,2,3)` census or infer a Windows kernel-isolation claim.
 
 - [ ] **Step 5: Run hardening tests and confirm RED.**
 
@@ -431,13 +523,15 @@ set.
 
 - [ ] **Step 6: Implement hardening and exact census.**
 
-Before setup processing, call `setrlimit(RLIMIT_CORE, (0, 0))`,
+On Linux before setup processing, call `setrlimit(RLIMIT_CORE, (0, 0))`,
 `prctl(PR_SET_DUMPABLE, 0)`, duplicate the IPC socket to FD 3, and use
 `close_range(4, UINT_MAX, 0)`. Close original duplicates and validate live FDs
 with bounded `fcntl(F_GETFD)` probes without relying on `/proc`. After receiving
 the authenticated non-secret setup record, call and verify
 `PR_SET_NO_NEW_PRIVS`. Bind standard streams to null and return all hardening
-state only in authenticated READY.
+state only in authenticated READY. The Windows path follows Task 2's separate
+consume-once-and-close stdin bootstrap contract and reports functional evidence
+without claiming the Linux descriptor layout.
 
 - [ ] **Step 7: Bind READY to process creation and per-packet credentials.**
 
@@ -614,8 +708,10 @@ credential in the response.
 
 For one active attempt, send eight requests with unique 32-hex request nonces.
 Assert response sequences `1..8`, distinct capability nonces, matching helper
-epoch, expiry no later than `issued_at + 300`, and the shared lease marks each
-prior capability stale after replacement. Assert the ninth request,
+epoch, and expiry no later than `issued_at + 300`. Install each replacement
+through `TaskProviderBroker.replace_auth_capability()` and assert the atomic
+slot rejects every prior sequence after the replacement returns. Assert the
+ninth request,
 duplicate nonce, expired capability, stale sequence, cancelled context, and old
 helper epoch fail closed. Assert another task/generation/attempt has an
 independent sequence starting at one.
@@ -648,12 +744,18 @@ Keep synthetic expiry-triggered refresh entirely inside the auth domain. Ensure
 `GET_REFRESH_TOKEN`, `GET_ACCESS_TOKEN`, `DUMP_AUTH_STATE`, `SHOW_AUTH_JSON`,
 and unknown actions receive `IPC_UNKNOWN_OPERATION` with no echoed input.
 
-- [ ] **Step 6: Update controller capability construction and lease state.**
+- [ ] **Step 6: Update controller capability construction and broker replacement integration.**
 
 Generate a new request nonce per issuance, validate every echoed field, build
-`ProviderAuthBinding`, update the per-attempt `CapabilityLease.current_sequence`,
-and return `SubscriptionAuthCapability`. Cancellation marks the lease inactive
-and sends the exact context; helper stop invalidates every lease from its epoch.
+`ProviderAuthBinding`, and return an immutable `SubscriptionAuthCapability`.
+The trusted orchestration path passes a newly issued candidate and the
+previously observed sequence into
+`TaskProviderBroker.replace_auth_capability(candidate, expected_sequence=...)`;
+it never assigns broker internals directly. Cancellation first sends the exact
+helper context and then calls `broker.cancel_auth_capability()`; helper stop
+cancels every broker slot registered to that helper epoch. Add an integration
+test proving a running broker adopts sequence two and injects only sequence
+two's access token after the replacement call returns.
 
 - [ ] **Step 7: Add crash, timeout, disconnect, flood, and cleanup tests.**
 
@@ -878,20 +980,32 @@ exact SHA, fast-forward Windows, and prove clean/equal clones.
 - Modify production/tests only for independently reproduced review findings.
 
 **Interfaces:**
-- Consumes: exact approved design, this plan, base SHA, candidate SHA, diff,
-  authority table, targeted evidence, full-suite outputs, and residue audit.
+- Consumes: exact approved design SHA, reviewed plan SHA, owner-designated
+  implementation-base SHA, candidate SHA, implementation diff, authority table,
+  targeted evidence, full-suite outputs, and residue audit.
 - Produces: independent review findings, exact test counts/durations, final
   Level A report, exact tested/pushed SHA, and preservation proof.
 
 - [ ] **Step 1: Run a fresh independent adversarial review before closure.**
 
 Invoke `superpowers:requesting-code-review` and give the reviewer the approved
-design, implementation plan, `BASE_SHA=43196fca78a92d819aa1b3f117f964ecdd1659ea`,
-candidate SHA, and explicit invalidation questions covering absolute paths,
+design and implementation plan as distinct review artifacts, with:
+
+```text
+DESIGN_SHA=43196fca78a92d819aa1b3f117f964ecdd1659ea
+PLAN_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
+IMPLEMENTATION_BASE_SHA=72dedf962c20acbdddb4ec3930ab67f2daef8380
+CANDIDATE_SHA=$(git rev-parse HEAD)
+```
+
+Give the reviewer the implementation diff from `IMPLEMENTATION_BASE_SHA` to
+`CANDIDATE_SHA` and explicit invalidation questions covering absolute paths,
 symlinks, `/proc/self/fd`, inherited directories, auth-root replacement,
 implementation identity, SCM sender binding, unexpected same-UID peers, IPC
-memory/time bounds, nonce/sequence replay, cross-policy reuse, exceptions,
-evidence, READY ordering, and ambient-auth fallback.
+memory/time bounds, `MSG_CTRUNC`, SCM_RIGHTS cleanup/FD residue,
+nonce/sequence replay, atomic replacement/cancellation races, cross-policy
+reuse, exceptions, evidence, READY ordering, Windows bootstrap closure, and
+ambient-auth fallback.
 
 - [ ] **Step 2: Resolve every critical/important finding test-first.**
 
@@ -905,8 +1019,8 @@ important findings.
 Run:
 
 ```bash
-git diff 43196fca78a92d819aa1b3f117f964ecdd1659ea...HEAD
-git diff --check 43196fca78a92d819aa1b3f117f964ecdd1659ea...HEAD
+git diff 72dedf962c20acbdddb4ec3930ab67f2daef8380...HEAD
+git diff --check 72dedf962c20acbdddb4ec3930ab67f2daef8380...HEAD
 ```
 
 If native code changed, run the repository's warning-clean GCC command and
