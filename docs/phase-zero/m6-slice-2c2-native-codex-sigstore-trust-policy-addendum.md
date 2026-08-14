@@ -4,11 +4,22 @@ Status: documentation-only trust decision, prepared 2026-08-12.
 
 ```text
 DECISION_OUTCOME=INDEPENDENT_OWNER_DIGEST_REQUIRED
-RESEARCH_STATUS=BLOCKED_PENDING_OWNER_DIGEST
+RESEARCH_STATUS=BLOCKED_NO_APPROVED_PREEXISTING_OWNER_DIGEST_AUTHORITY
 SIGSTORE_AUTHORITY_SELECTED=NO
+SIGSTORE_SWITCH_REVIEWED=YES
+SIGSTORE_SWITCH_DECISION=REJECTED_BLOCKED_MISSING_TARGET_ARCHIVE_MEMBER_BINDING
 OWNER_DIGEST_BRANCH_APPROVED=YES
+OWNER_DIGEST_BRANCH_STATUS=BLOCKED_NO_APPROVED_PREEXISTING_AUTHORITY
 OWNER_DIGEST_DELIVERY_MODE_SELECTED=NO
+OWNER_KEY_GENERATED=YES
+OWNER_PRIVATE_KEY_ACCESSED_BY_AGENT=NO
+OWNER_PUBLIC_KEY_ENROLLED=YES
+OWNER_PUBLIC_KEY_ENROLLMENT_COMMIT=3214251452e85549dedb0e97b0aeddc3df251e95
+OWNER_FINGERPRINT_APPROVED=YES
+OWNER_FINGERPRINT=SHA256:LQBNgC3HqdwfSWZr/7mvLlSUBwhodPOM0tFDdKZpIs4
 OWNER_DIGEST_RECEIVED=NO
+OWNER_DIGEST_STATEMENT_SIGNED=NO
+OWNER_DIGEST_STATEMENT_VALIDATED=NO
 GATE_A_APPROVED=YES
 GATE_B_APPROVED=NO
 ARTIFACT_ACQUIRED=NO
@@ -16,6 +27,8 @@ SIGSTORE_EVIDENCE_ACQUIRED=NO
 VERIFIER_ACQUIRED_OR_EXECUTED=NO
 ARTIFACT_INSTALLED_OR_EXECUTED=NO
 REAL_AUTHENTICATION_OR_PROVIDER_ACCESS=NO
+ARTIFACT_ACQUIRED_OR_EXECUTED=NO
+CODEX_OR_SIGSTORE_ACQUIRED_OR_EXECUTED=NO
 ```
 
 This addendum closes the verifier/trust-policy research blocker in
@@ -31,6 +44,17 @@ did not supply the digest or select its authenticated delivery mode and did not
 authorize Gate B or any acquisition, installation, execution, authentication,
 provider access, production integration, self-hosting, artifact, or version
 widening. Those boundaries remain blocked.
+
+Documentation-only reconciliation approved on 2026-08-14 records completed
+owner-only key generation and generation-1 public enrollment at commit
+`3214251452e85549dedb0e97b0aeddc3df251e95`, with separately approved
+fingerprint `SHA256:LQBNgC3HqdwfSWZr/7mvLlSUBwhodPOM0tFDdKZpIs4`. No agent, model, or
+controller accessed private-key material. No owner digest exists. Branch O
+remains selected but blocked because no approved pre-existing independent
+OpenAI raw-member digest authority exists. The proposed Branch S switch was
+reviewed and rejected/blocked because the existing raw-byte signature does not
+cryptographically bind the exact target, archive, and member identity. Gate B
+remains unapproved.
 
 ## 1. Scope and hard prohibitions
 
@@ -283,9 +307,10 @@ safe archive extraction.
 
 ### 6.2 Selected authority branch: owner digest
 
-The owner-digest branch is approved, but no owner digest or authenticated
-delivery mode exists yet, so this policy is incomplete and gate B remains
-blocked. Before B can be reviewed, the owner must deliver one canonical
+The owner-digest branch is approved, but no approved pre-existing independent
+OpenAI raw-member digest authority, owner digest, or authenticated delivery
+mode exists, so this policy is incomplete and gate B remains blocked. Before B
+can be reviewed, the owner must deliver one canonical
 `AOSCODEXOWNERDIGEST/1` statement through an authenticated authority
 independent of GitHub release hosting and the OpenAI sidecar:
 
@@ -325,9 +350,12 @@ used in this branch.
 
 ### 6.3 Sigstore branch requirements and blocker
 
-The Sigstore branch is **not selected**. It cannot be made authoritative by
-merely filling values from the acquired sidecar. Reconsideration requires a
-new pre-acquisition owner review and must, at minimum, pin and enforce:
+The Sigstore branch is **not selected**. The 2026-08-14 reconsideration was
+rejected and remains blocked: it cannot be made authoritative by merely
+filling values from the acquired sidecar, and verifier qualification cannot
+create the missing target/archive/member assertion. Any future reconsideration
+would require new evidence and a new pre-acquisition owner review and must, at
+minimum, pin and enforce:
 
 | Constraint | Required policy | Current state |
 |---|---|---|
@@ -361,18 +389,24 @@ a ready Sigstore-policy outcome.
 
 ### 7.1 Pinned official Cosign binary
 
-Candidate: official Cosign `v3.0.6`, Linux amd64 asset ID `390331694`,
-135,178,161 bytes, GitHub-recorded SHA-256
-`c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74`.
-Its sibling bundle is asset `390332772`, 6,339 bytes, GitHub-recorded SHA-256
-`b3a04913f3a3f4a38e4a7a42b8d590834b8791de99ddeaad66c608b6aa8e02a4`.
+Reviewed patched candidate: official Cosign `v3.1.3`, Linux amd64 asset ID
+`503286005`, 141,178,250 bytes, GitHub-recorded SHA-256
+`4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71`.
+Its sibling bundle is asset `503286953`, 6,406 bytes, GitHub-recorded SHA-256
+`e16547fbee348eb23bd7e5a4d542b540395faea2e7bb1d18da01bbc3cc74d57d`.
 
-This is the smallest official executable option and is newer than the fixed
-Cosign advisory affecting legacy bundle verification; official advisory
-`GHSA-whqx-f9j3-ch6m` requires at least 2.6.2 or 3.0.4. Version 3.0.6 includes
-Sigstore/Cosign's large compiled feature and dependency closure and must be
+This candidate is the minimum patched v3 release for the August 2026 high-
+severity legacy-bundle identity-bypass advisory `GHSA-fx35-mq7g-6g98`, which
+affects Cosign through `v3.1.2`; the corresponding patched v2 floor is `v2.6.5`.
+The previously recorded `v3.0.6` candidate is affected and is disqualified.
+Earlier advisory `GHSA-whqx-f9j3-ch6m` separately requires at least 2.6.2 or
+3.0.4 for Rekor-entry association. Version 3.1.3 includes Sigstore/Cosign's
+large compiled feature and dependency closure and must be
 invoked with explicit legacy-bundle, offline/online, identity, issuer, workflow
-claim, trust-root, Rekor-key, and output bounds. It must not auto-update TUF,
+claim, Fulcio/CT/Rekor trust-material, and output bounds. Its legacy blob path
+does not accept `--trusted-root`, which is reserved for the standardized-bundle
+path, so an exact separately qualified legacy trust-material procedure would
+be required. It must not auto-update TUF,
 select ambient roots, consult ambient network, or accept insecure-ignore flags.
 It is a single-executable distribution candidate, but its exact ELF linkage and
 host-runtime closure are acquisition-time unknowns. This policy's stronger
@@ -388,18 +422,28 @@ sidecar cannot bootstrap itself. Host qualification, exact executable/dependency
 identity, parser adversarial tests, retained invocation/output, and controlled
 trust-root acquisition would all be required.
 
+The August 2026 advisory demonstrates that a legacy bundle containing an
+attacker-controlled raw public key could bypass X.509 chain, identity, and OIDC
+issuer enforcement and even overwrite an explicitly supplied verification key.
+Therefore `Verified OK` is never sufficient, legacy `cert` must parse as
+exactly one Fulcio X.509 certificate, and every bare-key, key-overwrite, and
+identity-bypass negative case must fail. Updating the verifier does not repair
+the structural target/archive/member gap, so Branch S remains rejected.
+
 Primary sources:
 
-- `https://api.github.com/repos/sigstore/cosign/releases/tags/v3.0.6`
-- `https://api.github.com/repos/sigstore/cosign/releases/assets/390331694`
-- `https://api.github.com/repos/sigstore/cosign/releases/assets/390332772`
+- `https://api.github.com/repos/sigstore/cosign/releases/tags/v3.1.3`
+- `https://api.github.com/repos/sigstore/cosign/releases/assets/503286005`
+- `https://api.github.com/repos/sigstore/cosign/releases/assets/503286953`
+- `https://github.com/sigstore/cosign/security/advisories/GHSA-fx35-mq7g-6g98`
 - `https://github.com/sigstore/cosign/security/advisories/GHSA-whqx-f9j3-ch6m`
 
 ### 7.2 Vendored or source-built verifier/library
 
-Candidate baseline: Cosign source `v3.0.6`, Go `1.25.7`, with
-`sigstore-go v1.1.4` and the exact module graph in its `go.mod`. A genuinely
-minimal verifier would still need X.509/Fulcio/SCT validation, legacy Cosign
+No source-built verifier is approved. A candidate based on Cosign source
+`v3.1.3` would require an independently pinned Go toolchain and the exact
+module graph in its `go.mod` and `go.sum`. A genuinely minimal verifier would
+still need X.509/Fulcio/SCT validation, legacy Cosign
 bundle parsing, RFC 8785 SET verification, hashedrekord parsing and equality
 checks, Rekor inclusion/checkpoint/consistency validation, TUF rollback/freeze
 protection, GitHub certificate-extension policy, and strict JSON/bounds.
@@ -413,11 +457,9 @@ the selected Codex trust problem; a hand-minimized implementation has a smaller
 runtime but a higher parser/cryptography correctness burden. It does not solve
 the missing target binding.
 
-The signed annotated tag object is
-`77891cd80a8f2bac1a2bf2f37f2e6005df38e51a` and resolves to commit
-`f1ad3ee952313be5d74a49d67ba0aa8d0d5e351f`. GitHub reports the tag signature
-valid, but no maintainer SSH key is independently pinned in AgenticOS, and
-GitHub-generated source archives have no independently approved digest here.
+No Cosign `v3.1.3` source tag, toolchain, module, or generated-source authority
+is independently pinned in AgenticOS, and GitHub-generated source archives
+have no independently approved digest here.
 Network would be needed to acquire every source/toolchain object and, under the
 future transparency policy, controlled Rekor/checkpoint material. Audit evidence
 would need every source/module/toolchain digest, build invocation, produced
@@ -426,9 +468,8 @@ Any source, module, toolchain, or trust-root update is a new qualification.
 
 Primary sources:
 
-- `https://github.com/sigstore/cosign/blob/v3.0.6/go.mod`
-- `https://api.github.com/repos/sigstore/cosign/git/tags/77891cd80a8f2bac1a2bf2f37f2e6005df38e51a`
-- `https://github.com/sigstore/sigstore-go/tree/v1.1.4`
+- `https://github.com/sigstore/cosign/blob/v3.1.3/go.mod`
+- `https://github.com/sigstore/cosign/blob/v3.1.3/go.sum`
 
 ### 7.3 Independent owner digest
 
@@ -586,8 +627,9 @@ needed. Truncation is an explicit failure, never a passing record.
   TUF root compromise affects verifier trust. Owner digest independence is the
   selected compensating authority for exact bytes, not a claim those systems
   are uncompromised.
-- No verifier or trust-root snapshot is approved. Cosign 3.0.6 metadata is a
-  comparison candidate only.
+- No verifier or trust-root snapshot is approved. Cosign `v3.1.3` is only the
+  reviewed patched comparison candidate; it has not been acquired, executed,
+  bootstrapped, or qualified.
 - Existing Connected Build does not automatically authorize the release CDN
   redirect. Gate B must close that host/protocol qualification separately.
 - Successful acquisition and passive qualification would not authorize
@@ -619,6 +661,20 @@ unresolved Important findings. Any attempt to populate the unknown certificate,
 bundle, Rekor, or trust-root values would require prohibited byte acquisition;
 the policy therefore keeps that branch blocked instead of inventing pins.
 
+A second fresh documentation-only adversarial review was performed on
+2026-08-14 against the exact state-reconciliation diff. It found and resolved:
+
+| Severity | Finding | Resolution |
+|---|---|---|
+| Critical | The available raw-byte signature authenticates bytes under a shared Linux workflow identity but does not cryptographically bind the selected target, archive, or member. | Rejected and blocked the proposed Branch S switch; Branch O remains the sole selected branch. |
+| Critical | The prior Cosign `v3.0.6` candidate is affected by the August 2026 legacy-bundle identity-bypass advisory. | Disqualified `v3.0.6`; recorded unapproved `v3.1.3` as the minimum patched v3 comparison candidate and retained all bootstrap/qualification blockers. |
+| Important | `OWNER_PRIVATE_KEY_ACCESSED=NO` could falsely imply that the owner never handled the generated key. | Replaced it with explicit owner-only offline-ceremony handling and `OWNER_PRIVATE_KEY_ACCESSED_BY_AGENT=NO`; prose also excludes model and controller access. |
+| Important | Gate 2-4 and public-enrollment state text remained stale after publication. | Recorded completed owner-only generation, generation-1 enrollment commit and fingerprint approval while preserving every digest, signing, validation, acquisition, execution, authentication, and Gate B denial. |
+
+After those resolutions, the second review found zero unresolved Critical and
+zero unresolved Important findings. No finding was waived or converted into
+authority.
+
 ## 13. Decision and exact next owner action
 
 ```text
@@ -628,10 +684,11 @@ INDEPENDENT_OWNER_DIGEST_REQUIRED
 The available Sigstore evidence shape and verifier bootstrap are insufficient
 to authenticate the selected target mapping under a precise pre-acquisition
 fail-closed policy. Gate A and the §6.2 owner-digest authority branch were
-approved on 2026-08-12. The exact next required owner input is the canonical
-`AOSCODEXOWNERDIGEST/1` statement containing the independently authenticated
-SHA-256 for the uncompressed `codex-x86_64-unknown-linux-musl` binary and naming
-exactly one pre-existing authenticated delivery mode and identity.
+approved on 2026-08-12, but Branch O remains blocked because no approved
+pre-existing independent OpenAI raw-member digest authority currently exists.
+No `AOSCODEXOWNERDIGEST/1` statement may be created or signed unless such an
+authority first exists and the owner separately approves the exact Gate 5
+procedure and delivery identity in a new decision.
 
 Gate B remains unapproved after that input and requires a later separate owner
 decision authorizing the exact GitHub/CDN acquisition path.

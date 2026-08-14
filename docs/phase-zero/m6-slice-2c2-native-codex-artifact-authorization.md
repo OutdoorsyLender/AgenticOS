@@ -8,14 +8,27 @@ NATIVE_CLIENT_QUALIFICATION=BLOCKED_OWNER_AUTHORIZATION
 M6_SLICE2C1_STATUS=EARNED_LEVEL_A
 GATE_A_APPROVED=YES
 BYTE_AUTHORITY_BRANCH=INDEPENDENT_OWNER_DIGEST
+BYTE_AUTHORITY_BRANCH_STATUS=BLOCKED_NO_APPROVED_PREEXISTING_AUTHORITY
+OWNER_KEY_GENERATED=YES
+OWNER_PRIVATE_KEY_ACCESSED_BY_AGENT=NO
+OWNER_PUBLIC_KEY_ENROLLED=YES
+OWNER_PUBLIC_KEY_ENROLLMENT_COMMIT=3214251452e85549dedb0e97b0aeddc3df251e95
+OWNER_FINGERPRINT_APPROVED=YES
+OWNER_FINGERPRINT=SHA256:LQBNgC3HqdwfSWZr/7mvLlSUBwhodPOM0tFDdKZpIs4
 OWNER_DIGEST_RECEIVED=NO
+OWNER_DIGEST_STATEMENT_SIGNED=NO
+OWNER_DIGEST_STATEMENT_VALIDATED=NO
+BRANCH_S_SWITCH_DECISION=REJECTED_BLOCKED_MISSING_TARGET_ARCHIVE_MEMBER_BINDING
 GATE_B_APPROVED=NO
 ARTIFACT_ACQUIRED=NO
 ARTIFACT_INSTALLED=NO
 ARTIFACT_EXECUTED=NO
 REAL_AUTHENTICATION_USED=NO
 LIVE_PROVIDER_ACCESS_USED=NO
-ACQUISITION_RECOMMENDATION=BLOCKED_OWNER_DIGEST_AND_GATE_B
+ARTIFACT_ACQUIRED_OR_EXECUTED=NO
+CODEX_OR_SIGSTORE_ACQUIRED_OR_EXECUTED=NO
+REAL_AUTHENTICATION_OR_PROVIDER_ACCESS=NO
+ACQUISITION_RECOMMENDATION=BLOCKED_GATE5_AND_GATE_B
 ```
 
 This packet records narrowly separated owner permissions for one exact official
@@ -30,6 +43,18 @@ The decision explicitly did not authorize acquisition, installation, execution,
 authentication, provider access, production integration, self-hosting, or any
 other artifact or version. Gates B–D therefore remain unapproved and blocked;
 Gate E remains explicitly denied.
+
+Documentation-only reconciliation approved on 2026-08-14 records that the
+owner completed the approved offline key ceremony, generation-1 public
+enrollment was published at commit
+`3214251452e85549dedb0e97b0aeddc3df251e95`, and the owner separately approved
+fingerprint `SHA256:LQBNgC3HqdwfSWZr/7mvLlSUBwhodPOM0tFDdKZpIs4`. Only the owner handled the
+private key; no agent, model, or controller accessed private-key material.
+Branch O remains selected but blocked because no approved pre-existing
+independent OpenAI raw-member digest authority exists. The proposed Branch S
+switch was reviewed and rejected/blocked because the existing raw-byte
+signature does not cryptographically bind the exact target, archive, and
+member identity. Gate B remains unapproved.
 
 ## 1. Exact requested artifact
 
@@ -186,14 +211,15 @@ is:
 
 The host currently has no established `cosign` executable or Python Sigstore
 package, and the exact signer claims have not been independently pinned.
-Therefore this packet does **not** recommend or request permission B yet. A
-reviewed addendum must select exactly one mutually exclusive binary-byte
-authority:
+The reviewed addendum selects exactly one mutually exclusive binary-byte
+authority and does **not** recommend or request permission B:
 
-- **Branch S — Sigstore:** pin the complete verifier/trusted-root/signer policy
-  above, acquire both asset IDs, and verify the extracted binary against it; or
-- **Branch O — owner digest:** receive an independent expected SHA-256 for the
-  uncompressed binary through a separately authenticated owner authority,
+- **Branch S — Sigstore — REJECTED/BLOCKED:** the available raw-byte signature
+  does not cryptographically bind the exact target, archive, and member. A
+  verifier or same-origin GitHub metadata cannot repair that structural gap.
+- **Branch O — owner digest — SELECTED/BLOCKED:** receive an independent
+  expected SHA-256 for the uncompressed binary through a separately
+  authenticated owner authority,
   acquire only archive asset ID `393784170`, and require the extracted binary
   to match that digest. The release Sigstore bundle remains recorded but is not
   treated as verified evidence in this branch.
@@ -523,13 +549,13 @@ native launches.
 - The archive itself was not acquired or inspected. Its binary SHA-256, ELF
   linkage, loader/library closure, exact runtime dependencies, CPU/kernel
   minimums, file capabilities, build ID, and child census remain unknown.
-- The Sigstore bundle was identified but not downloaded or verified. For
-  Branch S, its exact certificate issuer/identity and signed binary digest are
-  not independently pinned; a reviewed primary-source trust-policy addendum
-  must fix the verifier, trusted root, and signer policy before B is approvable.
-  For Branch O, no independently authenticated owner-supplied uncompressed-
-  binary SHA-256 presently exists; that digest must be supplied before B is
-  approvable, and the branch earns no Sigstore signer/provenance claim. Neither
+- The Sigstore bundle was identified but not downloaded or verified. Branch S
+  was reviewed and rejected/blocked because its raw-byte signature does not
+  cryptographically bind the exact target, archive, and member; verifier,
+  trusted-root, and signer-policy qualification cannot create that missing
+  assertion. For Branch O, no independently authenticated owner-supplied
+  uncompressed-binary SHA-256 presently exists; that digest must be supplied
+  before B is approvable, and the branch earns no Sigstore signer/provenance claim. Neither
   branch may learn its authority from acquired bytes. The tag and tagged commit
   are unsigned.
 - GitHub release metadata authenticates the pinned archive digest through the
@@ -554,7 +580,9 @@ native launches.
 ## 10. Narrow owner decision record
 
 The owner approved A and the independent-owner-digest branch on 2026-08-12.
-B–D remain explicitly unapproved and blocked:
+On 2026-08-14 the owner approved only documentation reconciliation recording
+the completed public enrollment, the still-blocked Branch O input, and the
+rejected/blocked Branch S switch. B–D remain explicitly unapproved and blocked:
 
 - [x] **A — Exact selection — APPROVED 2026-08-12.** Only OpenAI Codex CLI
   `0.120.0`, release

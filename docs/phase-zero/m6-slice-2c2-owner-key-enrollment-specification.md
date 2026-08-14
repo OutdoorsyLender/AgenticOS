@@ -2,28 +2,37 @@
 
 Status: documentation-only enrollment specification, prepared 2026-08-12;
 approved by the owner on 2026-08-12 for the exact committed bytes identified
-below. No key-generation or later gate has been performed.
+below. Owner-only key generation, encrypted backup, generation-1 public
+enrollment, adversarial review/publication, and separate fingerprint approval
+were completed by 2026-08-14. Gates 5-7 have not been performed.
 
 ```text
 OWNER_KEY_ENROLLMENT_SPEC_APPROVED=YES
 OWNER_KEY_ENROLLMENT_SPEC_COMMIT=a9bbbedc9104f59170268e3870b6de3bd11e5376
 OWNER_KEY_ENROLLMENT_SPEC_SHA256=c78b6bdbe956238aff9a8976b9d830fab4da248747ca63b313a0fea43563c156
-OWNER_KEY_GENERATED=NO
-OWNER_PRIVATE_KEY_ACCESSED=NO
-OWNER_PUBLIC_KEY_ENROLLED=NO
+OWNER_KEY_GENERATED=YES
+OWNER_PRIVATE_KEY_HANDLED_BY_OWNER_DURING_OFFLINE_CEREMONY=YES
+OWNER_PRIVATE_KEY_ACCESSED_BY_AGENT=NO
+OWNER_PUBLIC_KEY_ENROLLED=YES
+OWNER_PUBLIC_KEY_ENROLLMENT_COMMIT=3214251452e85549dedb0e97b0aeddc3df251e95
+OWNER_FINGERPRINT_APPROVED=YES
+OWNER_FINGERPRINT=SHA256:LQBNgC3HqdwfSWZr/7mvLlSUBwhodPOM0tFDdKZpIs4
 OWNER_DIGEST_RECEIVED=NO
 OWNER_DIGEST_STATEMENT_SIGNED=NO
 OWNER_DIGEST_STATEMENT_VALIDATED=NO
 GATE_A_APPROVED=YES
 BYTE_AUTHORITY_BRANCH=INDEPENDENT_OWNER_DIGEST
+BYTE_AUTHORITY_BRANCH_STATUS=BLOCKED_NO_APPROVED_PREEXISTING_AUTHORITY
+BRANCH_S_SWITCH_DECISION=REJECTED_BLOCKED_MISSING_TARGET_ARCHIVE_MEMBER_BINDING
 GATE_B_APPROVED=NO
 ARTIFACT_ACQUIRED_OR_EXECUTED=NO
 CODEX_OR_SIGSTORE_ACQUIRED_OR_EXECUTED=NO
 REAL_AUTHENTICATION_OR_PROVIDER_ACCESS=NO
 ```
 
-This document specifies, but does not perform, enrollment of one dedicated
-owner key for signing exact `AOSCODEXOWNERDIGEST/1` statements. It refines the
+This document specifies and now records completed public enrollment of one
+dedicated owner key for signing exact `AOSCODEXOWNERDIGEST/1` statements. It
+refines the
 independent-owner-digest branch selected in the
 [artifact-authorization packet](m6-slice-2c2-native-codex-artifact-authorization.md)
 and its
@@ -49,9 +58,23 @@ installation, Codex execution, authentication, provider access, production
 integration, self-hosting, Git signing, SSH login, controller runtime use, or
 any other use of the key. All later gates remain separate.
 
+On 2026-08-14, the owner completed the approved offline ceremony and handled
+the private key without any agent, model, or controller access to private-key
+material. Generation-1 public evidence was published at commit
+`3214251452e85549dedb0e97b0aeddc3df251e95`, and the owner separately approved
+fingerprint `SHA256:LQBNgC3HqdwfSWZr/7mvLlSUBwhodPOM0tFDdKZpIs4`.
+
+The 2026-08-14 Gate 5 review found no approved pre-existing independent OpenAI
+authority for the raw-member digest, so Branch O remains selected but blocked.
+The proposed Branch S switch was rejected and remains blocked because the
+existing raw-byte signature does not cryptographically bind the exact
+`x86_64-unknown-linux-musl` target, archive, and member identity. Gate B remains
+unapproved.
+
 No command marked for the later owner ceremony was executed while preparing
-this specification. No key, passphrase, recovery material, public enrollment,
-digest statement, or signature was created or accessed.
+the original 2026-08-12 specification. At that preparation boundary, no key,
+passphrase, recovery material, public enrollment, digest statement, or
+signature had been created or accessed.
 
 ## 1. Decision and authority boundary
 
@@ -1206,26 +1229,31 @@ gate.
    `a9bbbedc9104f59170268e3870b6de3bd11e5376` and specification SHA-256
    `c78b6bdbe956238aff9a8976b9d830fab4da248747ca63b313a0fea43563c156`.
 2. **Owner manually generates the key outside the agent session.** The owner
-   performs §§3–5 with all agents stopped. Current state: authorized for the
-   owner alone as the next separate gate; not performed.
+   performs §§3–5 with all agents stopped. Current state: completed by the
+   owner during the approved offline ceremony; no agent, model, or controller
+   accessed private-key material.
 3. **Record only the public key and fingerprint.** The owner supplies only the
-   bounded public values; no digest is received. Current state: blocked on
-   Gate 2; not performed.
+   bounded public values; no digest is received. Current state: completed for
+   generation 1; no owner digest was received.
 4. **Adversarially review and commit the public enrollment.** Resolve every
    Critical and Important finding, publish the exact public-enrollment commit,
    synchronize both clones, and obtain separate owner fingerprint approval.
-   Current state: blocked on Gates 2–3.
+   Current state: completed and published at commit
+   `3214251452e85549dedb0e97b0aeddc3df251e95`; fingerprint
+   `SHA256:LQBNgC3HqdwfSWZr/7mvLlSUBwhodPOM0tFDdKZpIs4` separately approved.
 5. **Owner later obtains the independent binary digest.** Its authority is
    independent of GitHub release hosting, release metadata, the OpenAI
-   sidecar, and the later acquisition. Current state: blocked on Gates 2–4;
-   not performed.
+   sidecar, and the later acquisition. Current state: Gates 2–4 are complete,
+   but Gate 5 is blocked because no approved pre-existing independent OpenAI
+   raw-member digest authority currently exists; no digest was obtained.
 6. **Owner manually signs the exact canonical statement.** Use §§7–8 outside
    the agent session and disclose only public statement/signature evidence.
-   Current state: blocked on Gates 2–5.
+   Current state: blocked on Gate 5; no statement was created or signed.
 7. **Validate and record the statement before separately considering Gate B.**
    Apply §§9–11, commit only bounded public evidence, publish/synchronize it,
    and then stop. Gate B remains unapproved and requires a later explicit owner
-   decision. Current state: blocked on Gates 2–6.
+   decision. Current state: blocked on Gates 5–6; no statement was validated
+   or recorded.
 
 No gate may be combined with its successor, inferred from silence, backdated,
 or treated as approval of acquisition, installation, execution,
