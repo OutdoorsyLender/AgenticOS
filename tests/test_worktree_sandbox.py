@@ -324,8 +324,9 @@ def test_result_capture_diff_truncation(temp_git_repo, temp_state_root):
     state = manager.create(res)
     wt_dir = state.worktree_path
 
-    # Generate a diff larger than 100 bytes
-    (wt_dir / "large.txt").write_text("X" * 1000 + "\n", encoding="utf-8")
+    # Generate a tracked Git diff larger than 100 bytes. Untracked evidence has
+    # its own bounded presentation and does not alter the complete Git diff hash.
+    (wt_dir / "README.md").write_text("X" * 1000 + "\n", encoding="utf-8")
 
     res_obj = manager.capture_result(repo, "large-diff-task", 1, worker_exit_code=0, max_diff_bytes=100)
 
@@ -658,8 +659,8 @@ def test_untracked_file_evidence_bounds(temp_git_repo, temp_state_root):
     assert "large.bin" in res_obj.added_untracked_paths
     assert "binary.dat" in res_obj.added_untracked_paths
 
-    assert "[UNTRACKED LARGE FILE:" in res_obj.diff_content
-    assert "[UNTRACKED BINARY FILE:" in res_obj.diff_content
+    assert "[UNTRACKED LARGE FILE:" in res_obj.untracked_evidence_content
+    assert "[UNTRACKED BINARY FILE:" in res_obj.untracked_evidence_content
     assert len(res_obj.diff_sha256) == 64
     # Ensure source worktree files remain untouched and intact
     assert (wt_dir / "large.bin").read_bytes() == large_data

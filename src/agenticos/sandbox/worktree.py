@@ -34,8 +34,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -108,6 +109,734 @@ class WorktreeLifecycleStatus(str, enum.Enum):
     MISSING = "MISSING"
 
 
+class StatusCategory(str, enum.Enum):
+    """Complete semantic categories derived from one porcelain-v1 XY tuple."""
+
+    TRACKED_MODIFIED = "TRACKED_MODIFIED"
+    TRACKED_ADDED = "TRACKED_ADDED"
+    TRACKED_DELETED = "TRACKED_DELETED"
+    TRACKED_TYPE_CHANGED = "TRACKED_TYPE_CHANGED"
+    RENAMED = "RENAMED"
+    COPIED = "COPIED"
+    UNMERGED = "UNMERGED"
+    UNTRACKED = "UNTRACKED"
+    FILESYSTEM_ANOMALY = "FILESYSTEM_ANOMALY"
+
+
+class WorkspaceCaptureFailureKind(str, enum.Enum):
+    """Typed controller policy inputs for fail-closed workspace capture."""
+
+    GIT_STATUS_FAILURE = "GIT_STATUS_FAILURE"
+    MALFORMED_STATUS_STREAM = "MALFORMED_STATUS_STREAM"
+    GIT_INDEX_FAILURE = "GIT_INDEX_FAILURE"
+    MALFORMED_INDEX_STREAM = "MALFORMED_INDEX_STREAM"
+    INVALID_STATUS_PATH = "INVALID_STATUS_PATH"
+    GIT_DIFF_FAILURE = "GIT_DIFF_FAILURE"
+    REPOSITORY_IDENTITY_MISMATCH = "REPOSITORY_IDENTITY_MISMATCH"
+    REF_IDENTITY_MISMATCH = "REF_IDENTITY_MISMATCH"
+    FILESYSTEM_IDENTITY_MISMATCH = "FILESYSTEM_IDENTITY_MISMATCH"
+    UNREADABLE_UNTRACKED_ENTRY = "UNREADABLE_UNTRACKED_ENTRY"
+    UNHASHABLE_UNTRACKED_ENTRY = "UNHASHABLE_UNTRACKED_ENTRY"
+    FORBIDDEN_SYMLINK = "FORBIDDEN_SYMLINK"
+    FORBIDDEN_NON_REGULAR_ENTRY = "FORBIDDEN_NON_REGULAR_ENTRY"
+    FORBIDDEN_GITLINK = "FORBIDDEN_GITLINK"
+    UNMERGED_STATUS = "UNMERGED_STATUS"
+    EVIDENCE_BOUND_EXCEEDED = "EVIDENCE_BOUND_EXCEEDED"
+    INTERNAL_CANONICALIZATION_INCONSISTENCY = "INTERNAL_CANONICALIZATION_INCONSISTENCY"
+
+
+class WorkspaceCaptureCompleteness(str, enum.Enum):
+    COMPLETE = "COMPLETE"
+    INCOMPLETE = "INCOMPLETE"
+
+
+class WorkspaceReuseDecision(str, enum.Enum):
+    REUSABLE = "REUSABLE"
+    NOT_REUSABLE = "NOT_REUSABLE"
+    CAPTURE_FAILED = "CAPTURE_FAILED"
+
+
+class WorkspaceCaptureError(WorktreeValidationError):
+    """Hard capture failure carrying a narrow typed controller reason."""
+
+    def __init__(self, kind: WorkspaceCaptureFailureKind, diagnostic: str = "") -> None:
+        self.kind = kind
+        self.diagnostic = diagnostic[:16_384]
+        super().__init__(
+            f"{kind.value}: {self.diagnostic}" if self.diagnostic else kind.value
+        )
+
+
+@dataclass(frozen=True)
+class WorkspaceCaptureFailure:
+    kind: WorkspaceCaptureFailureKind
+    diagnostic: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"kind": self.kind.value, "diagnostic": self.diagnostic}
+
+
+@dataclass(frozen=True)
+class StatusManifestEntry:
+    """One complete, deterministic Git status record and its earned evidence."""
+
+    code: str
+    categories: tuple[StatusCategory, ...]
+    path: str
+    second_path: Optional[str] = None
+    anomaly: Optional[WorkspaceCaptureFailureKind] = None
+    untracked_file_type: Optional[str] = None
+    untracked_byte_count: Optional[int] = None
+    untracked_sha256: Optional[str] = None
+    untracked_device: Optional[int] = None
+    untracked_inode: Optional[int] = None
+    untracked_mode: Optional[int] = None
+    untracked_mtime_ns: Optional[int] = None
+    untracked_ctime_ns: Optional[int] = None
+
+    def to_manifest_dict(self) -> dict[str, Any]:
+        return {
+            "anomaly": self.anomaly.value if self.anomaly else None,
+            "categories": [category.value for category in self.categories],
+            "code": self.code,
+            "path": self.path,
+            "second_path": self.second_path,
+            "untracked_byte_count": self.untracked_byte_count,
+            "untracked_ctime_ns": self.untracked_ctime_ns,
+            "untracked_device": self.untracked_device,
+            "untracked_file_type": self.untracked_file_type,
+            "untracked_inode": self.untracked_inode,
+            "untracked_mode": self.untracked_mode,
+            "untracked_mtime_ns": self.untracked_mtime_ns,
+            "untracked_sha256": self.untracked_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class WorkspaceStatusCounts:
+    """Complete counts derived from the same entries as the manifest digest."""
+
+    tracked_modified: int
+    tracked_added: int
+    tracked_deleted: int
+    tracked_type_changed: int
+    renamed: int
+    copied: int
+    unmerged: int
+    untracked: int
+    filesystem_anomalies: int
+    anomalies: int
+    total_entries: int
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WorkspaceCheckpoint:
+    """Complete authoritative workspace state identity for later orchestration."""
+
+    schema_version: str
+    repository_id: str
+    ownership_digest: str
+    reservation_digest: str
+    task_id: str
+    generation: int
+    task_ref: str
+    baseline_commit_sha: str
+    current_head_sha: str
+    worktree_device: int
+    worktree_inode: int
+    status_counts: WorkspaceStatusCounts
+    status_manifest_sha256: str
+    status_entry_count: int
+    diff_byte_count: int
+    diff_sha256: str
+    anomalies: tuple[WorkspaceCaptureFailureKind, ...]
+    capture_completeness: WorkspaceCaptureCompleteness
+    authoritative_status_truncated: bool
+    authoritative_diff_truncated: bool
+    checkpoint_digest: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "anomalies": [anomaly.value for anomaly in self.anomalies],
+            "authoritative_diff_truncated": self.authoritative_diff_truncated,
+            "authoritative_status_truncated": self.authoritative_status_truncated,
+            "baseline_commit_sha": self.baseline_commit_sha,
+            "capture_completeness": self.capture_completeness.value,
+            "checkpoint_digest": self.checkpoint_digest,
+            "current_head_sha": self.current_head_sha,
+            "diff_byte_count": self.diff_byte_count,
+            "diff_sha256": self.diff_sha256,
+            "generation": self.generation,
+            "ownership_digest": self.ownership_digest,
+            "repository_id": self.repository_id,
+            "reservation_digest": self.reservation_digest,
+            "schema_version": self.schema_version,
+            "status_counts": self.status_counts.to_dict(),
+            "status_entry_count": self.status_entry_count,
+            "status_manifest_sha256": self.status_manifest_sha256,
+            "task_id": self.task_id,
+            "task_ref": self.task_ref,
+            "worktree_device": self.worktree_device,
+            "worktree_inode": self.worktree_inode,
+        }
+
+
+@dataclass(frozen=True)
+class WorkspaceCheckpointCaptureResult:
+    """Explicit controller decision; callers never infer reuse from fields."""
+
+    decision: WorkspaceReuseDecision
+    checkpoint: Optional[WorkspaceCheckpoint]
+    failure: Optional[WorkspaceCaptureFailure]
+    status_entries: tuple[StatusManifestEntry, ...]
+    modified_paths: tuple[str, ...]
+    tracked_added_paths: tuple[str, ...]
+    added_untracked_paths: tuple[str, ...]
+    deleted_paths: tuple[str, ...]
+    renamed_paths: tuple[tuple[str, str], ...]
+    copied_paths: tuple[tuple[str, str], ...]
+    unmerged_paths: tuple[str, ...]
+    path_list_truncated: bool
+    omitted_path_count: int
+    untracked_evidence_content: str
+    is_untracked_evidence_truncated: bool
+    diff_content: str
+    is_diff_truncated: bool
+    observed_at: str
+
+    @classmethod
+    def capture_failed(
+        cls, error: WorkspaceCaptureError, *, observed_at: str
+    ) -> WorkspaceCheckpointCaptureResult:
+        return cls(
+            decision=WorkspaceReuseDecision.CAPTURE_FAILED,
+            checkpoint=None,
+            failure=WorkspaceCaptureFailure(error.kind, error.diagnostic),
+            status_entries=(),
+            modified_paths=(),
+            tracked_added_paths=(),
+            added_untracked_paths=(),
+            deleted_paths=(),
+            renamed_paths=(),
+            copied_paths=(),
+            unmerged_paths=(),
+            path_list_truncated=False,
+            omitted_path_count=0,
+            untracked_evidence_content="",
+            is_untracked_evidence_truncated=False,
+            diff_content="",
+            is_diff_truncated=False,
+            observed_at=observed_at,
+        )
+
+
+MAX_STATUS_MANIFEST_BYTES = 32 * 1024 * 1024
+MAX_STATUS_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_STATUS_ENTRIES = 100_000
+MAX_STATUS_PATH_BYTES = 4096
+MAX_GIT_DIAGNOSTIC_BYTES = 16_384
+MAX_COMPLETE_DIFF_BYTES = 1 << 30
+MAX_UNTRACKED_INLINE_TOTAL_BYTES = 1_000_000
+MAX_UNTRACKED_FILE_EVIDENCE_BYTES = 64_000
+MAX_UNTRACKED_HASH_BYTES = 1 << 30
+MAX_AGGREGATE_UNTRACKED_BYTES = 1 << 30
+MAX_FILESYSTEM_PATH_BYTES = 64 * 1024 * 1024
+
+
+@dataclass
+class _CaptureBudget:
+    deadline: float
+    max_aggregate_untracked_bytes: int
+    max_filesystem_path_bytes: int
+    aggregate_untracked_bytes: int = 0
+    filesystem_path_bytes: int = 0
+
+    def remaining_timeout(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+                "workspace capture deadline exceeded",
+            )
+        return remaining
+
+    def account_path(self, path: str) -> None:
+        self.filesystem_path_bytes += len(path.encode("utf-8", errors="strict"))
+        if self.filesystem_path_bytes > self.max_filesystem_path_bytes:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+                "cumulative filesystem path bytes exceed the capture bound",
+            )
+        self.remaining_timeout()
+
+    def reserve_untracked_bytes(self, byte_count: int) -> bool:
+        if byte_count < 0:
+            return False
+        if self.aggregate_untracked_bytes + byte_count > self.max_aggregate_untracked_bytes:
+            return False
+        self.aggregate_untracked_bytes += byte_count
+        return True
+
+
+def _status_categories(code: str) -> tuple[StatusCategory, ...]:
+    if code == "??":
+        return (StatusCategory.UNTRACKED,)
+    if code == "!!":
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.MALFORMED_STATUS_STREAM,
+            "ignored status record was not requested by controller policy",
+        )
+    if code in {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}:
+        return (StatusCategory.UNMERGED,)
+
+    categories: set[StatusCategory] = set()
+    for marker in code:
+        if marker == " ":
+            continue
+        category = {
+            "M": StatusCategory.TRACKED_MODIFIED,
+            "A": StatusCategory.TRACKED_ADDED,
+            "D": StatusCategory.TRACKED_DELETED,
+            "T": StatusCategory.TRACKED_TYPE_CHANGED,
+            "R": StatusCategory.RENAMED,
+            "C": StatusCategory.COPIED,
+        }.get(marker)
+        if category is None:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.MALFORMED_STATUS_STREAM,
+                f"unsupported porcelain status code {code!r}",
+            )
+        categories.add(category)
+    if not categories:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.MALFORMED_STATUS_STREAM,
+            f"empty porcelain status code {code!r}",
+        )
+    return tuple(sorted(categories, key=lambda value: value.value))
+
+
+def _decode_status_path(raw: bytes, *, max_path_bytes: int) -> str:
+    if not raw or len(raw) > max_path_bytes:
+        kind = (
+            WorkspaceCaptureFailureKind.INVALID_STATUS_PATH
+            if not raw
+            else WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED
+        )
+        raise WorkspaceCaptureError(kind, "status path is empty or exceeds the byte bound")
+    try:
+        path = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.INVALID_STATUS_PATH,
+            "status path is not strict UTF-8",
+        ) from exc
+    parts = path.split("/")
+    if path.startswith("/") or any(part in {"", ".", ".."} for part in parts):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.INVALID_STATUS_PATH,
+            "status path is not a normalized repository-relative path",
+        )
+    return path
+
+
+def _parse_status_stream(
+    raw: bytes,
+    *,
+    max_entries: int,
+    max_path_bytes: int,
+) -> tuple[StatusManifestEntry, ...]:
+    """Strictly parse complete `porcelain=v1 -z` bytes without path quoting."""
+    if type(raw) is not bytes:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.MALFORMED_STATUS_STREAM,
+            "status output must be bytes",
+        )
+    if not raw:
+        return ()
+    if not raw.endswith(b"\0"):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.MALFORMED_STATUS_STREAM,
+            "status output lacks the final NUL delimiter",
+        )
+
+    fields = raw[:-1].split(b"\0")
+    entries: list[StatusManifestEntry] = []
+    observed_primary_paths: set[str] = set()
+    observed_tuples: set[tuple[str, str, Optional[str]]] = set()
+    index = 0
+    while index < len(fields):
+        field = fields[index]
+        if len(field) < 4 or field[2:3] != b" ":
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.MALFORMED_STATUS_STREAM,
+                "status record lacks an exact two-byte XY code and separator",
+            )
+        try:
+            code = field[:2].decode("ascii", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.MALFORMED_STATUS_STREAM,
+                "status code is not ASCII",
+            ) from exc
+        categories = _status_categories(code)
+        path = _decode_status_path(field[3:], max_path_bytes=max_path_bytes)
+        second_path: Optional[str] = None
+        if StatusCategory.RENAMED in categories or StatusCategory.COPIED in categories:
+            index += 1
+            if index >= len(fields):
+                raise WorkspaceCaptureError(
+                    WorkspaceCaptureFailureKind.MALFORMED_STATUS_STREAM,
+                    "rename/copy record lacks its source path",
+                )
+            second_path = _decode_status_path(fields[index], max_path_bytes=max_path_bytes)
+
+        status_tuple = (code, path, second_path)
+        if (
+            path in observed_primary_paths
+            or status_tuple in observed_tuples
+            or (second_path is not None and second_path == path)
+        ):
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.MALFORMED_STATUS_STREAM,
+                "duplicate status tuple, duplicate primary path, or self-referential rename/copy",
+            )
+        observed_primary_paths.add(path)
+        observed_tuples.add(status_tuple)
+        entries.append(
+            StatusManifestEntry(
+                code=code,
+                categories=categories,
+                path=path,
+                second_path=second_path,
+                anomaly=(
+                    WorkspaceCaptureFailureKind.UNMERGED_STATUS
+                    if StatusCategory.UNMERGED in categories
+                    else None
+                ),
+            )
+        )
+        if len(entries) > max_entries:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+                "status entry count exceeds the complete-capture bound",
+            )
+        index += 1
+
+    return tuple(sorted(entries, key=lambda entry: (entry.path, entry.second_path or "", entry.code)))
+
+
+def _count_status_categories(entries: tuple[StatusManifestEntry, ...]) -> WorkspaceStatusCounts:
+    def count(category: StatusCategory) -> int:
+        return sum(category in entry.categories for entry in entries)
+
+    return WorkspaceStatusCounts(
+        tracked_modified=count(StatusCategory.TRACKED_MODIFIED),
+        tracked_added=count(StatusCategory.TRACKED_ADDED),
+        tracked_deleted=count(StatusCategory.TRACKED_DELETED),
+        tracked_type_changed=count(StatusCategory.TRACKED_TYPE_CHANGED),
+        renamed=count(StatusCategory.RENAMED),
+        copied=count(StatusCategory.COPIED),
+        unmerged=count(StatusCategory.UNMERGED),
+        untracked=count(StatusCategory.UNTRACKED),
+        filesystem_anomalies=count(StatusCategory.FILESYSTEM_ANOMALY),
+        anomalies=sum(entry.anomaly is not None for entry in entries),
+        total_entries=len(entries),
+    )
+
+
+def _canonical_status_manifest(entries: tuple[StatusManifestEntry, ...]) -> str:
+    ordered_entries = sorted(entries, key=lambda entry: (entry.path, entry.second_path or "", entry.code))
+    payload = {
+        "entries": [entry.to_manifest_dict() for entry in ordered_entries],
+        "schema_version": "AOSSTATUSMANIFEST/1",
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8", errors="strict")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.INTERNAL_CANONICALIZATION_INCONSISTENCY,
+            "status manifest canonical encoding failed",
+        ) from exc
+    if len(encoded) > MAX_STATUS_MANIFEST_BYTES:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+            "status manifest exceeds the canonical byte bound",
+        )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+_DESCRIPTOR_RELATIVE_PATHS_SUPPORTED = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.readlink in os.supports_dir_fd
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+)
+
+
+def _supports_descriptor_relative_paths() -> bool:
+    return _DESCRIPTOR_RELATIVE_PATHS_SUPPORTED
+
+
+@contextlib.contextmanager
+def _open_verified_parent_directory(
+    worktree_dir: Path, relative_path: str
+) -> Any:
+    """Keep every parent directory open and no-follow while inspecting a leaf."""
+    full_path = worktree_dir.joinpath(*relative_path.split("/"))
+    if not _supports_descriptor_relative_paths():
+        yield None, full_path.name, full_path
+        return
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    current_fd = os.open(worktree_dir, flags)
+    try:
+        parts = relative_path.split("/")
+        for component in parts[:-1]:
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        yield current_fd, parts[-1], full_path
+    finally:
+        os.close(current_fd)
+
+
+def _lstat_at(parent_fd: Optional[int], leaf: str, full_path: Path) -> os.stat_result:
+    if parent_fd is None:
+        return full_path.lstat()
+    return os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+
+
+def _untracked_stable_fields() -> tuple[str, ...]:
+    fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
+    # Windows path-stat and descriptor-stat expose incompatible ctime semantics.
+    return fields if os.name == "nt" else (*fields, "st_ctime_ns")
+
+
+def _portable_untracked_ctime_ns(observed: os.stat_result) -> Optional[int]:
+    return None if os.name == "nt" else int(observed.st_ctime_ns)
+
+
+def _scan_unobserved_special_entries(
+    worktree_dir: Path,
+    entries: tuple[StatusManifestEntry, ...],
+    *,
+    tracked_paths: frozenset[str],
+    gitlink_paths: frozenset[str],
+    budget: _CaptureBudget,
+    max_entries: int,
+    max_path_bytes: int,
+) -> tuple[StatusManifestEntry, ...]:
+    """Detect unreported special entries without following attacker-replaced directories."""
+    observed_paths = {
+        path
+        for entry in entries
+        for path in (entry.path, entry.second_path)
+        if path is not None
+    }
+    anomalies: list[StatusManifestEntry] = []
+    visited = 0
+
+    def account_entry(rel_path: str) -> str:
+        nonlocal visited
+        visited += 1
+        if visited > max_entries:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+                "filesystem entry count exceeds the checkpoint audit bound",
+            )
+        try:
+            normalized = _decode_status_path(
+                rel_path.encode("utf-8", errors="strict"),
+                max_path_bytes=max_path_bytes,
+            )
+        except UnicodeEncodeError as exc:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.INVALID_STATUS_PATH,
+                "filesystem path is not strict UTF-8",
+            ) from exc
+        budget.account_path(normalized)
+        return normalized
+
+    def record_unreadable(rel_path: str, file_type: str = "UNKNOWN") -> None:
+        if rel_path not in observed_paths:
+            anomalies.append(
+                StatusManifestEntry(
+                    code="FS",
+                    categories=(StatusCategory.FILESYSTEM_ANOMALY,),
+                    path=rel_path,
+                    anomaly=WorkspaceCaptureFailureKind.UNREADABLE_UNTRACKED_ENTRY,
+                    untracked_file_type=file_type,
+                )
+            )
+
+    def inspect_child(
+        *,
+        rel_path: str,
+        child_stat: os.stat_result,
+        readlink: Any,
+        descend: Any,
+    ) -> None:
+        if rel_path == ".git":
+            return
+        if stat.S_ISDIR(child_stat.st_mode):
+            if rel_path not in gitlink_paths:
+                descend()
+            return
+        if rel_path in observed_paths or stat.S_ISREG(child_stat.st_mode):
+            return
+        if rel_path in tracked_paths:
+            return
+        if stat.S_ISLNK(child_stat.st_mode):
+            anomaly = WorkspaceCaptureFailureKind.FORBIDDEN_SYMLINK
+            file_type = "SYMLINK"
+            try:
+                target_bytes = os.fsencode(readlink())
+                target_size = len(target_bytes)
+                target_digest = hashlib.sha256(target_bytes).hexdigest()
+            except OSError:
+                target_size = None
+                target_digest = None
+        else:
+            anomaly = WorkspaceCaptureFailureKind.FORBIDDEN_NON_REGULAR_ENTRY
+            file_type = f"NON_REGULAR:{stat.S_IFMT(child_stat.st_mode):o}"
+            target_size = None
+            target_digest = None
+        anomalies.append(
+            StatusManifestEntry(
+                code="FS",
+                categories=(StatusCategory.FILESYSTEM_ANOMALY,),
+                path=rel_path,
+                anomaly=anomaly,
+                untracked_file_type=file_type,
+                untracked_byte_count=target_size,
+                untracked_sha256=target_digest,
+            )
+        )
+
+    def walk_descriptor(directory_fd: int, rel_prefix: str, depth: int) -> None:
+        if depth > 128:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+                "filesystem traversal depth exceeds the capture bound",
+            )
+        try:
+            with os.scandir(directory_fd) as children:
+                for child in children:
+                    rel_path = f"{rel_prefix}/{child.name}" if rel_prefix else child.name
+                    normalized = account_entry(rel_path)
+                    try:
+                        child_stat = os.stat(
+                            child.name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        record_unreadable(normalized)
+                        continue
+
+                    def descend() -> None:
+                        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+                        try:
+                            child_fd = os.open(child.name, flags, dir_fd=directory_fd)
+                        except OSError:
+                            record_unreadable(normalized, "DIRECTORY")
+                            return
+                        try:
+                            opened = os.fstat(child_fd)
+                            if (
+                                int(opened.st_dev) != int(child_stat.st_dev)
+                                or int(opened.st_ino) != int(child_stat.st_ino)
+                            ):
+                                record_unreadable(normalized, "DIRECTORY")
+                                return
+                            walk_descriptor(child_fd, normalized, depth + 1)
+                        finally:
+                            os.close(child_fd)
+
+                    inspect_child(
+                        rel_path=normalized,
+                        child_stat=child_stat,
+                        readlink=lambda: os.readlink(child.name, dir_fd=directory_fd),
+                        descend=descend,
+                    )
+        except WorkspaceCaptureError:
+            raise
+        except OSError as exc:
+            if not rel_prefix:
+                raise WorkspaceCaptureError(
+                    WorkspaceCaptureFailureKind.UNREADABLE_UNTRACKED_ENTRY,
+                    f"worktree directory scan failed: {type(exc).__name__}",
+                ) from exc
+            record_unreadable(rel_prefix, "DIRECTORY")
+
+    def walk_paths(directory: Path, rel_prefix: str, depth: int) -> None:
+        if depth > 128:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+                "filesystem traversal depth exceeds the capture bound",
+            )
+        try:
+            with os.scandir(directory) as children:
+                for child in children:
+                    full_path = Path(child.path)
+                    rel_path = f"{rel_prefix}/{child.name}" if rel_prefix else child.name
+                    normalized = account_entry(rel_path)
+                    try:
+                        child_stat = child.stat(follow_symlinks=False)
+                    except OSError:
+                        record_unreadable(normalized)
+                        continue
+                    inspect_child(
+                        rel_path=normalized,
+                        child_stat=child_stat,
+                        readlink=lambda path=full_path: os.readlink(path),
+                        descend=lambda path=full_path, prefix=normalized: walk_paths(
+                            path, prefix, depth + 1
+                        )
+                    )
+        except WorkspaceCaptureError:
+            raise
+        except OSError as exc:
+            if not rel_prefix:
+                raise WorkspaceCaptureError(
+                    WorkspaceCaptureFailureKind.UNREADABLE_UNTRACKED_ENTRY,
+                    f"worktree directory scan failed: {type(exc).__name__}",
+                ) from exc
+            record_unreadable(rel_prefix, "DIRECTORY")
+
+    if _supports_descriptor_relative_paths():
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            root_fd = os.open(worktree_dir, flags)
+        except OSError as exc:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.UNREADABLE_UNTRACKED_ENTRY,
+                f"worktree directory open failed: {type(exc).__name__}",
+            ) from exc
+        try:
+            walk_descriptor(root_fd, "", 0)
+        finally:
+            os.close(root_fd)
+    else:
+        walk_paths(worktree_dir, "", 0)
+    if len(entries) + len(anomalies) > max_entries:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+            "status plus filesystem anomaly entries exceed the manifest bound",
+        )
+    return tuple(sorted((*entries, *anomalies), key=lambda entry: (entry.path, entry.second_path or "", entry.code)))
+
+
 def _sanitize_git_env() -> dict[str, str]:
     """Build a deterministic controller-side environment for Git plumbing commands."""
     kept: dict[str, str] = {
@@ -149,6 +878,939 @@ def _run_git_plumbing(
         raise WorktreeValidationError(
             f"git plumbing execution failed for {argv[1] if len(argv) > 1 else argv[0]!r}: {type(exc).__name__}"
         ) from exc
+
+
+@dataclass(frozen=True)
+class _GitStreamResult:
+    total_bytes: int
+    sha256: str
+    inline_bytes: bytes
+
+
+def _run_git_stream_bounded(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    max_complete_bytes: int,
+    max_inline_bytes: int,
+    failure_kind: WorkspaceCaptureFailureKind,
+) -> _GitStreamResult:
+    """Drain stdout/stderr concurrently while retaining only explicit bounds."""
+    if not argv or argv[0] != "git":
+        raise ValueError("streaming Git command must start with 'git'")
+    if (
+        type(max_complete_bytes) is not int
+        or max_complete_bytes < 0
+        or type(max_inline_bytes) is not int
+        or max_inline_bytes < 0
+        or timeout <= 0
+    ):
+        raise ValueError("Git stream bounds must be non-negative integers and timeout must be positive")
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_sanitize_git_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WorkspaceCaptureError(
+            failure_kind, f"Git command execution failed: {type(exc).__name__}"
+        ) from exc
+
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    hasher = hashlib.sha256()
+    stream_state: dict[str, Any] = {
+        "total": 0,
+        "bound_exceeded": False,
+        "read_error": None,
+    }
+
+    def read_stdout() -> None:
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(65_536)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                stream_state["total"] += len(chunk)
+                if len(stdout_buffer) < max_inline_bytes:
+                    remaining = max_inline_bytes - len(stdout_buffer)
+                    stdout_buffer.extend(chunk[:remaining])
+                if stream_state["total"] > max_complete_bytes:
+                    stream_state["bound_exceeded"] = True
+                    with contextlib.suppress(OSError):
+                        proc.kill()
+        except BaseException as exc:  # transferred to the controller thread
+            stream_state["read_error"] = exc
+
+    def read_stderr() -> None:
+        try:
+            assert proc.stderr is not None
+            while True:
+                chunk = proc.stderr.read(4096)
+                if not chunk:
+                    break
+                if len(stderr_buffer) < MAX_GIT_DIAGNOSTIC_BYTES:
+                    remaining = MAX_GIT_DIAGNOSTIC_BYTES - len(stderr_buffer)
+                    stderr_buffer.extend(chunk[:remaining])
+        except BaseException as exc:  # transferred to the controller thread
+            stream_state["read_error"] = stream_state["read_error"] or exc
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        with contextlib.suppress(OSError):
+            proc.kill()
+        proc.wait()
+    stdout_thread.join(timeout=1.0)
+    stderr_thread.join(timeout=1.0)
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        with contextlib.suppress(OSError):
+            proc.kill()
+        raise WorkspaceCaptureError(failure_kind, "Git output drain did not terminate")
+    if stream_state["read_error"] is not None:
+        raise WorkspaceCaptureError(
+            failure_kind,
+            f"Git output read failed: {type(stream_state['read_error']).__name__}",
+        )
+    if stream_state["bound_exceeded"]:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+            f"Git {argv[1]} output exceeded {max_complete_bytes} bytes",
+        )
+    diagnostic = stderr_buffer.decode("utf-8", errors="replace")
+    if timed_out:
+        raise WorkspaceCaptureError(failure_kind, f"Git {argv[1]} timed out: {diagnostic}")
+    if proc.returncode != 0:
+        raise WorkspaceCaptureError(
+            failure_kind,
+            f"Git {argv[1]} exited {proc.returncode}: {diagnostic}",
+        )
+    return _GitStreamResult(
+        total_bytes=int(stream_state["total"]),
+        sha256=hasher.hexdigest(),
+        inline_bytes=bytes(stdout_buffer),
+    )
+
+
+def _run_git_status_bounded(
+    cwd: Path,
+    *,
+    max_status_bytes: int = MAX_STATUS_OUTPUT_BYTES,
+    timeout: float = 10.0,
+) -> bytes:
+    result = _run_git_stream_bounded(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=cwd,
+        timeout=timeout,
+        max_complete_bytes=max_status_bytes,
+        max_inline_bytes=max_status_bytes,
+        failure_kind=WorkspaceCaptureFailureKind.GIT_STATUS_FAILURE,
+    )
+    if result.total_bytes != len(result.inline_bytes):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.INTERNAL_CANONICALIZATION_INCONSISTENCY,
+            "complete status bytes were not retained",
+        )
+    return result.inline_bytes
+
+
+@dataclass(frozen=True)
+class _IndexManifest:
+    tracked_paths: frozenset[str]
+    gitlink_paths: frozenset[str]
+
+
+def _run_git_index_manifest_bounded(
+    cwd: Path,
+    *,
+    object_format: str,
+    max_index_bytes: int,
+    max_entries: int,
+    max_path_bytes: int,
+    timeout: float,
+) -> _IndexManifest:
+    result = _run_git_stream_bounded(
+        ["git", "ls-files", "--stage", "-z"],
+        cwd=cwd,
+        timeout=timeout,
+        max_complete_bytes=max_index_bytes,
+        max_inline_bytes=max_index_bytes,
+        failure_kind=WorkspaceCaptureFailureKind.GIT_INDEX_FAILURE,
+    )
+    if result.total_bytes != len(result.inline_bytes):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.INTERNAL_CANONICALIZATION_INCONSISTENCY,
+            "complete index bytes were not retained",
+        )
+    raw = result.inline_bytes
+    if raw and not raw.endswith(b"\0"):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.MALFORMED_INDEX_STREAM,
+            "index output lacks the final NUL delimiter",
+        )
+    tracked_paths: set[str] = set()
+    gitlink_paths: set[str] = set()
+    records = raw[:-1].split(b"\0") if raw else []
+    if len(records) > max_entries:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+            "tracked index entry count exceeds the capture bound",
+        )
+    oid_pattern = _LOWER_HEX_40_RE if object_format == "sha1" else _LOWER_HEX_64_RE
+    for record in records:
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            raw_mode, raw_oid, raw_stage = metadata.split(b" ")
+            mode = raw_mode.decode("ascii", errors="strict")
+            oid = raw_oid.decode("ascii", errors="strict")
+            stage = int(raw_stage.decode("ascii", errors="strict"), 10)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.MALFORMED_INDEX_STREAM,
+                "index record is malformed",
+            ) from exc
+        if mode not in {"100644", "100755", "120000", "160000"} or not oid_pattern.fullmatch(oid) or stage not in {0, 1, 2, 3}:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.MALFORMED_INDEX_STREAM,
+                "index record contains an invalid mode, object ID, or stage",
+            )
+        path = _decode_status_path(raw_path, max_path_bytes=max_path_bytes)
+        tracked_paths.add(path)
+        if mode == "160000":
+            gitlink_paths.add(path)
+    return _IndexManifest(
+        tracked_paths=frozenset(tracked_paths),
+        gitlink_paths=frozenset(gitlink_paths),
+    )
+
+
+def _untracked_evidence_marker(path: str, message: str) -> bytes:
+    return (
+        f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,1 @@\n+ [{message}]\n"
+    ).encode("utf-8", errors="replace")
+
+
+def _capture_untracked_entry(
+    worktree_dir: Path,
+    entry: StatusManifestEntry,
+    *,
+    max_inline_file_bytes: int,
+    budget: _CaptureBudget,
+) -> tuple[StatusManifestEntry, bytes]:
+    try:
+        with _open_verified_parent_directory(worktree_dir, entry.path) as (
+            parent_fd,
+            leaf,
+            full_path,
+        ):
+            return _capture_untracked_entry_at(
+                parent_fd,
+                leaf,
+                full_path,
+                entry,
+                max_inline_file_bytes=max_inline_file_bytes,
+                budget=budget,
+            )
+    except OSError as exc:
+        anomaly = WorkspaceCaptureFailureKind.UNREADABLE_UNTRACKED_ENTRY
+        return (
+            replace(entry, anomaly=anomaly, untracked_file_type="UNKNOWN"),
+            _untracked_evidence_marker(entry.path, f"UNREADABLE: {type(exc).__name__}"),
+        )
+
+
+def _capture_untracked_entry_at(
+    parent_fd: Optional[int],
+    leaf: str,
+    full_path: Path,
+    entry: StatusManifestEntry,
+    *,
+    max_inline_file_bytes: int,
+    budget: _CaptureBudget,
+) -> tuple[StatusManifestEntry, bytes]:
+    try:
+        initial = _lstat_at(parent_fd, leaf, full_path)
+    except OSError as exc:
+        anomaly = WorkspaceCaptureFailureKind.UNREADABLE_UNTRACKED_ENTRY
+        return (
+            replace(entry, anomaly=anomaly, untracked_file_type="UNKNOWN"),
+            _untracked_evidence_marker(entry.path, f"UNREADABLE: {type(exc).__name__}"),
+        )
+
+    if stat.S_ISLNK(initial.st_mode):
+        try:
+            target = (
+                os.readlink(full_path)
+                if parent_fd is None
+                else os.readlink(leaf, dir_fd=parent_fd)
+            )
+            target_bytes = os.fsencode(target)
+            target_digest = hashlib.sha256(target_bytes).hexdigest()
+            target_size = len(target_bytes)
+        except OSError:
+            target_digest = None
+            target_size = None
+        anomaly = WorkspaceCaptureFailureKind.FORBIDDEN_SYMLINK
+        return (
+            replace(
+                entry,
+                anomaly=anomaly,
+                untracked_file_type="SYMLINK",
+                untracked_byte_count=target_size,
+                untracked_sha256=target_digest,
+                untracked_device=int(initial.st_dev),
+                untracked_inode=int(initial.st_ino),
+                untracked_mode=int(initial.st_mode),
+                untracked_mtime_ns=int(initial.st_mtime_ns),
+                untracked_ctime_ns=_portable_untracked_ctime_ns(initial),
+            ),
+            _untracked_evidence_marker(entry.path, "FORBIDDEN SYMLINK"),
+        )
+
+    if not stat.S_ISREG(initial.st_mode):
+        anomaly = WorkspaceCaptureFailureKind.FORBIDDEN_NON_REGULAR_ENTRY
+        file_type = f"NON_REGULAR:{stat.S_IFMT(initial.st_mode):o}"
+        return (
+            replace(
+                entry,
+                anomaly=anomaly,
+                untracked_file_type=file_type,
+                untracked_device=int(initial.st_dev),
+                untracked_inode=int(initial.st_ino),
+                untracked_mode=int(initial.st_mode),
+                untracked_mtime_ns=int(initial.st_mtime_ns),
+                untracked_ctime_ns=_portable_untracked_ctime_ns(initial),
+            ),
+            _untracked_evidence_marker(entry.path, file_type),
+        )
+
+    if int(initial.st_size) > MAX_UNTRACKED_HASH_BYTES:
+        anomaly = WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED
+        return (
+            replace(
+                entry,
+                anomaly=anomaly,
+                untracked_file_type="REGULAR",
+                untracked_byte_count=int(initial.st_size),
+                untracked_device=int(initial.st_dev),
+                untracked_inode=int(initial.st_ino),
+                untracked_mode=int(initial.st_mode),
+                untracked_mtime_ns=int(initial.st_mtime_ns),
+                untracked_ctime_ns=_portable_untracked_ctime_ns(initial),
+            ),
+            _untracked_evidence_marker(
+                entry.path,
+                f"UNTRACKED HASH BOUND EXCEEDED: {int(initial.st_size)} BYTES",
+            ),
+        )
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = (
+            os.open(full_path, flags)
+            if parent_fd is None
+            else os.open(leaf, flags, dir_fd=parent_fd)
+        )
+    except OSError as exc:
+        anomaly = WorkspaceCaptureFailureKind.UNREADABLE_UNTRACKED_ENTRY
+        return (
+            replace(
+                entry,
+                anomaly=anomaly,
+                untracked_file_type="REGULAR",
+                untracked_byte_count=int(initial.st_size),
+                untracked_device=int(initial.st_dev),
+                untracked_inode=int(initial.st_ino),
+                untracked_mode=int(initial.st_mode),
+                untracked_mtime_ns=int(initial.st_mtime_ns),
+                untracked_ctime_ns=_portable_untracked_ctime_ns(initial),
+            ),
+            _untracked_evidence_marker(entry.path, f"UNREADABLE: {type(exc).__name__}"),
+        )
+
+    hasher = hashlib.sha256()
+    inline_prefix = bytearray()
+    total = 0
+    try:
+        opened = os.fstat(fd)
+        stable_fields = _untracked_stable_fields()
+        if not stat.S_ISREG(opened.st_mode) or any(
+            getattr(initial, name) != getattr(opened, name) for name in stable_fields
+        ):
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.UNHASHABLE_UNTRACKED_ENTRY,
+                "untracked entry identity changed before hashing",
+            )
+        reserved_size = int(opened.st_size)
+        if reserved_size > MAX_UNTRACKED_HASH_BYTES:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+                "untracked descriptor exceeds the per-file hash bound",
+            )
+        if not budget.reserve_untracked_bytes(reserved_size):
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+                "aggregate untracked hash bound exceeded",
+            )
+        while True:
+            budget.remaining_timeout()
+            remaining_reserved = reserved_size - total
+            chunk = os.read(fd, min(65_536, remaining_reserved + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > reserved_size:
+                raise WorkspaceCaptureError(
+                    WorkspaceCaptureFailureKind.UNHASHABLE_UNTRACKED_ENTRY,
+                    "untracked entry grew beyond its reserved hash budget",
+                )
+            hasher.update(chunk)
+            if len(inline_prefix) <= max_inline_file_bytes:
+                remaining = max_inline_file_bytes + 1 - len(inline_prefix)
+                inline_prefix.extend(chunk[:remaining])
+        final = os.fstat(fd)
+        if any(getattr(opened, name) != getattr(final, name) for name in stable_fields):
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.UNHASHABLE_UNTRACKED_ENTRY,
+                "untracked entry changed while hashing",
+            )
+        path_final = _lstat_at(parent_fd, leaf, full_path)
+        if any(getattr(final, name) != getattr(path_final, name) for name in stable_fields):
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.UNHASHABLE_UNTRACKED_ENTRY,
+                "untracked pathname no longer names the hashed descriptor",
+            )
+    except WorkspaceCaptureError as exc:
+        return (
+            replace(
+                entry,
+                anomaly=exc.kind,
+                untracked_file_type="REGULAR",
+                untracked_byte_count=int(initial.st_size),
+                untracked_device=int(initial.st_dev),
+                untracked_inode=int(initial.st_ino),
+                untracked_mode=int(initial.st_mode),
+                untracked_mtime_ns=int(initial.st_mtime_ns),
+                untracked_ctime_ns=_portable_untracked_ctime_ns(initial),
+            ),
+            _untracked_evidence_marker(entry.path, "UNHASHABLE: IDENTITY CHANGED"),
+        )
+    except OSError as exc:
+        anomaly = WorkspaceCaptureFailureKind.UNHASHABLE_UNTRACKED_ENTRY
+        return (
+            replace(
+                entry,
+                anomaly=anomaly,
+                untracked_file_type="REGULAR",
+                untracked_byte_count=int(initial.st_size),
+                untracked_device=int(initial.st_dev),
+                untracked_inode=int(initial.st_ino),
+                untracked_mode=int(initial.st_mode),
+                untracked_mtime_ns=int(initial.st_mtime_ns),
+                untracked_ctime_ns=_portable_untracked_ctime_ns(initial),
+            ),
+            _untracked_evidence_marker(entry.path, f"UNHASHABLE: {type(exc).__name__}"),
+        )
+    finally:
+        os.close(fd)
+
+    digest = hasher.hexdigest()
+    captured = replace(
+        entry,
+        untracked_file_type="REGULAR",
+        untracked_byte_count=total,
+        untracked_sha256=digest,
+        untracked_device=int(final.st_dev),
+        untracked_inode=int(final.st_ino),
+        untracked_mode=int(final.st_mode),
+        untracked_mtime_ns=int(final.st_mtime_ns),
+        untracked_ctime_ns=_portable_untracked_ctime_ns(final),
+    )
+    if total == 0:
+        inline = f"--- /dev/null\n+++ b/{entry.path}\n@@ -0,0 +0,0 @@\n".encode("utf-8")
+    elif total > max_inline_file_bytes:
+        inline = _untracked_evidence_marker(
+            entry.path, f"UNTRACKED LARGE FILE: {total} BYTES, SHA256: {digest}"
+        )
+    elif b"\0" in inline_prefix:
+        inline = _untracked_evidence_marker(
+            entry.path, f"UNTRACKED BINARY FILE: {total} BYTES, SHA256: {digest}"
+        )
+    else:
+        try:
+            text = bytes(inline_prefix).decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            inline = _untracked_evidence_marker(
+                entry.path, f"UNTRACKED BINARY FILE: {total} BYTES, SHA256: {digest}"
+            )
+        else:
+            lines = text.splitlines()
+            inline = (
+                f"--- /dev/null\n+++ b/{entry.path}\n@@ -0,0 +1,{len(lines)} @@\n+"
+                + "\n+".join(lines)
+                + "\n"
+            ).encode("utf-8")
+    return captured, inline
+
+
+def _enrich_untracked_entries(
+    worktree_dir: Path,
+    entries: tuple[StatusManifestEntry, ...],
+    *,
+    max_inline_file_bytes: int,
+    max_inline_total_bytes: int,
+    budget: _CaptureBudget,
+) -> tuple[tuple[StatusManifestEntry, ...], str, bool]:
+    enriched: list[StatusManifestEntry] = []
+    inline = bytearray()
+    truncated = False
+    for entry in entries:
+        if StatusCategory.UNTRACKED not in entry.categories:
+            enriched.append(entry)
+            continue
+        captured, evidence = _capture_untracked_entry(
+            worktree_dir,
+            entry,
+            max_inline_file_bytes=max_inline_file_bytes,
+            budget=budget,
+        )
+        enriched.append(captured)
+        remaining = max(0, max_inline_total_bytes - len(inline))
+        inline.extend(evidence[:remaining])
+        if len(evidence) > remaining:
+            truncated = True
+    return tuple(enriched), inline.decode("utf-8", errors="replace"), truncated
+
+
+def _revalidate_untracked_entries(
+    worktree_dir: Path,
+    entries: tuple[StatusManifestEntry, ...],
+    *,
+    budget: _CaptureBudget,
+) -> None:
+    for entry in entries:
+        if entry.untracked_file_type != "REGULAR" or entry.untracked_sha256 is None:
+            continue
+        budget.remaining_timeout()
+        try:
+            with _open_verified_parent_directory(worktree_dir, entry.path) as (
+                parent_fd,
+                leaf,
+                full_path,
+            ):
+                current = _lstat_at(parent_fd, leaf, full_path)
+        except OSError as exc:
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.UNHASHABLE_UNTRACKED_ENTRY,
+                f"hashed untracked path became unreadable: {type(exc).__name__}",
+            ) from exc
+        expected_by_field = {
+            "st_dev": entry.untracked_device,
+            "st_ino": entry.untracked_inode,
+            "st_mode": entry.untracked_mode,
+            "st_size": entry.untracked_byte_count,
+            "st_mtime_ns": entry.untracked_mtime_ns,
+            "st_ctime_ns": entry.untracked_ctime_ns,
+        }
+        expected = tuple(expected_by_field[name] for name in _untracked_stable_fields())
+        observed = tuple(
+            int(getattr(current, name)) for name in _untracked_stable_fields()
+        )
+        if observed != expected or not stat.S_ISREG(current.st_mode):
+            raise WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.UNHASHABLE_UNTRACKED_ENTRY,
+                "hashed untracked path changed before checkpoint completion",
+            )
+
+
+def _canonical_checkpoint_digest(payload: dict[str, Any]) -> str:
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8", errors="strict")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.INTERNAL_CANONICALIZATION_INCONSISTENCY,
+            "checkpoint canonical encoding failed",
+        ) from exc
+    if len(encoded) > 1_000_000:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.INTERNAL_CANONICALIZATION_INCONSISTENCY,
+            "checkpoint canonical representation exceeded its fixed bound",
+        )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _observe_owned_worktree_identity(
+    repo: RepositoryIdentity,
+    state: WorktreeLifecycleState,
+    worktree_dir: Path,
+    *,
+    budget: _CaptureBudget,
+) -> tuple[int, int, str]:
+    """Re-observe kernel and Git identity within the shared capture deadline."""
+    if not worktree_dir.is_dir() or worktree_dir.is_symlink():
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.FILESYSTEM_IDENTITY_MISMATCH,
+            "worktree path is missing, non-directory, or a symlink",
+        )
+    try:
+        current_device, current_inode = _stat_descriptor_identity(worktree_dir)
+    except WorktreeValidationError as exc:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.FILESYSTEM_IDENTITY_MISMATCH,
+            str(exc),
+        ) from exc
+    if (
+        state.worktree_device is None
+        or state.worktree_inode is None
+        or current_device != state.worktree_device
+        or current_inode != state.worktree_inode
+    ):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.FILESYSTEM_IDENTITY_MISMATCH,
+            "worktree device/inode differs from the controller-owned lifecycle evidence",
+        )
+
+    try:
+        head_result = _run_git_plumbing(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree_dir,
+            timeout=budget.remaining_timeout(),
+        )
+        ref_result = _run_git_plumbing(
+            ["git", "rev-parse", state.task_ref],
+            cwd=repo.canonical_root,
+            timeout=budget.remaining_timeout(),
+        )
+        symbolic_ref_result = _run_git_plumbing(
+            ["git", "symbolic-ref", "-q", "HEAD"],
+            cwd=worktree_dir,
+            timeout=budget.remaining_timeout(),
+        )
+    except WorktreeValidationError as exc:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.REF_IDENTITY_MISMATCH,
+            str(exc),
+        ) from exc
+    if head_result.returncode != 0 or ref_result.returncode != 0 or symbolic_ref_result.returncode != 0:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.REF_IDENTITY_MISMATCH,
+            "worktree HEAD, symbolic task branch, or task ref could not be resolved",
+        )
+    current_head_sha = head_result.stdout.strip().lower()
+    current_ref_sha = ref_result.stdout.strip().lower()
+    sha_pattern = _LOWER_HEX_40_RE if repo.object_format == "sha1" else _LOWER_HEX_64_RE
+    if (
+        not sha_pattern.fullmatch(current_head_sha)
+        or current_ref_sha != current_head_sha
+        or symbolic_ref_result.stdout.strip() != state.task_ref
+    ):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.REF_IDENTITY_MISMATCH,
+            "worktree HEAD and controller-owned task ref are not the same exact commit",
+        )
+    return current_device, current_inode, current_head_sha
+
+
+def _capture_workspace_checkpoint(
+    repo: RepositoryIdentity,
+    state: WorktreeLifecycleState,
+    *,
+    task_id: str,
+    generation: int,
+    timeout: float,
+    max_status_bytes: int,
+    max_status_entries: int,
+    max_status_path_bytes: int,
+    max_paths_per_category: int,
+    max_diff_bytes: int,
+    max_complete_diff_bytes: int,
+    max_untracked_inline_bytes: int,
+    max_aggregate_untracked_bytes: int,
+    max_filesystem_path_bytes: int,
+) -> WorkspaceCheckpointCaptureResult:
+    if type(max_paths_per_category) is not int or max_paths_per_category < 0:
+        raise ValueError("max_paths_per_category must be a non-negative integer")
+    if (
+        type(max_aggregate_untracked_bytes) is not int
+        or max_aggregate_untracked_bytes < 0
+        or type(max_filesystem_path_bytes) is not int
+        or max_filesystem_path_bytes < 0
+    ):
+        raise ValueError("aggregate capture bounds must be non-negative integers")
+    budget = _CaptureBudget(
+        deadline=time.monotonic() + timeout,
+        max_aggregate_untracked_bytes=max_aggregate_untracked_bytes,
+        max_filesystem_path_bytes=max_filesystem_path_bytes,
+    )
+    if state.repository_id != repo.repository_id:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.REPOSITORY_IDENTITY_MISMATCH,
+            "lifecycle repository identity does not match the observed repository",
+        )
+    ownership = state.ownership_record
+    if ownership is None or not verify_ownership_record_authenticity(ownership):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.REPOSITORY_IDENTITY_MISMATCH,
+            "trusted M5 ownership evidence is missing or invalid",
+        )
+    if (
+        state.task_id != task_id
+        or state.generation != generation
+        or ownership.task_id != task_id
+        or ownership.generation != generation
+        or ownership.repository_id != repo.repository_id
+        or ownership.task_ref != state.task_ref
+        or ownership.baseline_commit_sha != state.baseline_commit_sha
+    ):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.REPOSITORY_IDENTITY_MISMATCH,
+            "task, generation, repository, ref, or baseline ownership identity mismatch",
+        )
+
+    worktree_dir = state.worktree_path
+    current_device, current_inode, current_head_sha = _observe_owned_worktree_identity(
+        repo,
+        state,
+        worktree_dir,
+        budget=budget,
+    )
+
+    raw_status = _run_git_status_bounded(
+        worktree_dir,
+        max_status_bytes=max_status_bytes,
+        timeout=budget.remaining_timeout(),
+    )
+    parsed_entries = _parse_status_stream(
+        raw_status,
+        max_entries=max_status_entries,
+        max_path_bytes=max_status_path_bytes,
+    )
+    index_manifest = _run_git_index_manifest_bounded(
+        worktree_dir,
+        object_format=repo.object_format,
+        max_index_bytes=max_status_bytes,
+        max_entries=max_status_entries,
+        max_path_bytes=max_status_path_bytes,
+        timeout=budget.remaining_timeout(),
+    )
+    parsed_entries = tuple(
+        replace(entry, anomaly=WorkspaceCaptureFailureKind.FORBIDDEN_GITLINK)
+        if entry.path in index_manifest.gitlink_paths
+        or (entry.second_path is not None and entry.second_path in index_manifest.gitlink_paths)
+        else entry
+        for entry in parsed_entries
+    )
+    represented_paths = {
+        path
+        for entry in parsed_entries
+        for path in (entry.path, entry.second_path)
+        if path is not None
+    }
+    parsed_entries = tuple(
+        sorted(
+            (
+                *parsed_entries,
+                *(
+                    StatusManifestEntry(
+                        code="GL",
+                        categories=(StatusCategory.FILESYSTEM_ANOMALY,),
+                        path=path,
+                        anomaly=WorkspaceCaptureFailureKind.FORBIDDEN_GITLINK,
+                        untracked_file_type="GITLINK",
+                    )
+                    for path in index_manifest.gitlink_paths
+                    if path not in represented_paths
+                ),
+            ),
+            key=lambda entry: (entry.path, entry.second_path or "", entry.code),
+        )
+    )
+    parsed_entries = _scan_unobserved_special_entries(
+        worktree_dir,
+        parsed_entries,
+        tracked_paths=index_manifest.tracked_paths,
+        gitlink_paths=index_manifest.gitlink_paths,
+        budget=budget,
+        max_entries=max_status_entries,
+        max_path_bytes=max_status_path_bytes,
+    )
+    entries, untracked_content, untracked_truncated = _enrich_untracked_entries(
+        worktree_dir,
+        parsed_entries,
+        max_inline_file_bytes=MAX_UNTRACKED_FILE_EVIDENCE_BYTES,
+        max_inline_total_bytes=max_untracked_inline_bytes,
+        budget=budget,
+    )
+    manifest_digest = _canonical_status_manifest(entries)
+    status_counts = _count_status_categories(entries)
+    diff_byte_count, diff_sha256, diff_content, is_diff_truncated = _run_git_diff_bounded(
+        worktree_dir,
+        max_diff_bytes=max_diff_bytes,
+        max_complete_bytes=max_complete_diff_bytes,
+        timeout=budget.remaining_timeout(),
+    )
+
+    repeated_status = _run_git_status_bounded(
+        worktree_dir,
+        max_status_bytes=max_status_bytes,
+        timeout=budget.remaining_timeout(),
+    )
+    if repeated_status != raw_status:
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.INTERNAL_CANONICALIZATION_INCONSISTENCY,
+            "workspace status changed during checkpoint capture",
+        )
+    repeated_diff_count, repeated_diff_sha256, _, _ = _run_git_diff_bounded(
+        worktree_dir,
+        max_diff_bytes=0,
+        max_complete_bytes=max_complete_diff_bytes,
+        timeout=budget.remaining_timeout(),
+    )
+    if (repeated_diff_count, repeated_diff_sha256) != (diff_byte_count, diff_sha256):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.INTERNAL_CANONICALIZATION_INCONSISTENCY,
+            "workspace diff changed during checkpoint capture",
+        )
+    _revalidate_untracked_entries(worktree_dir, entries, budget=budget)
+    final_device, final_inode, final_head_sha = _observe_owned_worktree_identity(
+        repo,
+        state,
+        worktree_dir,
+        budget=budget,
+    )
+    if (
+        final_device != current_device
+        or final_inode != current_inode
+        or final_head_sha != current_head_sha
+    ):
+        raise WorkspaceCaptureError(
+            WorkspaceCaptureFailureKind.REF_IDENTITY_MISMATCH,
+            "worktree filesystem or commit identity changed during checkpoint capture",
+        )
+
+    anomalies = tuple(
+        sorted(
+            {entry.anomaly for entry in entries if entry.anomaly is not None},
+            key=lambda anomaly: anomaly.value,
+        )
+    )
+    incomplete_anomalies = {
+        WorkspaceCaptureFailureKind.UNREADABLE_UNTRACKED_ENTRY,
+        WorkspaceCaptureFailureKind.UNHASHABLE_UNTRACKED_ENTRY,
+        WorkspaceCaptureFailureKind.EVIDENCE_BOUND_EXCEEDED,
+    }
+    completeness = (
+        WorkspaceCaptureCompleteness.INCOMPLETE
+        if incomplete_anomalies.intersection(anomalies)
+        else WorkspaceCaptureCompleteness.COMPLETE
+    )
+    checkpoint_payload = {
+        "anomalies": [anomaly.value for anomaly in anomalies],
+        "authoritative_diff_truncated": False,
+        "authoritative_status_truncated": False,
+        "baseline_commit_sha": state.baseline_commit_sha,
+        "capture_completeness": completeness.value,
+        "current_head_sha": current_head_sha,
+        "diff_byte_count": diff_byte_count,
+        "diff_sha256": diff_sha256,
+        "generation": generation,
+        "ownership_digest": ownership.ownership_digest,
+        "repository_id": repo.repository_id,
+        "reservation_digest": ownership.reservation_digest,
+        "schema_version": "AOSWORKSPACECHECKPOINT/1",
+        "status_counts": status_counts.to_dict(),
+        "status_entry_count": len(entries),
+        "status_manifest_sha256": manifest_digest,
+        "task_id": task_id,
+        "task_ref": state.task_ref,
+        "worktree_device": current_device,
+        "worktree_inode": current_inode,
+    }
+    checkpoint_digest = _canonical_checkpoint_digest(checkpoint_payload)
+    checkpoint = WorkspaceCheckpoint(
+        schema_version="AOSWORKSPACECHECKPOINT/1",
+        repository_id=repo.repository_id,
+        ownership_digest=ownership.ownership_digest,
+        reservation_digest=ownership.reservation_digest,
+        task_id=task_id,
+        generation=generation,
+        task_ref=state.task_ref,
+        baseline_commit_sha=state.baseline_commit_sha,
+        current_head_sha=current_head_sha,
+        worktree_device=current_device,
+        worktree_inode=current_inode,
+        status_counts=status_counts,
+        status_manifest_sha256=manifest_digest,
+        status_entry_count=len(entries),
+        diff_byte_count=diff_byte_count,
+        diff_sha256=diff_sha256,
+        anomalies=anomalies,
+        capture_completeness=completeness,
+        authoritative_status_truncated=False,
+        authoritative_diff_truncated=False,
+        checkpoint_digest=checkpoint_digest,
+    )
+    presented = entries[:max_paths_per_category]
+    omitted_count = len(entries) - len(presented)
+    def paths_for(category: StatusCategory) -> tuple[str, ...]:
+        return tuple(entry.path for entry in entries if category in entry.categories)[
+            :max_paths_per_category
+        ]
+
+    decision = (
+        WorkspaceReuseDecision.REUSABLE
+        if not anomalies and completeness is WorkspaceCaptureCompleteness.COMPLETE
+        else WorkspaceReuseDecision.NOT_REUSABLE
+    )
+    return WorkspaceCheckpointCaptureResult(
+        decision=decision,
+        checkpoint=checkpoint,
+        failure=None,
+        status_entries=presented,
+        modified_paths=paths_for(StatusCategory.TRACKED_MODIFIED),
+        tracked_added_paths=paths_for(StatusCategory.TRACKED_ADDED),
+        added_untracked_paths=paths_for(StatusCategory.UNTRACKED),
+        deleted_paths=paths_for(StatusCategory.TRACKED_DELETED),
+        renamed_paths=tuple(
+            (entry.second_path, entry.path)
+            for entry in entries
+            if StatusCategory.RENAMED in entry.categories and entry.second_path is not None
+        )[:max_paths_per_category],
+        copied_paths=tuple(
+            (entry.second_path, entry.path)
+            for entry in entries
+            if StatusCategory.COPIED in entry.categories and entry.second_path is not None
+        )[:max_paths_per_category],
+        unmerged_paths=paths_for(StatusCategory.UNMERGED),
+        path_list_truncated=omitted_count > 0,
+        omitted_path_count=omitted_count,
+        untracked_evidence_content=untracked_content,
+        is_untracked_evidence_truncated=untracked_truncated,
+        diff_content=diff_content,
+        is_diff_truncated=is_diff_truncated,
+        observed_at=str(time.time_ns()),
+    )
 
 
 @dataclass(frozen=True)
@@ -1373,6 +3035,60 @@ class WorktreeManager:
             mask_file = self.ensure_git_mask(repo.repository_id, task_id, generation)
             return worktree_dir, mask_file, state
 
+    def capture_checkpoint(
+        self,
+        repo_path: str | Path,
+        task_id: str,
+        generation: int,
+        *,
+        max_diff_bytes: int = 1_000_000,
+        max_paths_per_category: int = 1000,
+        max_status_bytes: int = MAX_STATUS_OUTPUT_BYTES,
+        max_status_entries: int = MAX_STATUS_ENTRIES,
+        max_status_path_bytes: int = MAX_STATUS_PATH_BYTES,
+        max_complete_diff_bytes: int = MAX_COMPLETE_DIFF_BYTES,
+        max_untracked_inline_bytes: int = MAX_UNTRACKED_INLINE_TOTAL_BYTES,
+        max_aggregate_untracked_bytes: int = MAX_AGGREGATE_UNTRACKED_BYTES,
+        max_filesystem_path_bytes: int = MAX_FILESYSTEM_PATH_BYTES,
+    ) -> WorkspaceCheckpointCaptureResult:
+        """Measure one complete M5 state and return an explicit reuse decision."""
+        observed_at = str(time.time_ns())
+        try:
+            repo = RepositoryIdentity.from_path(repo_path)
+        except WorktreeValidationError as exc:
+            error = WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.REPOSITORY_IDENTITY_MISMATCH, str(exc)
+            )
+            return WorkspaceCheckpointCaptureResult.capture_failed(error, observed_at=observed_at)
+
+        lock_path = self._get_lock_path(repo.repository_id)
+        try:
+            with acquire_repository_lock(lock_path, timeout=self.lock_timeout):
+                state = self.inspect(repo_path, task_id, generation)
+                return _capture_workspace_checkpoint(
+                    repo,
+                    state,
+                    task_id=task_id,
+                    generation=generation,
+                    timeout=self.lock_timeout,
+                    max_status_bytes=max_status_bytes,
+                    max_status_entries=max_status_entries,
+                    max_status_path_bytes=max_status_path_bytes,
+                    max_paths_per_category=max_paths_per_category,
+                    max_diff_bytes=max_diff_bytes,
+                    max_complete_diff_bytes=max_complete_diff_bytes,
+                    max_untracked_inline_bytes=max_untracked_inline_bytes,
+                    max_aggregate_untracked_bytes=max_aggregate_untracked_bytes,
+                    max_filesystem_path_bytes=max_filesystem_path_bytes,
+                )
+        except WorkspaceCaptureError as exc:
+            return WorkspaceCheckpointCaptureResult.capture_failed(exc, observed_at=observed_at)
+        except WorktreeValidationError as exc:
+            error = WorkspaceCaptureError(
+                WorkspaceCaptureFailureKind.REPOSITORY_IDENTITY_MISMATCH, str(exc)
+            )
+            return WorkspaceCheckpointCaptureResult.capture_failed(error, observed_at=observed_at)
+
     def capture_result(
         self,
         repo_path: str | Path,
@@ -1384,6 +3100,13 @@ class WorktreeManager:
         worker_timed_out: bool = False,
         max_diff_bytes: int = 1_000_000,
         max_paths_per_category: int = 1000,
+        max_status_bytes: int = MAX_STATUS_OUTPUT_BYTES,
+        max_status_entries: int = MAX_STATUS_ENTRIES,
+        max_status_path_bytes: int = MAX_STATUS_PATH_BYTES,
+        max_complete_diff_bytes: int = MAX_COMPLETE_DIFF_BYTES,
+        max_untracked_inline_bytes: int = MAX_UNTRACKED_INLINE_TOTAL_BYTES,
+        max_aggregate_untracked_bytes: int = MAX_AGGREGATE_UNTRACKED_BYTES,
+        max_filesystem_path_bytes: int = MAX_FILESYSTEM_PATH_BYTES,
     ) -> TaskWorktreeResult:
         """Capture post-worker result from trusted Git & filesystem inspection of task worktree."""
         repo = RepositoryIdentity.from_path(repo_path)
@@ -1395,77 +3118,32 @@ class WorktreeManager:
             if not worktree_dir.is_dir():
                 raise WorktreeValidationError(f"Worktree path {worktree_dir} missing for result capture")
 
-            cur_dev, cur_ino = _stat_descriptor_identity(worktree_dir)
-
-            res_head = _run_git_plumbing(["git", "rev-parse", "HEAD"], cwd=worktree_dir)
-            if res_head.returncode != 0:
-                raise WorktreeValidationError("Failed to resolve worktree HEAD SHA")
-            current_head_sha = res_head.stdout.strip().lower()
-
-            res_st = _run_git_plumbing(["git", "status", "--porcelain=v1", "-z"], cwd=worktree_dir)
-            renamed_set: set[tuple[str, str]] = set()
-            modified_set: set[str] = set()
-            added_set: set[str] = set()
-            deleted_set: set[str] = set()
-
-            if res_st.returncode == 0 and res_st.stdout:
-                raw_entries = res_st.stdout.split("\0")
-                idx = 0
-                while idx < len(raw_entries):
-                    entry = raw_entries[idx]
-                    if not entry:
-                        idx += 1
-                        continue
-                    if len(entry) >= 3:
-                        st_code = entry[:2]
-                        path1 = entry[3:]
-                        if st_code[0] in ("R", "C") or st_code[1] in ("R", "C"):
-                            if idx + 1 < len(raw_entries):
-                                path2 = raw_entries[idx + 1]
-                                idx += 1
-                                renamed_set.add((path2, path1))
-                                if st_code[1] == "M":
-                                    modified_set.add(path1)
-                        elif st_code == "??" or "A" in st_code:
-                            added_set.add(path1)
-                        elif "D" in st_code:
-                            deleted_set.add(path1)
-                        elif "M" in st_code:
-                            modified_set.add(path1)
-                    idx += 1
-
-            mod_paths = tuple(sorted(modified_set)[:max_paths_per_category])
-            add_paths = tuple(sorted(added_set)[:max_paths_per_category])
-            del_paths = tuple(sorted(deleted_set)[:max_paths_per_category])
-            ren_paths = tuple(sorted(renamed_set)[:max_paths_per_category])
-
-            diff_byte_count, diff_sha256, diff_content, is_diff_truncated = _run_git_diff_bounded(
-                worktree_dir, max_diff_bytes=max_diff_bytes, timeout=self.lock_timeout
+            capture = _capture_workspace_checkpoint(
+                repo,
+                state,
+                task_id=task_id,
+                generation=generation,
+                timeout=self.lock_timeout,
+                max_status_bytes=max_status_bytes,
+                max_status_entries=max_status_entries,
+                max_status_path_bytes=max_status_path_bytes,
+                max_paths_per_category=max_paths_per_category,
+                max_diff_bytes=max_diff_bytes,
+                max_complete_diff_bytes=max_complete_diff_bytes,
+                max_untracked_inline_bytes=max_untracked_inline_bytes,
+                max_aggregate_untracked_bytes=max_aggregate_untracked_bytes,
+                max_filesystem_path_bytes=max_filesystem_path_bytes,
             )
-
-            if added_set:
-                extra_chunks = []
-                for rel_p in sorted(added_set):
-                    chunk_b = _format_untracked_file_evidence(worktree_dir, rel_p)
-                    if chunk_b:
-                        extra_chunks.append(chunk_b)
-                if extra_chunks:
-                    combined_extra = b"\n" + b"".join(extra_chunks)
-                    base_bytes = diff_content.encode("utf-8", errors="replace")
-                    all_bytes = base_bytes + combined_extra
-                    diff_byte_count = len(all_bytes)
-                    diff_sha256 = hashlib.sha256(all_bytes).hexdigest()
-                    if diff_byte_count > max_diff_bytes:
-                        is_diff_truncated = True
-                        diff_content = all_bytes[:max_diff_bytes].decode("utf-8", errors="replace") + f"\n... [TRUNCATED {diff_byte_count - max_diff_bytes} BYTES]"
-                    else:
-                        diff_content = all_bytes.decode("utf-8", errors="replace")
+            checkpoint = capture.checkpoint
+            if checkpoint is None:
+                raise WorkspaceCaptureError(
+                    WorkspaceCaptureFailureKind.INTERNAL_CANONICALIZATION_INCONSISTENCY,
+                    "successful capture did not produce a checkpoint",
+                )
+            current_head_sha = checkpoint.current_head_sha
 
             is_clean = (
-                len(modified_set) == 0
-                and len(added_set) == 0
-                and len(deleted_set) == 0
-                and len(renamed_set) == 0
+                checkpoint.status_counts.total_entries == 0
                 and current_head_sha == state.baseline_commit_sha.lower()
             )
 
@@ -1484,21 +3162,36 @@ class WorktreeManager:
                 baseline_commit_sha=state.baseline_commit_sha,
                 current_head_sha=current_head_sha,
                 worktree_path=worktree_dir,
-                worktree_device=cur_dev,
-                worktree_inode=cur_ino,
+                worktree_device=checkpoint.worktree_device,
+                worktree_inode=checkpoint.worktree_inode,
                 worker_exit_code=worker_exit_code,
                 worker_signal=worker_signal,
                 worker_timed_out=worker_timed_out,
                 lifecycle_status=WorktreeLifecycleStatus(preservation),
                 is_clean=is_clean,
-                modified_paths=mod_paths,
-                added_untracked_paths=add_paths,
-                deleted_paths=del_paths,
-                renamed_paths=ren_paths,
-                diff_sha256=diff_sha256,
-                diff_byte_count=diff_byte_count,
-                diff_content=diff_content,
-                is_diff_truncated=is_diff_truncated,
+                modified_paths=capture.modified_paths,
+                tracked_added_paths=capture.tracked_added_paths,
+                added_untracked_paths=capture.added_untracked_paths,
+                deleted_paths=capture.deleted_paths,
+                renamed_paths=capture.renamed_paths,
+                copied_paths=capture.copied_paths,
+                unmerged_paths=capture.unmerged_paths,
+                status_entries=capture.status_entries,
+                status_counts=checkpoint.status_counts,
+                status_manifest_sha256=checkpoint.status_manifest_sha256,
+                status_entry_count=checkpoint.status_entry_count,
+                path_list_truncated=capture.path_list_truncated,
+                omitted_path_count=capture.omitted_path_count,
+                diff_sha256=checkpoint.diff_sha256,
+                diff_byte_count=checkpoint.diff_byte_count,
+                diff_content=capture.diff_content,
+                is_diff_truncated=capture.is_diff_truncated,
+                untracked_evidence_content=capture.untracked_evidence_content,
+                is_untracked_evidence_truncated=capture.is_untracked_evidence_truncated,
+                workspace_checkpoint=checkpoint,
+                checkpoint_digest=checkpoint.checkpoint_digest,
+                capture_completeness=checkpoint.capture_completeness,
+                reusability_decision=capture.decision,
                 preservation_classification=preservation,
             )
 
@@ -1512,111 +3205,40 @@ class WorktreeManager:
             return result
 
 
-MAX_UNTRACKED_FILE_EVIDENCE_BYTES = 64_000
-
-
 def _run_git_diff_bounded(
     cwd: Path,
     max_diff_bytes: int = 1_000_000,
+    max_complete_bytes: int = MAX_COMPLETE_DIFF_BYTES,
     timeout: float = 10.0,
 ) -> tuple[int, str, str, bool]:
     """Execute git diff HEAD with bounded streaming memory consumption.
 
     Returns (diff_byte_count, diff_sha256, diff_inline_content, is_diff_truncated).
     """
-    cmd = ["git", "diff", "HEAD"]
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_sanitize_git_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise WorktreeValidationError(f"git diff execution failed: {type(exc).__name__}") from exc
-
-    hasher = hashlib.sha256()
-    total_bytes = 0
-    inline_buf = bytearray()
-
-    try:
-        if proc.stdout is not None:
-            while True:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    break
-                hasher.update(chunk)
-                total_bytes += len(chunk)
-                if len(inline_buf) < max_diff_bytes:
-                    space = max_diff_bytes - len(inline_buf)
-                    inline_buf.extend(chunk[:space])
-        proc.wait(timeout=timeout)
-    except Exception as exc:
-        proc.kill()
-        proc.wait()
-        raise WorktreeValidationError(f"git diff streaming failed: {type(exc).__name__}") from exc
-
-    if proc.returncode != 0:
-        return 0, hashlib.sha256(b"").hexdigest(), "", False
-
-    is_truncated = total_bytes > max_diff_bytes
-    diff_sha256 = hasher.hexdigest()
-    diff_text = inline_buf.decode("utf-8", errors="replace")
-
-    return total_bytes, diff_sha256, diff_text, is_truncated
-
-
-def _format_untracked_file_evidence(
-    worktree_dir: Path,
-    rel_p: str,
-    max_evidence_bytes: int = MAX_UNTRACKED_FILE_EVIDENCE_BYTES,
-) -> bytes:
-    """Generate bounded, safe evidence diff chunk for an untracked file without following symlinks."""
-    full_p = worktree_dir / rel_p
-    try:
-        st = full_p.lstat()
-    except OSError:
-        return b""
-
-    if stat.S_ISLNK(st.st_mode):
-        try:
-            target = os.readlink(full_p)
-        except OSError:
-            target = "<unreadable>"
-        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,1 @@\n+ [SYMLINK -> {target}]\n".encode("utf-8")
-
-    if not stat.S_ISREG(st.st_mode):
-        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,1 @@\n+ [NON-REGULAR FILE: mode {oct(st.st_mode)}]\n".encode("utf-8")
-
-    if st.st_size == 0:
-        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +0,0 @@\n".encode("utf-8")
-
-    if st.st_size > max_evidence_bytes:
-        hasher = hashlib.sha256()
-        try:
-            with open(full_p, "rb") as f:
-                while chunk := f.read(65536):
-                    hasher.update(chunk)
-            sha = hasher.hexdigest()
-        except OSError:
-            sha = "<unreadable>"
-        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,1 @@\n+ [UNTRACKED LARGE FILE: {st.st_size} BYTES, SHA256: {sha}]\n".encode("utf-8")
-
-    try:
-        with open(full_p, "rb") as f:
-            raw = f.read(max_evidence_bytes + 1)
-    except OSError:
-        return b""
-
-    if b"\x00" in raw:
-        sha = hashlib.sha256(raw).hexdigest()
-        return f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,1 @@\n+ [UNTRACKED BINARY FILE: {len(raw)} BYTES, SHA256: {sha}]\n".encode("utf-8")
-
-    text = raw.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    content = f"--- /dev/null\n+++ b/{rel_p}\n@@ -0,0 +1,{len(lines)} @@\n+" + "\n+".join(lines) + "\n"
-    return content.encode("utf-8")
+    if type(max_diff_bytes) is not int or max_diff_bytes < 0:
+        raise ValueError("max_diff_bytes must be a non-negative integer")
+    result = _run_git_stream_bounded(
+        [
+            "git",
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+        cwd=cwd,
+        timeout=timeout,
+        max_complete_bytes=max_complete_bytes,
+        max_inline_bytes=max_diff_bytes,
+        failure_kind=WorkspaceCaptureFailureKind.GIT_DIFF_FAILURE,
+    )
+    is_truncated = result.total_bytes > max_diff_bytes
+    diff_text = result.inline_bytes.decode("utf-8", errors="replace")
+    if is_truncated:
+        diff_text += f"\n... [TRUNCATED {result.total_bytes - max_diff_bytes} BYTES]"
+    return result.total_bytes, result.sha256, diff_text, is_truncated
 
 
 @dataclass(frozen=True)
@@ -1638,14 +3260,29 @@ class TaskWorktreeResult:
     lifecycle_status: WorktreeLifecycleStatus
     is_clean: bool
     modified_paths: tuple[str, ...]
+    tracked_added_paths: tuple[str, ...]
     added_untracked_paths: tuple[str, ...]
     deleted_paths: tuple[str, ...]
+    renamed_paths: tuple[tuple[str, str], ...]
+    copied_paths: tuple[tuple[str, str], ...]
+    unmerged_paths: tuple[str, ...]
+    status_entries: tuple[StatusManifestEntry, ...]
+    status_counts: WorkspaceStatusCounts
+    status_manifest_sha256: str
+    status_entry_count: int
+    path_list_truncated: bool
+    omitted_path_count: int
     diff_sha256: str
     diff_byte_count: int
     diff_content: str
     is_diff_truncated: bool
+    untracked_evidence_content: str
+    is_untracked_evidence_truncated: bool
+    workspace_checkpoint: WorkspaceCheckpoint
+    checkpoint_digest: str
+    capture_completeness: WorkspaceCaptureCompleteness
+    reusability_decision: WorkspaceReuseDecision
     preservation_classification: str
-    renamed_paths: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1664,13 +3301,28 @@ class TaskWorktreeResult:
             "lifecycle_status": self.lifecycle_status.value,
             "is_clean": self.is_clean,
             "modified_paths": list(self.modified_paths),
+            "tracked_added_paths": list(self.tracked_added_paths),
             "added_untracked_paths": list(self.added_untracked_paths),
             "deleted_paths": list(self.deleted_paths),
             "renamed_paths": [list(pair) for pair in self.renamed_paths],
+            "copied_paths": [list(pair) for pair in self.copied_paths],
+            "unmerged_paths": list(self.unmerged_paths),
+            "status_entries": [entry.to_manifest_dict() for entry in self.status_entries],
+            "status_counts": self.status_counts.to_dict(),
+            "status_manifest_sha256": self.status_manifest_sha256,
+            "status_entry_count": self.status_entry_count,
+            "path_list_truncated": self.path_list_truncated,
+            "omitted_path_count": self.omitted_path_count,
             "diff_sha256": self.diff_sha256,
             "diff_byte_count": self.diff_byte_count,
             "diff_content": self.diff_content,
             "is_diff_truncated": self.is_diff_truncated,
+            "untracked_evidence_content": self.untracked_evidence_content,
+            "is_untracked_evidence_truncated": self.is_untracked_evidence_truncated,
+            "workspace_checkpoint": self.workspace_checkpoint.to_dict(),
+            "checkpoint_digest": self.checkpoint_digest,
+            "capture_completeness": self.capture_completeness.value,
+            "reusability_decision": self.reusability_decision.value,
             "preservation_classification": self.preservation_classification,
         }
 
