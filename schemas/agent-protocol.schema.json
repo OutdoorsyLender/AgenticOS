@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenticos.local/schemas/agent-protocol.schema.json",
+  "title": "AgenticOS provider-neutral agent protocol AOSAGENT/1",
+  "oneOf": [{"$ref": "#/$defs/request"}, {"$ref": "#/$defs/event"}, {"$ref": "#/$defs/result"}],
+  "$defs": {
+    "identifier": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", "maxLength": 128},
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "sha64": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["project_id", "task_id", "task_generation", "attempt", "controller_epoch", "lease_epoch", "dispatch_nonce", "repository_id", "baseline_commit", "workspace_id", "workspace_generation", "reservation_id", "checkpoint_digest"],
+      "properties": {
+        "project_id": {"$ref": "#/$defs/identifier"}, "task_id": {"$ref": "#/$defs/identifier"}, "task_generation": {"type": "integer", "minimum": 1},
+        "attempt": {"type": "integer", "minimum": 1}, "controller_epoch": {"type": "integer", "minimum": 1}, "lease_epoch": {"type": "integer", "minimum": 0},
+        "dispatch_nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "repository_id": {"$ref": "#/$defs/identifier"},
+        "baseline_commit": {"$ref": "#/$defs/sha40"}, "workspace_id": {"$ref": "#/$defs/identifier"}, "workspace_generation": {"type": "integer", "minimum": 1},
+        "reservation_id": {"$ref": "#/$defs/identifier"}, "checkpoint_digest": {"$ref": "#/$defs/sha64"}
+      }
+    },
+    "evidence": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "evidence_id", "digest", "byte_size"],
+      "properties": {"kind": {"$ref": "#/$defs/identifier"}, "evidence_id": {"$ref": "#/$defs/identifier"}, "digest": {"$ref": "#/$defs/sha64"}, "byte_size": {"type": "integer", "minimum": 0, "maximum": 16777216}}
+    },
+    "limits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["max_events", "max_event_bytes", "max_output_bytes", "max_context_entries", "max_context_bytes", "max_processes", "max_runtime_seconds"],
+      "properties": {
+        "max_events": {"type": "integer", "minimum": 1, "maximum": 4096}, "max_event_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576},
+        "max_output_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216}, "max_context_entries": {"type": "integer", "minimum": 1, "maximum": 1024},
+        "max_context_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216}, "max_processes": {"type": "integer", "minimum": 1, "maximum": 256},
+        "max_runtime_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}
+      }
+    },
+    "request": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "identity", "role", "provider_id", "model_id", "workspace_mount", "instructions", "acceptance_criteria", "context_manifest", "capabilities", "limits"],
+      "properties": {
+        "schema": {"const": "AOSAGENT/1"}, "identity": {"$ref": "#/$defs/identity"},
+        "role": {"enum": ["RESEARCHER", "PLANNER", "BUILDER", "VERIFIER", "REVIEWER"]}, "provider_id": {"$ref": "#/$defs/identifier"}, "model_id": {"$ref": "#/$defs/identifier"},
+        "workspace_mount": {"const": "/workspace"}, "instructions": {"type": "string", "minLength": 1, "maxLength": 32768},
+        "acceptance_criteria": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 1024}},
+        "context_manifest": {"type": "array", "maxItems": 1024, "items": {"type": "object", "additionalProperties": false, "required": ["kind", "item_id", "digest", "byte_size"], "properties": {"kind": {"enum": ["RESEARCH_NOTE", "PLAN_INPUT", "ARCHITECTURE_NOTE", "VERIFICATION_FINDING", "REVIEW_FINDING", "WORKSPACE_MANIFEST"]}, "item_id": {"$ref": "#/$defs/identifier"}, "digest": {"$ref": "#/$defs/sha64"}, "byte_size": {"type": "integer", "minimum": 0, "maximum": 16777216}}}},
+        "capabilities": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"enum": ["READ_CONTEXT", "PROPOSE_TASKS", "PROPOSE_REVIEW", "READ_WORKSPACE", "WRITE_WORKSPACE", "RUN_BOUNDED_COMMANDS"]}},
+        "limits": {"$ref": "#/$defs/limits"}
+      }
+    },
+    "event": {
+      "type": "object", "additionalProperties": false, "required": ["schema", "identity", "sequence", "kind", "payload"],
+      "properties": {
+        "schema": {"const": "AOSAGENT/1"}, "identity": {"$ref": "#/$defs/identity"}, "sequence": {"type": "integer", "minimum": 1},
+        "kind": {"enum": ["STARTED", "PROGRESS", "PROPOSAL", "SUCCEEDED", "NO_OP", "RETRYABLE_FAILURE", "TERMINAL_FAILURE", "BLOCKED", "CANCELLED"]},
+        "payload": {"type": "object", "additionalProperties": false, "required": ["text", "evidence_refs"], "properties": {"text": {"type": "string", "maxLength": 8192}, "evidence_refs": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/evidence"}}}}
+      }
+    },
+    "result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "identity", "status", "exit_class", "event_count", "byte_count", "stream_digest", "evidence_refs", "workspace_handoff_ref", "usage", "retryability"],
+      "properties": {
+        "schema": {"const": "AOSAGENT/1"}, "identity": {"$ref": "#/$defs/identity"},
+        "status": {"enum": ["SUCCEEDED", "NO_OP", "RETRYABLE_FAILURE", "TERMINAL_FAILURE", "BLOCKED", "CANCELLED"]},
+        "exit_class": {"enum": ["SUCCESS", "NO_OP", "RETRYABLE", "TERMINAL", "MALFORMED", "TIMEOUT", "CANCELLED"]},
+        "event_count": {"type": "integer", "minimum": 1, "maximum": 4096}, "byte_count": {"type": "integer", "minimum": 1, "maximum": 16777216}, "stream_digest": {"$ref": "#/$defs/sha64"},
+        "evidence_refs": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/evidence"}},
+        "workspace_handoff_ref": {"anyOf": [{"$ref": "#/$defs/evidence"}, {"type": "null"}]},
+        "usage": {"anyOf": [{"type": "object", "additionalProperties": false, "required": ["input_units", "output_units"], "properties": {"input_units": {"type": "integer", "minimum": 0, "maximum": 1000000000}, "output_units": {"type": "integer", "minimum": 0, "maximum": 1000000000}}}, {"type": "null"}]},
+        "retryability": {"enum": ["RETRYABLE", "NOT_RETRYABLE", "CONTROLLER_POLICY_REQUIRED"]}
+      }
+    }
+  }
+}

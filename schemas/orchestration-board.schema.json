@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenticos.local/schemas/orchestration-board.schema.json",
+  "title": "AgenticOS authoritative board AOSBOARD/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["project", "tasks"],
+  "properties": {
+    "project": {"$ref": "#/$defs/project"},
+    "tasks": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/task"}}
+  },
+  "$defs": {
+    "identifier": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", "maxLength": 128},
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha64": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "workspace": {
+      "type": "object", "additionalProperties": false,
+      "required": ["workspace_id", "generation", "reservation_id"],
+      "properties": {
+        "workspace_id": {"$ref": "#/$defs/identifier"}, "generation": {"type": "integer", "minimum": 1},
+        "reservation_id": {"$ref": "#/$defs/identifier"}
+      }
+    },
+    "limits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["max_tasks", "max_total_attempts", "max_repair_depth", "max_events_per_attempt", "max_event_bytes", "max_output_bytes", "max_context_entries", "max_context_bytes", "max_processes", "max_runtime_seconds"],
+      "properties": {
+        "max_tasks": {"type": "integer", "minimum": 1, "maximum": 128},
+        "max_total_attempts": {"type": "integer", "minimum": 1, "maximum": 4096},
+        "max_repair_depth": {"type": "integer", "minimum": 1, "maximum": 32},
+        "max_events_per_attempt": {"type": "integer", "minimum": 1, "maximum": 4096},
+        "max_event_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576},
+        "max_output_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216},
+        "max_context_entries": {"type": "integer", "minimum": 1, "maximum": 1024},
+        "max_context_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216},
+        "max_processes": {"type": "integer", "minimum": 1, "maximum": 256},
+        "max_runtime_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}
+      }
+    },
+    "project": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "project_id", "goal", "baseline", "workspace", "status", "terminal_reason", "board_revision", "controller_epoch", "lease_epoch", "limits", "started_at_unix_ms", "deadline_unix_ms", "transition_sequence", "transition_digest"],
+      "properties": {
+        "schema": {"const": "AOSBOARD/1"}, "project_id": {"$ref": "#/$defs/identifier"},
+        "goal": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "baseline": {"type": "object", "additionalProperties": false, "required": ["repository_id", "commit_sha"], "properties": {"repository_id": {"$ref": "#/$defs/identifier"}, "commit_sha": {"$ref": "#/$defs/sha40"}}},
+        "workspace": {"$ref": "#/$defs/workspace"},
+        "status": {"enum": ["CREATED", "ACTIVE", "OWNER_BLOCKED", "DONE", "FAILED", "CANCELLED"]},
+        "terminal_reason": {"enum": ["COMPLETED", "OWNER_DECISION_REQUIRED", "CANCELLED_BY_OWNER", "ATTEMPTS_EXHAUSTED", "DEPENDENCY_FAILED", "INVALID_CONTROLLER_STATE", "JOURNAL_CORRUPTION", "RESOURCE_LIMIT", "CONTROLLER_FAILURE", null]},
+        "board_revision": {"type": "integer", "minimum": 0}, "controller_epoch": {"type": "integer", "minimum": 1},
+        "lease_epoch": {"type": "integer", "minimum": 0}, "limits": {"$ref": "#/$defs/limits"},
+        "started_at_unix_ms": {"type": "integer", "minimum": 0}, "deadline_unix_ms": {"type": "integer", "minimum": 1},
+        "transition_sequence": {"type": "integer", "minimum": 0}, "transition_digest": {"$ref": "#/$defs/sha64"}
+      },
+      "allOf": [
+        {"if": {"properties": {"status": {"enum": ["CREATED", "ACTIVE"]}}}, "then": {"properties": {"terminal_reason": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "OWNER_BLOCKED"}}}, "then": {"properties": {"terminal_reason": {"const": "OWNER_DECISION_REQUIRED"}}}},
+        {"if": {"properties": {"status": {"const": "DONE"}}}, "then": {"properties": {"terminal_reason": {"const": "COMPLETED"}}}},
+        {"if": {"properties": {"status": {"const": "CANCELLED"}}}, "then": {"properties": {"terminal_reason": {"const": "CANCELLED_BY_OWNER"}}}},
+        {"if": {"properties": {"status": {"const": "FAILED"}}}, "then": {"properties": {"terminal_reason": {"enum": ["ATTEMPTS_EXHAUSTED", "DEPENDENCY_FAILED", "INVALID_CONTROLLER_STATE", "JOURNAL_CORRUPTION", "RESOURCE_LIMIT", "CONTROLLER_FAILURE"]}}}}
+      ]
+    },
+    "task": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "task_id", "project_id", "title", "description", "task_type", "priority", "dependencies", "acceptance_criteria", "preferred_role", "assigned_role", "status", "attempt_count", "max_attempts", "creation_sequence", "creator", "parent_task_id", "root_task_id", "generation", "workspace", "lease_epoch", "block_reason", "terminal_reason", "repair_failure_fingerprint", "satisfying_descendant_id", "verification_result_digest", "review_result_digest"],
+      "properties": {
+        "schema": {"const": "AOSBOARD/1"}, "task_id": {"$ref": "#/$defs/identifier"}, "project_id": {"$ref": "#/$defs/identifier"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 200}, "description": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "task_type": {"enum": ["RESEARCH", "PLAN", "BUILD", "REPAIR", "DOCUMENT"]}, "priority": {"type": "integer", "minimum": 0, "maximum": 100},
+        "dependencies": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/identifier"}},
+        "acceptance_criteria": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 1024}},
+        "preferred_role": {"enum": ["RESEARCHER", "PLANNER", "BUILDER", "VERIFIER", "REVIEWER"]},
+        "assigned_role": {"type": ["string", "null"], "enum": ["RESEARCHER", "PLANNER", "BUILDER", "VERIFIER", "REVIEWER", null]},
+        "status": {"enum": ["BACKLOG", "READY", "IN_PROGRESS", "VERIFYING", "REVIEW", "WAITING_REPAIR", "BLOCKED", "DONE", "FAILED", "CANCELLED"]},
+        "attempt_count": {"type": "integer", "minimum": 0}, "max_attempts": {"type": "integer", "minimum": 1, "maximum": 32},
+        "creation_sequence": {"type": "integer", "minimum": 1}, "creator": {"$ref": "#/$defs/identifier"},
+        "parent_task_id": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]}, "root_task_id": {"$ref": "#/$defs/identifier"},
+        "generation": {"type": "integer", "minimum": 1}, "workspace": {"$ref": "#/$defs/workspace"}, "lease_epoch": {"type": "integer", "minimum": 0},
+        "block_reason": {"enum": ["OWNER_DECISION_REQUIRED", "PERMISSION_REQUIRED", "CREDENTIAL_REQUIRED", "PAYMENT_REQUIRED", "SAFETY_LIMIT_REQUIRES_OWNER", "DEPENDENCY_BLOCKED", null]}, "terminal_reason": {"enum": ["COMPLETED", "OWNER_DECISION_REQUIRED", "CANCELLED_BY_OWNER", "ATTEMPTS_EXHAUSTED", "DEPENDENCY_FAILED", "INVALID_CONTROLLER_STATE", "JOURNAL_CORRUPTION", "RESOURCE_LIMIT", "CONTROLLER_FAILURE", null]},
+        "repair_failure_fingerprint": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]},
+        "satisfying_descendant_id": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]},
+        "verification_result_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]},
+        "review_result_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]}
+      },
+      "allOf": [
+        {"if": {"properties": {"status": {"enum": ["BACKLOG", "READY", "IN_PROGRESS", "VERIFYING", "REVIEW", "WAITING_REPAIR"]}}}, "then": {"properties": {"terminal_reason": {"type": "null"}, "block_reason": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "BLOCKED"}}}, "then": {"properties": {"terminal_reason": {"type": "null"}, "block_reason": {"type": "string"}}}},
+        {"if": {"properties": {"status": {"const": "DONE"}}}, "then": {"properties": {"terminal_reason": {"const": "COMPLETED"}, "block_reason": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "CANCELLED"}}}, "then": {"properties": {"terminal_reason": {"const": "CANCELLED_BY_OWNER"}, "block_reason": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "FAILED"}}}, "then": {"properties": {"terminal_reason": {"enum": ["ATTEMPTS_EXHAUSTED", "DEPENDENCY_FAILED", "INVALID_CONTROLLER_STATE", "JOURNAL_CORRUPTION", "RESOURCE_LIMIT", "CONTROLLER_FAILURE"]}, "block_reason": {"type": "null"}}}}
+      ]
+    }
+  }
+}
