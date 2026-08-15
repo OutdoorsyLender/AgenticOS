@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -18,6 +19,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 TEMP_ROOT_PLACEHOLDER = "<TEMP_ROOT>"
+CONTAINMENT_RESERVATION_SCHEMA = "AOSCONTAINMENT/1"
+PREPARED_PROCESS_RECEIPT_SCHEMA = "AOSPROCESSSTART/1"
+_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_UNIT_RE = re.compile(r"aos-task-[a-z0-9][a-z0-9-]{0,116}\Z")
+_LOWER_HEX_32_RE = re.compile(r"[0-9a-f]{32}\Z")
+_LOWER_HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
+_NAMESPACE_NAMES = frozenset({"user", "mnt", "net", "pid", "ipc", "uts"})
 
 
 def utc_now_iso() -> str:
@@ -151,6 +159,204 @@ class ProcessIdentity:
             and read_boot_id(proc_root) == self.boot_id
         )
 
+    def matches_fields(
+        self, *, pid: int, start_time_ticks: int, boot_id: str
+    ) -> bool:
+        """Compare the durable anti-PID-reuse fields exactly."""
+        return (
+            self.pid == pid
+            and self.start_time_ticks == start_time_ticks
+            and self.boot_id == boot_id
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "pid": self.pid,
+            "process_group_id": self.process_group_id,
+            "start_time_ticks": self.start_time_ticks,
+            "boot_id": self.boot_id,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "ProcessIdentity":
+        if type(raw) is not dict or set(raw) != {
+            "pid", "process_group_id", "start_time_ticks", "boot_id"
+        }:
+            raise ValueError("invalid process identity fields")
+        return cls(**raw)
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ContainmentReservation:
+    """Controller-selected exact containment and one-use release authority."""
+
+    schema: str
+    project_id: str
+    task_id: str
+    task_generation: int
+    attempt: int
+    controller_epoch: int
+    lease_epoch: int
+    dispatch_nonce: str
+    unit_name: str
+    release_nonce: str
+
+    def __post_init__(self) -> None:
+        if self.schema != CONTAINMENT_RESERVATION_SCHEMA:
+            raise ValueError("invalid containment reservation schema")
+        for name in ("project_id", "task_id"):
+            value = getattr(self, name)
+            if type(value) is not str or _IDENTIFIER_RE.fullmatch(value) is None:
+                raise ValueError(f"invalid {name}")
+        for name in (
+            "task_generation", "attempt", "controller_epoch", "lease_epoch"
+        ):
+            _require_positive_int(name, getattr(self, name))
+        if _LOWER_HEX_32_RE.fullmatch(self.dispatch_nonce) is None:
+            raise ValueError("invalid dispatch nonce")
+        if _UNIT_RE.fullmatch(self.unit_name) is None:
+            raise ValueError("invalid containment unit")
+        if _LOWER_HEX_32_RE.fullmatch(self.release_nonce) is None:
+            raise ValueError("invalid release nonce")
+
+    @property
+    def scope_name(self) -> str:
+        return f"{self.unit_name}.scope"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "ContainmentReservation":
+        if type(raw) is not dict or set(raw) != set(cls.__dataclass_fields__):
+            raise ValueError("invalid containment reservation fields")
+        return cls(**raw)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProcessReceipt:
+    """Measured M4A evidence captured while hostile code is still gated."""
+
+    schema: str
+    reservation: ContainmentReservation
+    process_identity: ProcessIdentity
+    cgroup_path: str
+    child_cgroup: str
+    namespace_ids: tuple[tuple[str, int], ...]
+    policy_digest: str
+    workspace_destination: str
+    workspace_device: int
+    workspace_inode: int
+    workspace_file_type: int
+    executable: str
+    argv: tuple[str, ...]
+    prepared_at: str
+
+    def __post_init__(self) -> None:
+        if self.schema != PREPARED_PROCESS_RECEIPT_SCHEMA:
+            raise ValueError("invalid prepared receipt schema")
+        if not isinstance(self.reservation, ContainmentReservation):
+            raise ValueError("invalid containment reservation")
+        identity = self.process_identity
+        if not isinstance(identity, ProcessIdentity):
+            raise ValueError("invalid process identity")
+        _require_positive_int("pid", identity.pid)
+        _require_positive_int("process_group_id", identity.process_group_id)
+        _require_positive_int("start_time_ticks", identity.start_time_ticks)
+        if type(identity.boot_id) is not str or not identity.boot_id:
+            raise ValueError("boot id is required")
+        expected_suffix = "/" + self.reservation.scope_name
+        if (
+            type(self.cgroup_path) is not str
+            or not self.cgroup_path.startswith("/sys/fs/cgroup/")
+            or not self.cgroup_path.endswith(expected_suffix)
+        ):
+            raise ValueError("receipt cgroup does not match reservation")
+        if (
+            type(self.child_cgroup) is not str
+            or not self.child_cgroup.startswith("/")
+            or not self.child_cgroup.endswith(expected_suffix)
+        ):
+            raise ValueError("child cgroup does not match reservation")
+        if type(self.namespace_ids) is not tuple:
+            raise ValueError("invalid namespace evidence")
+        namespace_names = [item[0] for item in self.namespace_ids]
+        if (
+            any(
+                type(item) is not tuple
+                or len(item) != 2
+                or type(item[0]) is not str
+                or type(item[1]) is not int
+                or item[1] < 1
+                for item in self.namespace_ids
+            )
+            or namespace_names != sorted(namespace_names)
+            or set(namespace_names) != _NAMESPACE_NAMES
+        ):
+            raise ValueError("invalid namespace evidence")
+        if _LOWER_HEX_64_RE.fullmatch(self.policy_digest) is None:
+            raise ValueError("invalid policy digest")
+        if self.workspace_destination != "/workspace":
+            raise ValueError("invalid workspace destination")
+        for name in ("workspace_device", "workspace_inode", "workspace_file_type"):
+            _require_positive_int(name, getattr(self, name))
+        if (
+            type(self.argv) is not tuple
+            or not self.argv
+            or any(type(item) is not str or not item for item in self.argv)
+            or type(self.executable) is not str
+            or not self.executable.startswith("/")
+            or self.argv[0] != self.executable
+        ):
+            raise ValueError("invalid prepared executable or argv")
+        try:
+            datetime.fromisoformat(self.prepared_at)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid prepared timestamp") from exc
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "reservation": self.reservation.to_dict(),
+            "process_identity": self.process_identity.to_dict(),
+            "cgroup_path": self.cgroup_path,
+            "child_cgroup": self.child_cgroup,
+            "namespace_ids": [[name, value] for name, value in self.namespace_ids],
+            "policy_digest": self.policy_digest,
+            "workspace_destination": self.workspace_destination,
+            "workspace_device": self.workspace_device,
+            "workspace_inode": self.workspace_inode,
+            "workspace_file_type": self.workspace_file_type,
+            "executable": self.executable,
+            "argv": list(self.argv),
+            "prepared_at": self.prepared_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "PreparedProcessReceipt":
+        if type(raw) is not dict or set(raw) != set(cls.__dataclass_fields__):
+            raise ValueError("invalid prepared receipt fields")
+        return cls(
+            **{
+                **raw,
+                "reservation": ContainmentReservation.from_dict(raw["reservation"]),
+                "process_identity": ProcessIdentity.from_dict(raw["process_identity"]),
+                "namespace_ids": tuple(
+                    tuple(item) for item in raw["namespace_ids"]
+                ),
+                "argv": tuple(raw["argv"]),
+            }
+        )
+
 
 @dataclass
 class ProcessResult:
@@ -174,9 +380,18 @@ class ProcessResult:
     containment_unit: Optional[str] = None
     containment_cgroup: Optional[str] = None
     containment_state: Optional[str] = None
+    output_limit_exceeded: bool = False
+    _stdout_bytes: bytes = field(default=b"", repr=False, compare=False)
+
+    @property
+    def stdout_bytes(self) -> bytes:
+        """Exact captured bytes for strict protocol validation."""
+        return self._stdout_bytes
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        value.pop("_stdout_bytes", None)
+        return value
 
 
 @dataclass

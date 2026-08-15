@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 from dataclasses import dataclass, replace
 from enum import Enum
 
-from .canonical import canonical_json_line
+from .canonical import CanonicalDataError, canonical_json_line, load_canonical_json
 from .proposals import (
     PLANNER_SCHEMA,
     REVIEW_SCHEMA,
@@ -52,6 +53,13 @@ class SyntheticScenario(str, Enum):
     WRONG_NONCE = "WRONG_NONCE"
     STALE_ATTEMPT = "STALE_ATTEMPT"
     INCOMPLETE_STREAM = "INCOMPLETE_STREAM"
+    SUCCESSFUL_EDIT = "SUCCESSFUL_EDIT"
+    INVALID_PATH_ATTEMPT = "INVALID_PATH_ATTEMPT"
+    DOT_GIT_ATTEMPT = "DOT_GIT_ATTEMPT"
+    CRASH_AFTER_EDIT = "CRASH_AFTER_EDIT"
+    TIMEOUT_AFTER_EDIT = "TIMEOUT_AFTER_EDIT"
+    CHILD_PROCESS_CASE = "CHILD_PROCESS_CASE"
+    POST_TERMINAL_MUTATION_ATTEMPT = "POST_TERMINAL_MUTATION_ATTEMPT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +79,63 @@ class SyntheticOutcome:
     accepted: bool
     rejection_code: str | None
     result: AgentResult | None
+
+
+WORKSPACE_SCENARIOS = frozenset(
+    {
+        SyntheticScenario.SUCCESSFUL_EDIT,
+        SyntheticScenario.NO_OP,
+        SyntheticScenario.INVALID_PATH_ATTEMPT,
+        SyntheticScenario.DOT_GIT_ATTEMPT,
+        SyntheticScenario.CRASH_AFTER_EDIT,
+        SyntheticScenario.TIMEOUT_AFTER_EDIT,
+        SyntheticScenario.CHILD_PROCESS_CASE,
+        SyntheticScenario.POST_TERMINAL_MUTATION_ATTEMPT,
+    }
+)
+
+
+def build_synthetic_workspace_argv(
+    request: AgentTaskRequest, scenario: SyntheticScenario
+) -> list[str]:
+    """Build the fixed in-sandbox argv without exposing a host locator."""
+    if not isinstance(request, AgentTaskRequest) or scenario not in WORKSPACE_SCENARIOS:
+        raise ValueError("strict Slice C request and scenario are required")
+    encoded = base64.urlsafe_b64encode(canonical_json_line(request.to_dict())[:-1]).decode("ascii")
+    return [
+        "/usr/bin/python3",
+        "/opt/agenticos/worker.py",
+        "--scenario",
+        scenario.value,
+        "--request-base64",
+        encoded,
+    ]
+
+
+def validate_synthetic_process_output(
+    request: AgentTaskRequest, raw: bytes
+) -> SyntheticOutcome:
+    """Validate exact worker bytes; decoded replacement text is never authority."""
+    if not isinstance(request, AgentTaskRequest) or type(raw) is not bytes:
+        raise TypeError("strict request and raw bytes are required")
+    validator = AgentStreamValidator(request)
+    try:
+        lines = raw.splitlines(keepends=True)
+        if len(lines) < 2 or any(not line.endswith(b"\n") for line in lines):
+            raise ProtocolRejection("MISSING_RESULT")
+        for line in lines[:-1]:
+            validator.accept(line)
+        result_raw = lines[-1]
+        value = load_canonical_json(
+            result_raw[:-1], max_bytes=request.limits.max_output_bytes
+        )
+        if canonical_json_line(value, max_bytes=request.limits.max_output_bytes) != result_raw:
+            raise ProtocolRejection("NONCANONICAL_RESULT")
+        result = AgentResult.from_dict(value)
+        return SyntheticOutcome(True, None, validator.accept_result(result))
+    except (CanonicalDataError, ProtocolRejection, TypeError, ValueError) as exc:
+        code = exc.code if isinstance(exc, ProtocolRejection) else "MALFORMED_RESULT"
+        return SyntheticOutcome(False, code, None)
 
 
 def _event(request: AgentTaskRequest, sequence: int, kind: EventKind, text: str = "", refs: tuple[EvidenceRef, ...] = ()) -> AgentEvent:

@@ -74,6 +74,19 @@ class ContainmentState(str, Enum):
     FAILED = "FAILED"
 
 
+class ScopeEvidenceState(str, Enum):
+    PRESENT = "PRESENT"
+    ABSENT = "ABSENT"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeEvidence:
+    state: ScopeEvidenceState
+    cgroup_path: Path | None
+    detail: str
+
+
 @dataclass
 class CancellationConfig:
     """Bounded escalation timing. Test-friendly defaults; configure for
@@ -230,6 +243,69 @@ class SystemdScopeBackend:
         if proc.returncode != 0 or not rel or rel == "/":
             return None
         return self.cgroup_root / rel.lstrip("/")
+
+    def scope_evidence(self, unit: str) -> ScopeEvidence:
+        """Return typed unit evidence; lookup errors are never absence proof."""
+        try:
+            proc = self._ctl(
+                [
+                    "show",
+                    unit,
+                    "-p",
+                    "LoadState",
+                    "-p",
+                    "ActiveState",
+                    "-p",
+                    "ControlGroup",
+                ]
+            )
+        except (OSError, subprocess.SubprocessError, ContainmentUnavailableError) as exc:
+            return ScopeEvidence(
+                ScopeEvidenceState.UNKNOWN,
+                None,
+                f"scope lookup failed: {type(exc).__name__}",
+            )
+        if proc.returncode != 0:
+            return ScopeEvidence(
+                ScopeEvidenceState.UNKNOWN,
+                None,
+                f"scope lookup exit {proc.returncode}",
+            )
+        properties: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            if "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name in properties:
+                return ScopeEvidence(
+                    ScopeEvidenceState.UNKNOWN,
+                    None,
+                    "duplicate scope property",
+                )
+            properties[name] = value
+        if set(properties) != {"LoadState", "ActiveState", "ControlGroup"}:
+            return ScopeEvidence(
+                ScopeEvidenceState.UNKNOWN,
+                None,
+                "incomplete scope properties",
+            )
+        load_state = properties["LoadState"]
+        control_group = properties["ControlGroup"]
+        if load_state == "not-found" and control_group in {"", "/"}:
+            return ScopeEvidence(
+                ScopeEvidenceState.ABSENT, None, "unit positively not found"
+            )
+        if load_state != "not-found" and control_group not in {"", "/"}:
+            return ScopeEvidence(
+                ScopeEvidenceState.PRESENT,
+                self.cgroup_root / control_group.lstrip("/"),
+                "unit and control group observed",
+            )
+        return ScopeEvidence(
+            ScopeEvidenceState.UNKNOWN,
+            None,
+            "contradictory scope properties",
+        )
 
     def signal_unit(self, unit: str, sig: str) -> None:
         self._ctl(["kill", f"--signal={sig}", unit])

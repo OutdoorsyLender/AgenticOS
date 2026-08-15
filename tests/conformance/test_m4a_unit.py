@@ -544,6 +544,44 @@ def test_cgroup_populated_accepts_enodev_only_after_evidence_object_is_gone(
         backend.cgroup_populated(cgroup)
 
 
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "state", "has_path"),
+    [
+        (
+            0,
+            "LoadState=loaded\nActiveState=active\nControlGroup=/user.slice/task.scope\n",
+            "PRESENT",
+            True,
+        ),
+        (
+            0,
+            "LoadState=not-found\nActiveState=inactive\nControlGroup=\n",
+            "ABSENT",
+            False,
+        ),
+        (1, "", "UNKNOWN", False),
+        (0, "LoadState=loaded\nActiveState=active\n", "UNKNOWN", False),
+    ],
+)
+def test_scope_evidence_distinguishes_present_absent_and_unknown(
+    tmp_path, monkeypatch, returncode, stdout, state, has_path
+):
+    from agenticos.sandbox.containment import SystemdScopeBackend
+
+    backend = object.__new__(SystemdScopeBackend)
+    backend.cgroup_root = tmp_path
+    monkeypatch.setattr(
+        backend,
+        "_ctl",
+        lambda _args: SimpleNamespace(returncode=returncode, stdout=stdout),
+    )
+
+    evidence = backend.scope_evidence("task.scope")
+
+    assert evidence.state.value == state
+    assert (evidence.cgroup_path is not None) is has_path
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux openat2")
 def test_verified_bubblewrap_reopen_rejects_identity_or_content_change(tmp_path):
     from dataclasses import replace

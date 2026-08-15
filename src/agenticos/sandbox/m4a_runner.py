@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import select
+import selectors
 import subprocess
 import time
 import uuid
@@ -36,7 +37,15 @@ from .launcher import (
     parse_launcher_status,
     prepare_launch_request,
 )
-from .models import ProcessIdentity, ProcessResult, utc_now_iso
+from .models import (
+    CONTAINMENT_RESERVATION_SCHEMA,
+    PREPARED_PROCESS_RECEIPT_SCHEMA,
+    ContainmentReservation,
+    PreparedProcessReceipt,
+    ProcessIdentity,
+    ProcessResult,
+    utc_now_iso,
+)
 from .runtime_boundary import (
     AuthorizedSource,
     M4AProfile,
@@ -61,6 +70,357 @@ EV_LAUNCHER_ENTERED = "TRUSTED_LAUNCHER_ENTERED"
 EV_IDENTITIES_VERIFIED = "SANDBOX_IDENTITIES_VERIFIED"
 EV_RUNTIME_FAILURE = "RUNTIME_BOUNDARY_FAILED"
 EV_RUNTIME_VERIFIED = "RUNTIME_BOUNDARY_VERIFIED"
+
+
+class PreparedM4AExecution:
+    """Single-owner M4A process held after policy proof and before worker exec."""
+
+    def __init__(
+        self,
+        *,
+        runner: "NamespaceLandlockRunner",
+        proc: subprocess.Popen,
+        worker_argv: list[str],
+        started_at: str,
+        process_identity: ProcessIdentity,
+        scope: str,
+        cgroup_path: Path,
+        control_fd: int,
+        native_status_fd: int,
+        json_status_fd: int,
+        launch_request: object,
+        launch_transcript: bytes,
+        launch_outcome: dict,
+        plan: object,
+        workspace_mount: object,
+        namespace_evidence: NamespaceEvidence,
+        receipt: PreparedProcessReceipt,
+        marker_instrumented: bool,
+    ) -> None:
+        self._runner = runner
+        self._proc = proc
+        self._worker_argv = worker_argv
+        self._started_at = started_at
+        self._process_identity = process_identity
+        self._scope = scope
+        self._cgroup_path = cgroup_path
+        self._control_fd = control_fd
+        self._native_status_fd = native_status_fd
+        self._json_status_fd = json_status_fd
+        self._launch_request = launch_request
+        self._launch_transcript = launch_transcript
+        self._launch_outcome = launch_outcome
+        self._plan = plan
+        self._workspace_mount = workspace_mount
+        self._namespace_evidence = namespace_evidence
+        self.receipt = receipt
+        self._marker_instrumented = marker_instrumented
+        self._released = False
+        self._terminal = False
+        self._cancellation_requested = False
+        self._cleanup_proven = False
+        self._result: Optional[ProcessResult] = None
+
+    @property
+    def terminal(self) -> bool:
+        return self._terminal
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    @property
+    def cleanup_proven(self) -> bool:
+        return self._cleanup_proven
+
+    def __enter__(self) -> "PreparedM4AExecution":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if not self._terminal:
+            self.cancel()
+
+    def _close_status_fds(self) -> None:
+        for name in ("_native_status_fd", "_json_status_fd"):
+            fd = getattr(self, name)
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, name, -1)
+
+    def _close_native_status_fd(self) -> None:
+        if self._native_status_fd >= 0:
+            try:
+                os.close(self._native_status_fd)
+            except OSError:
+                pass
+            self._native_status_fd = -1
+
+    def _cleanup_after_error(self, cause: BaseException) -> None:
+        self._cleanup_proven = False
+        try:
+            self._runner._cleanup_failed_process(
+                self._scope, self._cgroup_path, self._proc, cause
+            )
+            self._cleanup_proven = True
+        finally:
+            self._close_status_fds()
+            self._terminal = True
+
+    def release(
+        self,
+        expected_receipt: PreparedProcessReceipt,
+        release_nonce: str,
+    ) -> None:
+        if self._terminal or self._released:
+            raise ContainmentUnavailableError("prepared execution already released or terminal")
+        if expected_receipt != self.receipt:
+            raise ContainmentUnavailableError("prepared receipt mismatch")
+        if release_nonce != self.receipt.reservation.release_nonce:
+            raise ContainmentUnavailableError("prepared release nonce mismatch")
+        try:
+            self._runner._write_all(
+                self._control_fd, b"X", budget=self._runner.setup_timeout
+            )
+            assert self._proc.stdin is not None
+            self._proc.stdin.close()
+            trailing, status_eof = NativeLandlockRunner._read_post_release_status(
+                self._native_status_fd, budget=self._runner.setup_timeout
+            )
+            if not status_eof:
+                raise ContainmentUnavailableError(
+                    "native status channel did not close on worker exec"
+                )
+            prepared = self._launch_request
+            outcome = parse_launcher_status(
+                self._launch_transcript + trailing,
+                expected_nonce=prepared.nonce,
+                expected_policy_digest=prepared.policy_digest,
+                expected_min_abi=3,
+                protocol_version=2,
+            )
+            self._launch_outcome = outcome
+            self._runner.last_launch_outcome = outcome
+            if outcome.get("failed_stage") is not None:
+                raise ContainmentUnavailableError(
+                    f"M4A launcher failed at {outcome['failed_stage']}"
+                )
+            outcome["exec_succeeded"] = True
+            self._runner._emit(EV_EXEC_ATTEMPTED, unit=self._scope)
+            self._released = True
+            # Bubblewrap may continue writing lifecycle JSON until process exit.
+            # Keep that read end open so the contained process cannot receive
+            # SIGPIPE merely because the native launch channel reached EOF.
+            self._close_native_status_fd()
+        except BaseException as exc:
+            self._runner.last_launch_outcome = self._launch_outcome
+            self._runner._emit(
+                EV_RUNTIME_FAILURE,
+                unit=self._scope,
+                stage="exec_release",
+                error_type=type(exc).__name__,
+            )
+            self._cleanup_after_error(exc)
+            raise
+
+    def _complete(
+        self,
+        out_b: bytes,
+        err_b: bytes,
+        *,
+        timed_out: bool,
+        containment_state: str,
+        output_limit_exceeded: bool = False,
+    ) -> ProcessResult:
+        if not wait_cgroup_empty(
+            self._runner.backend,
+            self._cgroup_path,
+            0.2,
+            self._runner.cancellation.poll_interval,
+        ):
+            containment_state = self._runner._cancel(
+                self._scope, self._cgroup_path, self._proc
+            ).value
+        else:
+            if containment_state == ContainmentState.RUNNING.value:
+                containment_state = ContainmentState.TERMINATED.value
+            self._runner._emit(
+                EV_CGROUP_EMPTY_VERIFIED, unit=self._scope, after="clean exit"
+            )
+        self._runner.backend.stop_unit(self._scope)
+        if self._runner.backend.unit_active(self._scope):
+            containment_state = ContainmentState.FAILED.value
+        if containment_state != ContainmentState.TERMINATED.value:
+            raise ContainmentUnavailableError(
+                "M4A task cleanup did not reach proven TERMINATED state"
+            )
+
+        plan = self._plan
+        workspace_mount = self._workspace_mount
+        evidence = self._namespace_evidence
+        outcome = self._launch_outcome
+        self._runner._emit(
+            EV_RUNTIME_VERIFIED,
+            profile=plan.profile.value,
+            workspace_destination="/workspace",
+            workspace_identity={
+                "device": workspace_mount.source.identity.device,
+                "inode": workspace_mount.source.identity.inode,
+                "file_type": workspace_mount.source.identity.file_type,
+            },
+            worker_cwd=plan.cwd,
+            environment_names=[name for name, _ in plan.worker_environment],
+            filesystem_view_digest=plan.filesystem_view_digest,
+            environment_policy_digest=plan.environment_policy_digest,
+            combined_policy_digest=plan.combined_policy_digest,
+            network_policy=plan.network_policy,
+            namespace_identities=dict(evidence.child.identities),
+            child_cgroup=evidence.child.cgroup,
+            gate_ordering=dict(self._runner.last_ordering_observations),
+            worker_marker_instrumented=self._marker_instrumented,
+            landlock_abi=outcome.get("abi"),
+            handled_access_fs=outcome.get("handled_access_fs"),
+            identity_verified=outcome.get("identity_verified"),
+            policy_applied=outcome.get("policy_applied"),
+            exec_succeeded=outcome.get("exec_succeeded"),
+            containment_state=containment_state,
+            output_limit_exceeded=output_limit_exceeded,
+            cleanup="recursive_cgroup_empty",
+        )
+        self._runner._emit(
+            EV_TASK_EXITED, unit=self._scope, containment_state=containment_state
+        )
+        result = self._runner._assemble_process_result(
+            proc=self._proc,
+            worker_argv=self._worker_argv,
+            out_b=out_b,
+            err_b=err_b,
+            timed_out=timed_out,
+            started_at=self._started_at,
+            finished_at=utc_now_iso(),
+            identity=self._process_identity,
+            scope=self._scope,
+            cgroup_path=self._cgroup_path,
+            containment_state=containment_state,
+            output_limit_exceeded=output_limit_exceeded,
+        )
+        self._result = result
+        self._terminal = True
+        self._close_status_fds()
+        return result
+
+    def wait(
+        self,
+        timeout: Optional[float] = None,
+        *,
+        max_output_bytes: int = 16 * 1024 * 1024,
+        cancellation_observer=None,
+    ) -> ProcessResult:
+        if self._terminal:
+            if self._result is None:
+                raise ContainmentUnavailableError("prepared execution is terminal")
+            return self._result
+        if not self._released:
+            raise ContainmentUnavailableError("prepared execution has not been released")
+        timeout = self._runner.default_timeout if timeout is None else float(timeout)
+        timed_out = False
+        output_limit_exceeded = False
+        containment_state = ContainmentState.RUNNING.value
+        try:
+            try:
+                out_b, err_b, output_limit_exceeded = (
+                    self._runner._communicate_process_bounded(
+                        self._proc, timeout, max_output_bytes
+                    )
+                )
+                if output_limit_exceeded:
+                    if cancellation_observer is not None:
+                        cancellation_observer()
+                    cancellation_state = self._runner._cancel(
+                        self._scope, self._cgroup_path, self._proc
+                    )
+                    if cancellation_state is not ContainmentState.TERMINATED:
+                        raise ContainmentUnavailableError(
+                            "output-limited M4A task cleanup was not proven"
+                        )
+                    containment_state = cancellation_state.value
+                    self._runner._communicate_process(
+                        self._proc, self._runner.setup_timeout
+                    )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                cancellation_state = self._runner._cancel(
+                    self._scope, self._cgroup_path, self._proc
+                )
+                if cancellation_state is not ContainmentState.TERMINATED:
+                    raise ContainmentUnavailableError(
+                        "timed-out M4A task cleanup was not proven"
+                    )
+                containment_state = cancellation_state.value
+                out_b, err_b = self._runner._communicate_process(
+                    self._proc, self._runner.setup_timeout
+                )
+            return self._complete(
+                out_b,
+                err_b,
+                timed_out=timed_out,
+                containment_state=containment_state,
+                output_limit_exceeded=output_limit_exceeded,
+            )
+        except BaseException as exc:
+            self._runner._emit(
+                EV_RUNTIME_FAILURE,
+                unit=self._scope,
+                stage="host_lifecycle",
+                error_type=type(exc).__name__,
+            )
+            self._cleanup_after_error(exc)
+            raise
+
+    def cancel(self) -> ProcessResult:
+        if self._terminal:
+            if self._result is None:
+                raise ContainmentUnavailableError("prepared execution is terminal")
+            return self._result
+        try:
+            if self._proc.stdin is not None and not self._proc.stdin.closed:
+                self._proc.stdin.close()
+            state = self._runner._cancel(
+                self._scope, self._cgroup_path, self._proc
+            )
+            if state is not ContainmentState.TERMINATED:
+                raise ContainmentUnavailableError(
+                    "cancelled M4A task cleanup was not proven"
+                )
+            out_b, err_b = self._runner._communicate_process(
+                self._proc, self._runner.setup_timeout
+            )
+            return self._complete(
+                out_b,
+                err_b,
+                timed_out=False,
+                containment_state=state.value,
+            )
+        except BaseException as exc:
+            self._cleanup_after_error(exc)
+            raise
+
+    def request_cancel(self) -> None:
+        """Recursively signal/drain now; the owning wait path performs final reap."""
+        if self._terminal or self._cancellation_requested:
+            return
+        if self._proc.stdin is not None and not self._proc.stdin.closed:
+            self._proc.stdin.close()
+        state = self._runner._cancel(
+            self._scope, self._cgroup_path, self._proc
+        )
+        if state is not ContainmentState.TERMINATED:
+            raise ContainmentUnavailableError(
+                "requested M4A cancellation did not drain containment"
+            )
+        self._cancellation_requested = True
 
 
 class NamespaceLandlockRunner(CgroupProcessRunner):
@@ -233,6 +593,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
         scope: str,
         cgroup_path: Optional[Path],
         containment_state: str,
+        output_limit_exceeded: bool = False,
     ) -> ProcessResult:
         rc = proc.returncode
         return ProcessResult(
@@ -250,6 +611,8 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             containment_unit=scope,
             containment_cgroup=str(cgroup_path) if cgroup_path else None,
             containment_state=containment_state,
+            output_limit_exceeded=output_limit_exceeded,
+            _stdout_bytes=out_b or b"",
         )
 
     @staticmethod
@@ -268,6 +631,66 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
         proc: subprocess.Popen, timeout: Optional[float]
     ) -> tuple[bytes, bytes]:
         return proc.communicate(timeout=timeout)
+
+    @staticmethod
+    def _communicate_process_bounded(
+        proc: subprocess.Popen,
+        timeout: Optional[float],
+        max_output_bytes: int,
+    ) -> tuple[bytes, bytes, bool]:
+        """Drain both hostile streams incrementally under one aggregate bound."""
+        if type(max_output_bytes) is not int or max_output_bytes < 1:
+            raise ValueError("max_output_bytes must be positive")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        captured = {"stdout": bytearray(), "stderr": bytearray()}
+        selector = selectors.DefaultSelector()
+        streams = (("stdout", proc.stdout), ("stderr", proc.stderr))
+        for name, stream in streams:
+            if stream is not None:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+        overflow = False
+        try:
+            while selector.get_map():
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise subprocess.TimeoutExpired(
+                        proc.args,
+                        timeout,
+                        output=bytes(captured["stdout"]),
+                        stderr=bytes(captured["stderr"]),
+                    )
+                events = selector.select(remaining)
+                if not events:
+                    continue
+                for key, _mask in events:
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total = len(captured["stdout"]) + len(captured["stderr"])
+                    available = max_output_bytes - total
+                    captured[key.data].extend(chunk[:available])
+                    if len(chunk) > available:
+                        overflow = True
+                        return (
+                            bytes(captured["stdout"]),
+                            bytes(captured["stderr"]),
+                            True,
+                        )
+            proc.wait(timeout=0)
+            return bytes(captured["stdout"]), bytes(captured["stderr"]), overflow
+        finally:
+            selector.close()
+            for _name, stream in streams:
+                if stream is not None and not stream.closed:
+                    try:
+                        os.set_blocking(stream.fileno(), True)
+                    except OSError:
+                        pass
 
     @staticmethod
     def _write_all(fd: int, payload: bytes, *, budget: float) -> None:
@@ -354,24 +777,25 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 network_policy="DENY",
             )
 
-    def run(
+    def prepare(
         self,
         argv: Sequence[str],
         *,
         cwd: str | os.PathLike[str],
         env: Mapping[str, str],
-        timeout: Optional[float] = None,
+        reservation: ContainmentReservation,
         _leak_fds: Sequence[int] = (),
         _marker_path: Optional[Path] = None,
-    ) -> ProcessResult:
+    ) -> PreparedM4AExecution:
         if str(cwd) != "/workspace":
             raise ValueError("M4A worker cwd must be the stable /workspace ABI")
+        if not isinstance(reservation, ContainmentReservation):
+            raise TypeError("reservation must be a ContainmentReservation")
         support = self.check_support()
         if not support.supported:
             raise ContainmentUnavailableError(
                 "M4A runtime boundary unavailable: " + "; ".join(support.reasons)
             )
-        timeout = self.default_timeout if timeout is None else float(timeout)
         if self._bwrap_capability is None:
             raise ContainmentUnavailableError("Bubblewrap capability evidence is missing")
         worker_argv = [str(item) for item in argv]
@@ -448,8 +872,8 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                     except OSError:
                         pass
             raise
-        unit = f"aos-task-{uuid.uuid4().hex[:12]}"
-        scope = f"{unit}.scope"
+        unit = reservation.unit_name
+        scope = reservation.scope_name
         pass_fds = tuple(
             [bwrap_fd, *[source.fd for source in sources]]
             + [namespace_gate_r, json_status_w, native_status_w]
@@ -468,7 +892,7 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             "policy_applied": False,
             "exec_succeeded": False,
         }
-        launch_ready = False
+        handle_ready = False
         try:
             command = [
                 self.backend.systemd_run,
@@ -612,30 +1036,45 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
                 raise ContainmentUnavailableError(
                     "worker entered before authenticated exec release"
                 )
-            self._write_all(control_fd, b"X", budget=self.setup_timeout)
-            proc.stdin.close()
-            trailing, status_eof = NativeLandlockRunner._read_post_release_status(
-                native_status_r, budget=self.setup_timeout
+            worker_identity = ProcessIdentity.from_pid(evidence.child.pid)
+            receipt = PreparedProcessReceipt(
+                schema=PREPARED_PROCESS_RECEIPT_SCHEMA,
+                reservation=reservation,
+                process_identity=worker_identity,
+                cgroup_path=str(cgroup_path),
+                child_cgroup=evidence.child.cgroup,
+                namespace_ids=tuple(sorted(evidence.child.identities.items())),
+                policy_digest=prepared.policy_digest,
+                workspace_destination="/workspace",
+                workspace_device=workspace_mount.source.identity.device,
+                workspace_inode=workspace_mount.source.identity.inode,
+                workspace_file_type=workspace_mount.source.identity.file_type,
+                executable=worker_argv[0],
+                argv=tuple(worker_argv),
+                prepared_at=utc_now_iso(),
             )
-            if not status_eof:
-                raise ContainmentUnavailableError(
-                    "native status channel did not close on worker exec"
-                )
-            outcome = parse_launcher_status(
-                transcript + trailing,
-                expected_nonce=prepared.nonce,
-                expected_policy_digest=prepared.policy_digest,
-                expected_min_abi=3,
-                protocol_version=2,
+            handle = PreparedM4AExecution(
+                runner=self,
+                proc=proc,
+                worker_argv=worker_argv,
+                started_at=started_at,
+                process_identity=identity,
+                scope=scope,
+                cgroup_path=cgroup_path,
+                control_fd=control_fd,
+                native_status_fd=native_status_r,
+                json_status_fd=json_status_r,
+                launch_request=prepared,
+                launch_transcript=transcript,
+                launch_outcome=outcome,
+                plan=plan,
+                workspace_mount=workspace_mount,
+                namespace_evidence=evidence,
+                receipt=receipt,
+                marker_instrumented=_marker_path is not None,
             )
-            if outcome.get("failed_stage") is not None:
-                raise ContainmentUnavailableError(
-                    f"M4A launcher failed at {outcome['failed_stage']}"
-                )
-            outcome["exec_succeeded"] = True
-            self.last_launch_outcome = outcome
-            self._emit(EV_EXEC_ATTEMPTED, unit=scope)
-            launch_ready = True
+            handle_ready = True
+            return handle
         except BaseException as launch_error:
             self.last_launch_outcome = outcome
             self._emit(
@@ -668,107 +1107,49 @@ class NamespaceLandlockRunner(CgroupProcessRunner):
             if namespace_gate_w >= 0:
                 os.close(namespace_gate_w)
 
-            if not launch_ready:
+            if not handle_ready:
                 for fd in (native_status_r, json_status_r):
                     try:
                         os.close(fd)
                     except OSError:
                         pass
 
-        assert proc is not None
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str | os.PathLike[str],
+        env: Mapping[str, str],
+        timeout: Optional[float] = None,
+        _leak_fds: Sequence[int] = (),
+        _marker_path: Optional[Path] = None,
+    ) -> ProcessResult:
+        """Compatibility one-shot composed from the split-phase contract."""
+        token = uuid.uuid4().hex
+        reservation = ContainmentReservation(
+            schema=CONTAINMENT_RESERVATION_SCHEMA,
+            project_id="one-shot",
+            task_id="one-shot",
+            task_generation=1,
+            attempt=1,
+            controller_epoch=1,
+            lease_epoch=1,
+            dispatch_nonce=token,
+            unit_name=f"aos-task-{token[:24]}",
+            release_nonce=uuid.uuid4().hex,
+        )
+        prepared = self.prepare(
+            argv,
+            cwd=cwd,
+            env=env,
+            reservation=reservation,
+            _leak_fds=_leak_fds,
+            _marker_path=_marker_path,
+        )
         try:
-            os.close(native_status_r)
-            native_status_r = -1
-            timed_out = False
-            containment_state = ContainmentState.RUNNING.value
-            try:
-                out_b, err_b = self._communicate_process(proc, timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                cancellation_state = self._cancel(scope, cgroup_path, proc)
-                if cancellation_state is not ContainmentState.TERMINATED:
-                    raise ContainmentUnavailableError(
-                        "timed-out M4A task cleanup was not proven"
-                    )
-                containment_state = cancellation_state.value
-                out_b, err_b = self._communicate_process(proc, self.setup_timeout)
-
-            if cgroup_path is not None and not wait_cgroup_empty(
-                self.backend,
-                cgroup_path,
-                0.2,
-                self.cancellation.poll_interval,
-            ):
-                containment_state = self._cancel(scope, cgroup_path, proc).value
-            elif cgroup_path is not None:
-                if containment_state == ContainmentState.RUNNING.value:
-                    containment_state = ContainmentState.TERMINATED.value
-                self._emit(EV_CGROUP_EMPTY_VERIFIED, unit=scope, after="clean exit")
-            else:
-                containment_state = ContainmentState.FAILED.value
-            self.backend.stop_unit(scope)
-            if self.backend.unit_active(scope):
-                containment_state = ContainmentState.FAILED.value
-            if containment_state != ContainmentState.TERMINATED.value:
-                raise ContainmentUnavailableError(
-                    "M4A task cleanup did not reach proven TERMINATED state"
-                )
-            self._emit(
-                EV_RUNTIME_VERIFIED,
-                profile=plan.profile.value,
-                workspace_destination="/workspace",
-                workspace_identity={
-                    "device": workspace_mount.source.identity.device,
-                    "inode": workspace_mount.source.identity.inode,
-                    "file_type": workspace_mount.source.identity.file_type,
-                },
-                worker_cwd=plan.cwd,
-                environment_names=[name for name, _ in plan.worker_environment],
-                filesystem_view_digest=plan.filesystem_view_digest,
-                environment_policy_digest=plan.environment_policy_digest,
-                combined_policy_digest=plan.combined_policy_digest,
-                network_policy=plan.network_policy,
-                namespace_identities=dict(evidence.child.identities),
-                child_cgroup=evidence.child.cgroup,
-                gate_ordering=dict(self.last_ordering_observations),
-                worker_marker_instrumented=_marker_path is not None,
-                landlock_abi=outcome.get("abi"),
-                handled_access_fs=outcome.get("handled_access_fs"),
-                identity_verified=outcome.get("identity_verified"),
-                policy_applied=outcome.get("policy_applied"),
-                exec_succeeded=outcome.get("exec_succeeded"),
-                containment_state=containment_state,
-                cleanup="recursive_cgroup_empty",
-            )
-            self._emit(EV_TASK_EXITED, unit=scope, containment_state=containment_state)
-
-            finished_at = utc_now_iso()
-            return self._assemble_process_result(
-                proc=proc,
-                worker_argv=worker_argv,
-                out_b=out_b,
-                err_b=err_b,
-                timed_out=timed_out,
-                started_at=started_at,
-                finished_at=finished_at,
-                identity=identity,
-                scope=scope,
-                cgroup_path=cgroup_path,
-                containment_state=containment_state,
-            )
-        except BaseException as runtime_error:
-            self._emit(
-                EV_RUNTIME_FAILURE,
-                unit=scope,
-                stage="host_lifecycle",
-                error_type=type(runtime_error).__name__,
-            )
-            self._cleanup_failed_process(scope, cgroup_path, proc, runtime_error)
+            prepared.release(prepared.receipt, reservation.release_nonce)
+            return prepared.wait(timeout=timeout)
+        except BaseException:
+            if not prepared.terminal:
+                prepared.cancel()
             raise
-        finally:
-            for fd in (native_status_r, json_status_r):
-                if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass

@@ -29,6 +29,10 @@ from agenticos.sandbox.runtime_boundary import (
     secure_open_source,
     build_worker_env,
 )
+from agenticos.sandbox.models import (
+    CONTAINMENT_RESERVATION_SCHEMA,
+    ContainmentReservation,
+)
 from helpers import WORKER_PATH
 
 
@@ -43,6 +47,21 @@ FAST = CancellationConfig(
     empty_verify_timeout=5.0,
     poll_interval=0.05,
 )
+
+
+def _reservation(suffix: str) -> ContainmentReservation:
+    return ContainmentReservation(
+        schema=CONTAINMENT_RESERVATION_SCHEMA,
+        project_id="slice-c-project",
+        task_id="slice-c-build",
+        task_generation=1,
+        attempt=1,
+        controller_epoch=1,
+        lease_epoch=1,
+        dispatch_nonce="1" * 32,
+        unit_name=f"aos-task-slice-c-{suffix}",
+        release_nonce="2" * 32,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -786,4 +805,79 @@ def test_failed_worker_exec_after_authenticated_policy_is_fail_closed(
     assert m4a_runner.last_launch_outcome["failed_stage"] == "exec"
     assert m4a_runner.last_launch_outcome["policy_applied"] is True
     assert m4a_runner.last_launch_outcome["exec_succeeded"] is False
+    _assert_no_task_units(m4a_runner)
+
+
+def test_split_phase_prepare_holds_worker_until_exact_release(m4a_runner, layout):
+    marker = layout.task_tmp / "split-phase-worker-ran"
+    reservation = _reservation(uuid.uuid4().hex[:12])
+
+    prepared = m4a_runner.prepare(
+        [
+            "/usr/bin/python3",
+            "-c",
+            "from pathlib import Path; "
+            "Path('/tmp/split-phase-worker-ran').write_text('released'); "
+            "print('split-ok')",
+        ],
+        cwd="/workspace",
+        env={},
+        reservation=reservation,
+        _marker_path=marker,
+    )
+    try:
+        receipt = prepared.receipt
+        assert not marker.exists()
+        assert receipt.reservation == reservation
+        assert receipt.process_identity.matches_current()
+        assert receipt.cgroup_path.endswith(reservation.scope_name)
+        assert receipt.child_cgroup.endswith(reservation.scope_name)
+        assert receipt.workspace_destination == "/workspace"
+        assert receipt.executable == "/usr/bin/python3"
+
+        with pytest.raises(ContainmentUnavailableError, match="receipt"):
+            prepared.release(
+                receipt.__class__.from_dict(
+                    {**receipt.to_dict(), "policy_digest": "f" * 64}
+                ),
+                reservation.release_nonce,
+            )
+        with pytest.raises(ContainmentUnavailableError, match="nonce"):
+            prepared.release(receipt, "f" * 32)
+
+        prepared.release(receipt, reservation.release_nonce)
+        with pytest.raises(ContainmentUnavailableError, match="already"):
+            prepared.release(receipt, reservation.release_nonce)
+        result = prepared.wait(timeout=5.0)
+    finally:
+        if not prepared.terminal:
+            prepared.cancel()
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "split-ok"
+    assert marker.read_text() == "released"
+    assert result.containment_unit == reservation.scope_name
+    _assert_no_task_units(m4a_runner)
+
+
+def test_split_phase_cancel_before_release_never_enters_worker(m4a_runner, layout):
+    marker = layout.task_tmp / "split-cancel-worker-ran"
+    reservation = _reservation(uuid.uuid4().hex[:12])
+    prepared = m4a_runner.prepare(
+        [
+            "/usr/bin/python3",
+            "-c",
+            "from pathlib import Path; Path('/tmp/split-cancel-worker-ran').touch()",
+        ],
+        cwd="/workspace",
+        env={},
+        reservation=reservation,
+        _marker_path=marker,
+    )
+
+    result = prepared.cancel()
+
+    assert result.containment_state == ContainmentState.TERMINATED.value
+    assert not marker.exists()
+    assert prepared.terminal is True
     _assert_no_task_units(m4a_runner)
