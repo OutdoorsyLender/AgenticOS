@@ -1,0 +1,22 @@
+{
+  "credential_storage_key": "oauth/kimi-code",
+  "future_credential_directory_mode": "0700",
+  "future_credential_file_mode": "0600",
+  "future_credential_final_entries": [
+    "kimi-code.json"
+  ],
+  "future_credential_transient_pattern": "kimi-code.json.tmp.<pid>.<8-lowercase-hex>",
+  "ephemeral_categories": [
+    "CACHE",
+    "LOG",
+    "MUTABLE_NONSECRET_STATE"
+  ],
+  "future_persistent_paths": [
+    "credentials/"
+  ],
+  "real_authentication": "NOT_AUTHENTICATED",
+  "real_provider_execution": "REAL_PROVIDER_DISABLED",
+  "schema": "AOS_KIMI_DATA_ROOT_POLICY/1",
+  "unknown_state_policy": "FAIL_CLOSED",
+  "workspace_authority": "NONE"
+}

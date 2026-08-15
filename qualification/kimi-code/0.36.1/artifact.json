@@ -1,0 +1,30 @@
+{
+  "archive_name": "kimi-code-linux-x64.zip",
+  "archive_sha256": "c5af089d5ad34c27f2f26d5f93588ba3f656bf771911e5d43c85be95d3e1cbd4",
+  "archive_size": 64621491,
+  "archive_url": "https://github.com/MoonshotAI/kimi-code/releases/download/%40moonshot-ai/kimi-code%400.36.1/kimi-code-linux-x64.zip",
+  "checksum_sha256": "428ca7c07c64fa266d86ee372a2689ceeb063ab5724221e8e1e729b1f96748b5",
+  "checksum_url": "https://github.com/MoonshotAI/kimi-code/releases/download/%40moonshot-ai/kimi-code%400.36.1/kimi-code-linux-x64.zip.sha256",
+  "elf_build_id": "5e67bdf95c7646325b62decd0ca8d375d325ea19",
+  "executable_name": "kimi",
+  "executable_sha256": "78c07b255e0bdc8dfe90d0cbd3204a3d862957394a08ca99c6e31144732451c7",
+  "executable_size": 180948160,
+  "manifest_sha256": "b1c89cc44b3e4401125ac86a5ac4c9cc324f856e902c7b859049fc3578c2af66",
+  "manifest_url": "https://github.com/MoonshotAI/kimi-code/releases/download/%40moonshot-ai/kimi-code%400.36.1/manifest.json",
+  "platform": "linux-x64",
+  "release_published_at": "2026-08-14T12:53:36Z",
+  "release_url": "https://github.com/MoonshotAI/kimi-code/releases/tag/%40moonshot-ai%2Fkimi-code%400.36.1",
+  "required_mode": "0555",
+  "runtime_requirements": [
+    "ELF x86-64",
+    "/lib64/ld-linux-x86-64.so.2",
+    "glibc",
+    "libstdc++",
+    "libgcc_s"
+  ],
+  "schema": "AOS_KIMI_PIN/1",
+  "source_commit": "13d86f8b7bb2443a3b8222e7d94deb0a66429f8e",
+  "tag": "@moonshot-ai/kimi-code@0.36.1",
+  "tag_object": "336fed3b5f265c986d4f43808da98f3c6b4bbd16",
+  "version": "0.36.1"
+}
