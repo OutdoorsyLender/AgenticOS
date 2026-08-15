@@ -751,8 +751,8 @@ class SyntheticBuildController:
                 dispatch.checkpoint_digest == lease.pre_checkpoint_digest,
                 getattr(pre_checkpoint, "checkpoint_digest") == dispatch.checkpoint_digest,
                 getattr(pre_checkpoint, "repository_id") == dispatch.repository_id,
-                getattr(pre_checkpoint, "task_id") == dispatch.task_id,
-                getattr(pre_checkpoint, "generation") == dispatch.task_generation,
+                getattr(pre_checkpoint, "task_id") == dispatch.workspace_id,
+                getattr(pre_checkpoint, "generation") == dispatch.workspace_generation,
                 getattr(pre_checkpoint, "baseline_commit_sha") == dispatch.baseline_commit,
                 getattr(pre_checkpoint, "reservation_digest") == dispatch.reservation_id,
                 getattr(pre_checkpoint, "capture_completeness")
@@ -792,7 +792,7 @@ class SyntheticBuildController:
         expected_inode: int | None = None,
     ) -> object:
         capture = workspace_manager.capture_checkpoint(
-            repo_path, dispatch.task_id, dispatch.task_generation
+            repo_path, dispatch.workspace_id, dispatch.workspace_generation
         )
         checkpoint = SyntheticBuildController._checkpoint_from_capture(capture)
         if receipt is not None:
@@ -800,8 +800,8 @@ class SyntheticBuildController:
             expected_inode = receipt.workspace_inode
         checks = (
             checkpoint.repository_id == dispatch.repository_id,
-            checkpoint.task_id == dispatch.task_id,
-            checkpoint.generation == dispatch.task_generation,
+            checkpoint.task_id == dispatch.workspace_id,
+            checkpoint.generation == dispatch.workspace_generation,
             checkpoint.baseline_commit_sha == dispatch.baseline_commit,
             checkpoint.reservation_digest == dispatch.reservation_id,
             checkpoint.worktree_device == expected_device,

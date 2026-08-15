@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agenticos.orchestration.models import WorkspaceIdentityRef
+from agenticos.orchestration.models import TaskStatus, WorkspaceIdentityRef
 from agenticos.sandbox.worktree import (
     WorkspaceCaptureCompleteness,
     WorkspaceReuseDecision,
@@ -353,6 +353,48 @@ def test_admission_issue_rejects_incomplete_or_mismatched_checkpoint() -> None:
         WorkspaceLeaseAdmission.issue(
             board=board, identity=identity, checkpoint_capture=capture
         )
+
+
+def test_repair_lease_binds_checkpoint_to_project_workspace_not_child_task() -> None:
+    identity = replace(_identity(), task_id="repair-c", task_generation=7)
+    task = SimpleNamespace(
+        project_id=identity.project_id,
+        task_id=identity.task_id,
+        generation=identity.task_generation,
+        attempt_count=identity.attempt,
+        lease_epoch=identity.lease_epoch,
+        workspace=identity.workspace,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    project = SimpleNamespace(
+        project_id=identity.project_id,
+        controller_epoch=identity.controller_epoch,
+        lease_epoch=identity.lease_epoch,
+        workspace=identity.workspace,
+        baseline=SimpleNamespace(repository_id="repo-c", commit_sha="b" * 40),
+    )
+    checkpoint = SimpleNamespace(
+        capture_completeness=WorkspaceCaptureCompleteness.COMPLETE,
+        repository_id="repo-c",
+        baseline_commit_sha="b" * 40,
+        task_id=identity.workspace.workspace_id,
+        generation=identity.workspace.generation,
+        reservation_digest=identity.workspace.reservation_id,
+        checkpoint_digest=identity.pre_checkpoint_digest,
+        worktree_device=1,
+        worktree_inode=2,
+    )
+    capture = SimpleNamespace(
+        decision=WorkspaceReuseDecision.REUSABLE, checkpoint=checkpoint
+    )
+    board = SimpleNamespace(project=project, task=lambda _task_id: task)
+
+    admitted = WorkspaceLeaseAdmission.issue(
+        board=board, identity=identity, checkpoint_capture=capture
+    )
+
+    assert admitted.task_id == "repair-c"
+    assert admitted.workspace == identity.workspace
 
     checkpoint.capture_completeness = WorkspaceCaptureCompleteness.COMPLETE
     capture.decision = WorkspaceReuseDecision.NOT_REUSABLE

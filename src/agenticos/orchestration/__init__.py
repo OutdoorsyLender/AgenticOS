@@ -14,6 +14,29 @@ from .workspace import (
     WorkspaceLeaseLedger,
     WorkspaceLeaseState,
 )
+from .verification import (
+    FailureClassification,
+    VerificationClassification,
+    VerificationController,
+    VerificationResult,
+    VerifierRegistry,
+    VerifierSpec,
+)
+from .review import (
+    ReviewClassification,
+    ReviewController,
+    ReviewResult,
+    ReviewerExecutionIdentity,
+    SyntheticReviewerAdapter,
+)
+from .repair import (
+    LineageSatisfactionOutcome,
+    RepairBudgetPolicy,
+    RepairController,
+    RepairCreationOutcome,
+    RepairExecutionOutcome,
+    SyntheticRepairAdapter,
+)
 
 __all__ = [
     "BoardAuthority",
@@ -28,4 +51,21 @@ __all__ = [
     "WorkspaceLeaseIdentity",
     "WorkspaceLeaseLedger",
     "WorkspaceLeaseState",
+    "FailureClassification",
+    "VerificationClassification",
+    "VerificationController",
+    "VerificationResult",
+    "VerifierRegistry",
+    "VerifierSpec",
+    "ReviewClassification",
+    "ReviewController",
+    "ReviewResult",
+    "ReviewerExecutionIdentity",
+    "SyntheticReviewerAdapter",
+    "LineageSatisfactionOutcome",
+    "RepairBudgetPolicy",
+    "RepairController",
+    "RepairCreationOutcome",
+    "RepairExecutionOutcome",
+    "SyntheticRepairAdapter",
 ]

@@ -211,8 +211,8 @@ def _board(**task_changes: object) -> BoardSnapshot:
 class FakeCheckpoint:
     checkpoint_digest: str
     repository_id: str = "repo-c"
-    task_id: str = "build-c"
-    generation: int = 2
+    task_id: str = WORKSPACE.workspace_id
+    generation: int = WORKSPACE.generation
     baseline_commit_sha: str = "b" * 40
     reservation_digest: str = "reservation-c"
     worktree_device: int = 10
@@ -827,6 +827,32 @@ def test_dispatch_board_lease_and_precheckpoint_must_bind_before_prepare(tmp_pat
             timeout=5.0,
         )
     assert calls == []
+
+
+def test_terminal_capture_uses_project_workspace_owner_for_repair_task() -> None:
+    dispatch = _dispatch(task_id="repair-c", task_generation=7)
+    checkpoint = replace(
+        FakeCheckpoint("a" * 64),
+        task_id=dispatch.workspace_id,
+        generation=dispatch.workspace_generation,
+    )
+
+    class WorkspaceOwnerAssertingManager:
+        def capture_checkpoint(self, repo_path, task_id, generation):
+            assert task_id == dispatch.workspace_id
+            assert generation == dispatch.workspace_generation
+            return _capture(checkpoint)
+
+    captured = SyntheticBuildController._capture(
+        WorkspaceOwnerAssertingManager(),
+        Path("/repo"),
+        dispatch,
+        None,
+        expected_device=checkpoint.worktree_device,
+        expected_inode=checkpoint.worktree_inode,
+    )
+
+    assert captured == checkpoint
 
 
 class FakeBackend:

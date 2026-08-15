@@ -142,8 +142,8 @@ class WorkspaceLeaseAdmission:
                 and project.workspace == task.workspace == identity.workspace
                 and project.baseline.repository_id == checkpoint.repository_id
                 and project.baseline.commit_sha == checkpoint.baseline_commit_sha
-                and checkpoint.task_id == identity.task_id
-                and checkpoint.generation == identity.task_generation
+                and checkpoint.task_id == identity.workspace.workspace_id
+                and checkpoint.generation == identity.workspace.generation
                 and checkpoint.reservation_digest
                 == identity.workspace.reservation_id
                 and checkpoint.checkpoint_digest

@@ -12,6 +12,7 @@ from .models import (
     ProjectRecord,
     ProjectStatus,
     TaskStatus,
+    TaskType,
     TerminalReason,
     require_exact_fields,
 )
@@ -193,13 +194,31 @@ class BoardTransitionEngine:
                 return self._reject(MutationRejectionCode.ATTEMPTS_EXHAUSTED)
             attempt_count += 1
         try:
+            lease_epoch = current.lease_epoch
+            if target is TaskStatus.IN_PROGRESS:
+                lease_epoch = self._snapshot.project.lease_epoch + 1
             updated = replace(
                 current,
                 status=target,
                 attempt_count=attempt_count,
+                lease_epoch=lease_epoch,
                 terminal_reason=terminal_reason,
                 block_reason=block_reason,
             )
+            if target is TaskStatus.IN_PROGRESS:
+                tasks = tuple(
+                    updated if item.task_id == current.task_id else item
+                    for item in self._snapshot.tasks
+                )
+                project = replace(
+                    self._snapshot.project,
+                    board_revision=self._snapshot.revision + 1,
+                    lease_epoch=lease_epoch,
+                )
+                self._snapshot = BoardSnapshot.create(project, tasks)
+                return AcceptedBoardMutation(
+                    self._snapshot, (self._snapshot.task(current.task_id),)
+                )
             return self._replace_tasks((updated,))
         except ControllerValidationError as exc:
             return self._reject(MutationRejectionCode.INVALID_REASON, exc.code)
@@ -259,6 +278,199 @@ class BoardTransitionEngine:
             return self._reject(MutationRejectionCode.INVALID_BOARD, exc.code)
         self._snapshot = candidate
         return AcceptedBoardMutation(candidate, tasks)
+
+    def create_repair(
+        self,
+        expected_revision: int,
+        parent_task_id: str,
+        child: BoardTask,
+        *,
+        result_digest: str,
+        verification_result_digest: str | None = None,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        """Atomically retain failure evidence, wait the parent, and add one child."""
+        if (stale := self._revision_ok(expected_revision)) is not None:
+            return stale
+        try:
+            parent = self._snapshot.task(parent_task_id)
+        except KeyError:
+            return self._reject(MutationRejectionCode.UNKNOWN_TASK)
+        if parent.status not in {TaskStatus.VERIFYING, TaskStatus.REVIEW}:
+            return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        if (
+            child.task_type is not TaskType.REPAIR
+            or child.parent_task_id != parent.task_id
+            or child.root_task_id != parent.root_task_id
+            or child.workspace != parent.workspace
+            or child.dependencies != parent.dependencies
+            or child.repair_failure_fingerprint is None
+        ):
+            return self._reject(MutationRejectionCode.INVALID_BOARD, "INVALID_REPAIR_CHILD")
+        try:
+            if parent.status is TaskStatus.VERIFYING:
+                updated_parent = replace(
+                    parent,
+                    status=TaskStatus.WAITING_REPAIR,
+                    verification_result_digest=result_digest,
+                )
+            else:
+                updated_parent = replace(
+                    parent,
+                    status=TaskStatus.WAITING_REPAIR,
+                    verification_result_digest=verification_result_digest,
+                    review_result_digest=result_digest,
+                )
+            tasks = tuple(
+                updated_parent if item.task_id == parent.task_id else item
+                for item in self._snapshot.tasks
+            ) + (child,)
+            project = replace(
+                self._snapshot.project,
+                board_revision=self._snapshot.revision + 1,
+            )
+            candidate = BoardSnapshot.create(project, tasks)
+        except ControllerValidationError as exc:
+            return self._reject(MutationRejectionCode.INVALID_BOARD, exc.code)
+        self._snapshot = candidate
+        return AcceptedBoardMutation(
+            candidate,
+            (candidate.task(parent.task_id), candidate.task(child.task_id)),
+        )
+
+    def fail_repair_budget(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        result_digest: str,
+        verification_result_digest: str | None = None,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        if (stale := self._revision_ok(expected_revision)) is not None:
+            return stale
+        try:
+            current = self._snapshot.task(task_id)
+        except KeyError:
+            return self._reject(MutationRejectionCode.UNKNOWN_TASK)
+        if current.status not in {TaskStatus.VERIFYING, TaskStatus.REVIEW}:
+            return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        try:
+            failed = [replace(
+                current,
+                status=TaskStatus.FAILED,
+                terminal_reason=TerminalReason.RESOURCE_LIMIT,
+                verification_result_digest=(
+                    result_digest
+                    if current.status is TaskStatus.VERIFYING
+                    else verification_result_digest
+                ),
+                review_result_digest=(
+                    result_digest if current.status is TaskStatus.REVIEW else current.review_result_digest
+                ),
+            )]
+            by_id = {item.task_id: item for item in self._snapshot.tasks}
+            parent_id = current.parent_task_id
+            seen = {current.task_id}
+            while parent_id is not None:
+                parent = by_id.get(parent_id)
+                if parent is None or parent.task_id in seen:
+                    return self._reject(
+                        MutationRejectionCode.INVALID_BOARD,
+                        "INVALID_REPAIR_LINEAGE",
+                    )
+                if parent.status is not TaskStatus.WAITING_REPAIR:
+                    return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+                seen.add(parent.task_id)
+                failed.append(replace(
+                    parent,
+                    status=TaskStatus.FAILED,
+                    terminal_reason=TerminalReason.RESOURCE_LIMIT,
+                ))
+                parent_id = parent.parent_task_id
+            return self._replace_tasks(tuple(failed))
+        except ControllerValidationError as exc:
+            return self._reject(MutationRejectionCode.INVALID_REASON, exc.code)
+
+    def record_verification_pass(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        result_digest: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        """Record controller verification and advance exactly one task to review."""
+        if (stale := self._revision_ok(expected_revision)) is not None:
+            return stale
+        try:
+            current = self._snapshot.task(task_id)
+        except KeyError:
+            return self._reject(MutationRejectionCode.UNKNOWN_TASK)
+        if current.status is not TaskStatus.VERIFYING:
+            return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        try:
+            return self._replace_tasks((replace(
+                current,
+                status=TaskStatus.REVIEW,
+                verification_result_digest=result_digest,
+            ),))
+        except ControllerValidationError as exc:
+            return self._reject(MutationRejectionCode.INVALID_REASON, exc.code)
+
+    def satisfy_lineage(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        verification_result_digest: str,
+        review_result_digest: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        """Atomically complete a reviewed task and each waiting repair ancestor."""
+        if (stale := self._revision_ok(expected_revision)) is not None:
+            return stale
+        try:
+            leaf = self._snapshot.task(task_id)
+        except KeyError:
+            return self._reject(MutationRejectionCode.UNKNOWN_TASK)
+        if (
+            leaf.status is not TaskStatus.REVIEW
+            or leaf.verification_result_digest != verification_result_digest
+        ):
+            return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        by_id = {item.task_id: item for item in self._snapshot.tasks}
+        lineage = [leaf]
+        seen = {leaf.task_id}
+        current = leaf
+        while current.parent_task_id is not None:
+            parent = by_id.get(current.parent_task_id)
+            if parent is None or parent.task_id in seen:
+                return self._reject(
+                    MutationRejectionCode.INVALID_BOARD, "INVALID_REPAIR_LINEAGE"
+                )
+            if parent.status is not TaskStatus.WAITING_REPAIR:
+                return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+            seen.add(parent.task_id)
+            lineage.append(parent)
+            current = parent
+        try:
+            changed = [
+                replace(
+                    leaf,
+                    status=TaskStatus.DONE,
+                    terminal_reason=TerminalReason.COMPLETED,
+                    review_result_digest=review_result_digest,
+                )
+            ]
+            changed.extend(
+                replace(
+                    ancestor,
+                    status=TaskStatus.DONE,
+                    terminal_reason=TerminalReason.COMPLETED,
+                    satisfying_descendant_id=leaf.task_id,
+                )
+                for ancestor in lineage[1:]
+            )
+            return self._replace_tasks(tuple(changed))
+        except ControllerValidationError as exc:
+            return self._reject(MutationRejectionCode.INVALID_REASON, exc.code)
 
     def _replace_tasks(self, changed: tuple[BoardTask, ...]) -> AcceptedBoardMutation:
         replacements = {item.task_id: item for item in changed}
@@ -347,6 +559,72 @@ class BoardAuthority:
         transaction_id: str,
     ) -> AcceptedBoardMutation | RejectedBoardMutation:
         staged = BoardTransitionEngine(self._snapshot).add_tasks(expected_revision, tasks)
+        return self._commit_staged(staged, transaction_id)
+
+    def create_repair(
+        self,
+        expected_revision: int,
+        parent_task_id: str,
+        child: BoardTask,
+        *,
+        result_digest: str,
+        transaction_id: str,
+        verification_result_digest: str | None = None,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        staged = BoardTransitionEngine(self._snapshot).create_repair(
+            expected_revision,
+            parent_task_id,
+            child,
+            result_digest=result_digest,
+            verification_result_digest=verification_result_digest,
+        )
+        return self._commit_staged(staged, transaction_id)
+
+    def fail_repair_budget(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        result_digest: str,
+        transaction_id: str,
+        verification_result_digest: str | None = None,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        staged = BoardTransitionEngine(self._snapshot).fail_repair_budget(
+            expected_revision,
+            task_id,
+            result_digest=result_digest,
+            verification_result_digest=verification_result_digest,
+        )
+        return self._commit_staged(staged, transaction_id)
+
+    def record_verification_pass(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        result_digest: str,
+        transaction_id: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        staged = BoardTransitionEngine(self._snapshot).record_verification_pass(
+            expected_revision, task_id, result_digest=result_digest
+        )
+        return self._commit_staged(staged, transaction_id)
+
+    def satisfy_lineage(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        verification_result_digest: str,
+        review_result_digest: str,
+        transaction_id: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        staged = BoardTransitionEngine(self._snapshot).satisfy_lineage(
+            expected_revision,
+            task_id,
+            verification_result_digest=verification_result_digest,
+            review_result_digest=review_result_digest,
+        )
         return self._commit_staged(staged, transaction_id)
 
     def _commit_staged(

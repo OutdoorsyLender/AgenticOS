@@ -53,7 +53,28 @@ def test_valid_task_transition_increments_attempt_and_revision() -> None:
     assert isinstance(result, AcceptedBoardMutation)
     assert result.snapshot.revision == 1
     assert result.snapshot.task("task-1").attempt_count == 1
+    assert result.snapshot.project.lease_epoch == 1
+    assert result.snapshot.task("task-1").lease_epoch == 1
     assert authority.snapshot == result.snapshot
+
+
+def test_each_mutating_attempt_advances_the_project_workspace_fence() -> None:
+    first = task(
+        task_id="task-1", root_task_id="task-1", status=TaskStatus.DONE,
+        terminal_reason=TerminalReason.COMPLETED, lease_epoch=1,
+    )
+    second = task(
+        task_id="task-2", root_task_id="task-2", status=TaskStatus.READY,
+        creation_sequence=2, lease_epoch=1,
+    )
+    source = BoardSnapshot.create(replace(project(), lease_epoch=1), (first, second))
+    result = BoardTransitionEngine(source).transition_task(
+        0, "task-2", TaskStatus.IN_PROGRESS
+    )
+    assert isinstance(result, AcceptedBoardMutation)
+    assert result.snapshot.project.lease_epoch == 2
+    assert result.snapshot.task("task-2").lease_epoch == 2
+    assert result.snapshot.task("task-1").lease_epoch == 1
 
 
 def test_impossible_duplicate_and_invalid_status_transitions_are_typed_rejections() -> None:

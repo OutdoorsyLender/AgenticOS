@@ -119,7 +119,7 @@ def _fixture(
     manager = WorktreeManager(state_root)
     reservation = create_worktree_reservation(
         repo_path=repo,
-        task_id="build-c",
+        task_id="slice-c-workspace",
         generation=1,
         baseline_commit_sha=baseline,
         nonce="7" * 32,
@@ -127,7 +127,7 @@ def _fixture(
         state_root=state_root,
     )
     lifecycle = manager.create(reservation)
-    pre_capture = manager.capture_checkpoint(repo, "build-c", 1)
+    pre_capture = manager.capture_checkpoint(repo, "slice-c-workspace", 1)
     assert pre_capture.decision is WorkspaceReuseDecision.REUSABLE
     assert pre_capture.checkpoint is not None
     pre = pre_capture.checkpoint
@@ -247,7 +247,9 @@ def _fixture(
         launcher_path=launcher,
         task_tmp=task_tmp,
         synthetic_home=synthetic_home,
-        git_mask_path=manager.ensure_git_mask(pre.repository_id, "build-c", 1),
+        git_mask_path=manager.ensure_git_mask(
+            pre.repository_id, "slice-c-workspace", 1
+        ),
         cancellation=FAST,
         collector=EvidenceCollector(normalize_root=tmp_path),
     )
@@ -366,7 +368,9 @@ def test_real_receipt_persistence_failure_never_releases_worker_and_restores_cle
 
     manager = observed["manager"]
     repo = observed["repo"]
-    post = manager.capture_checkpoint(repo, "build-c", 1)  # type: ignore[attr-defined]
+    post = manager.capture_checkpoint(  # type: ignore[attr-defined]
+        repo, "slice-c-workspace", 1
+    )
     assert post.decision is WorkspaceReuseDecision.REUSABLE
     assert post.checkpoint == observed["pre"]
     worktree = observed["worktree"]

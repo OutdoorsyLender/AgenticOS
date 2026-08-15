@@ -39,6 +39,14 @@ class SyntheticScenario(str, Enum):
     PLANNER_SUCCESS = "PLANNER_SUCCESS"
     REVIEWER_PASS = "REVIEWER_PASS"
     REVIEWER_FAIL = "REVIEWER_FAIL"
+    REVIEWER_MUTATE_CREATE = "REVIEWER_MUTATE_CREATE"
+    REVIEWER_MUTATE_WRITE = "REVIEWER_MUTATE_WRITE"
+    REVIEWER_MUTATE_RENAME = "REVIEWER_MUTATE_RENAME"
+    REVIEWER_MUTATE_DELETE = "REVIEWER_MUTATE_DELETE"
+    REVIEWER_DOT_GIT_ACCESS = "REVIEWER_DOT_GIT_ACCESS"
+    REVIEWER_HOST_ACCESS = "REVIEWER_HOST_ACCESS"
+    REVIEWER_CONTROLLER_ACCESS = "REVIEWER_CONTROLLER_ACCESS"
+    REVIEWER_CREDENTIAL_ACCESS = "REVIEWER_CREDENTIAL_ACCESS"
     NO_OP = "NO_OP"
     RETRYABLE_FAILURE = "RETRYABLE_FAILURE"
     TERMINAL_FAILURE = "TERMINAL_FAILURE"
@@ -54,6 +62,9 @@ class SyntheticScenario(str, Enum):
     STALE_ATTEMPT = "STALE_ATTEMPT"
     INCOMPLETE_STREAM = "INCOMPLETE_STREAM"
     SUCCESSFUL_EDIT = "SUCCESSFUL_EDIT"
+    BROKEN_FEATURE_EDIT = "BROKEN_FEATURE_EDIT"
+    REPAIR_FEATURE = "REPAIR_FEATURE"
+    REPAIR_REVIEW = "REPAIR_REVIEW"
     INVALID_PATH_ATTEMPT = "INVALID_PATH_ATTEMPT"
     DOT_GIT_ATTEMPT = "DOT_GIT_ATTEMPT"
     CRASH_AFTER_EDIT = "CRASH_AFTER_EDIT"
@@ -83,7 +94,20 @@ class SyntheticOutcome:
 
 WORKSPACE_SCENARIOS = frozenset(
     {
+        SyntheticScenario.REVIEWER_PASS,
+        SyntheticScenario.REVIEWER_FAIL,
+        SyntheticScenario.REVIEWER_MUTATE_CREATE,
+        SyntheticScenario.REVIEWER_MUTATE_WRITE,
+        SyntheticScenario.REVIEWER_MUTATE_RENAME,
+        SyntheticScenario.REVIEWER_MUTATE_DELETE,
+        SyntheticScenario.REVIEWER_DOT_GIT_ACCESS,
+        SyntheticScenario.REVIEWER_HOST_ACCESS,
+        SyntheticScenario.REVIEWER_CONTROLLER_ACCESS,
+        SyntheticScenario.REVIEWER_CREDENTIAL_ACCESS,
         SyntheticScenario.SUCCESSFUL_EDIT,
+        SyntheticScenario.BROKEN_FEATURE_EDIT,
+        SyntheticScenario.REPAIR_FEATURE,
+        SyntheticScenario.REPAIR_REVIEW,
         SyntheticScenario.NO_OP,
         SyntheticScenario.INVALID_PATH_ATTEMPT,
         SyntheticScenario.DOT_GIT_ATTEMPT,
@@ -205,7 +229,7 @@ def _normal_fixture(request: AgentTaskRequest, scenario: SyntheticScenario) -> S
         content = canonical_json_line(review.to_dict())
         artifacts = (("review-proposal-1", content),)
         middle_kind = EventKind.PROPOSAL
-        middle_text = "Reviewer proposal artifact emitted."
+        middle_text = content[:-1].decode("utf-8")
     elif scenario is SyntheticScenario.NO_OP:
         terminal = EventKind.NO_OP
     elif scenario is SyntheticScenario.RETRYABLE_FAILURE:
