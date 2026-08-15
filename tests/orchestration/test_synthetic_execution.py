@@ -145,3 +145,9 @@ def test_required_slice_c_scenarios_are_exact() -> None:
         "POST_TERMINAL_MUTATION_ATTEMPT",
     }
     assert required <= {item.value for item in SyntheticScenario}
+
+
+def test_follow_up_edit_is_a_real_bounded_workspace_mutation(tmp_path) -> None:
+    kind, _ = synthetic_worker._scenario_action("FOLLOW_UP_EDIT", tmp_path)
+    assert kind == "SUCCEEDED"
+    assert (tmp_path / "follow-up.txt").read_bytes() == b"dependent work complete\n"

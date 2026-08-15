@@ -37,6 +37,7 @@ from .models import Role, TaskType
 class SyntheticScenario(str, Enum):
     RESEARCHER_SUCCESS = "RESEARCHER_SUCCESS"
     PLANNER_SUCCESS = "PLANNER_SUCCESS"
+    DEMO_PLANNER_SUCCESS = "DEMO_PLANNER_SUCCESS"
     REVIEWER_PASS = "REVIEWER_PASS"
     REVIEWER_FAIL = "REVIEWER_FAIL"
     REVIEWER_MUTATE_CREATE = "REVIEWER_MUTATE_CREATE"
@@ -62,6 +63,7 @@ class SyntheticScenario(str, Enum):
     STALE_ATTEMPT = "STALE_ATTEMPT"
     INCOMPLETE_STREAM = "INCOMPLETE_STREAM"
     SUCCESSFUL_EDIT = "SUCCESSFUL_EDIT"
+    FOLLOW_UP_EDIT = "FOLLOW_UP_EDIT"
     BROKEN_FEATURE_EDIT = "BROKEN_FEATURE_EDIT"
     REPAIR_FEATURE = "REPAIR_FEATURE"
     REPAIR_REVIEW = "REPAIR_REVIEW"
@@ -105,6 +107,7 @@ WORKSPACE_SCENARIOS = frozenset(
         SyntheticScenario.REVIEWER_CONTROLLER_ACCESS,
         SyntheticScenario.REVIEWER_CREDENTIAL_ACCESS,
         SyntheticScenario.SUCCESSFUL_EDIT,
+        SyntheticScenario.FOLLOW_UP_EDIT,
         SyntheticScenario.BROKEN_FEATURE_EDIT,
         SyntheticScenario.REPAIR_FEATURE,
         SyntheticScenario.REPAIR_REVIEW,
@@ -212,11 +215,28 @@ def _normal_fixture(request: AgentTaskRequest, scenario: SyntheticScenario) -> S
     if scenario is SyntheticScenario.RESEARCHER_SUCCESS:
         content = canonical_json_line({"schema": "AOSNOTE/1", "note": "Bounded deterministic research."})
         artifacts = (("research-note-1", content),)
-    elif scenario is SyntheticScenario.PLANNER_SUCCESS:
-        plan = PlannerProposal(
-            schema=PLANNER_SCHEMA,
-            tasks=(ProposedTask("build", "Build fixture", "Implement bounded fixture.", TaskType.BUILD, (), ("Focused test passes.",), Role.BUILDER, 50),),
+    elif scenario in {
+        SyntheticScenario.PLANNER_SUCCESS,
+        SyntheticScenario.DEMO_PLANNER_SUCCESS,
+    }:
+        tasks = (
+            ProposedTask(
+                "build", "Build fixture", "Implement bounded fixture.",
+                TaskType.BUILD, (), ("Focused test passes.",), Role.BUILDER, 50,
+            ),
         )
+        if scenario is SyntheticScenario.DEMO_PLANNER_SUCCESS:
+            tasks = (
+                ProposedTask(
+                    "feature", "Implement feature", "Implement the bounded fixture feature.",
+                    TaskType.BUILD, (), ("Focused test passes.",), Role.BUILDER, 50,
+                ),
+                ProposedTask(
+                    "follow-up", "Complete follow-up", "Complete dependent bounded work.",
+                    TaskType.DOCUMENT, ("feature",), ("Focused test passes.",), Role.BUILDER, 40,
+                ),
+            )
+        plan = PlannerProposal(schema=PLANNER_SCHEMA, tasks=tasks)
         content = canonical_json_line(plan.to_dict())
         artifacts = (("planner-proposal-1", content),)
         middle_kind = EventKind.PROPOSAL
@@ -251,6 +271,7 @@ def build_synthetic_fixture(request: AgentTaskRequest, scenario: SyntheticScenar
         raise TypeError("strict request and scenario values are required")
     normal = {
         SyntheticScenario.RESEARCHER_SUCCESS, SyntheticScenario.PLANNER_SUCCESS,
+        SyntheticScenario.DEMO_PLANNER_SUCCESS,
         SyntheticScenario.REVIEWER_PASS, SyntheticScenario.REVIEWER_FAIL,
         SyntheticScenario.NO_OP, SyntheticScenario.RETRYABLE_FAILURE,
         SyntheticScenario.TERMINAL_FAILURE,

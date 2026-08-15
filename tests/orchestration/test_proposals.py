@@ -17,7 +17,7 @@ from agenticos.orchestration.proposals import (
     compile_planner_proposal,
 )
 from agenticos.orchestration.protocol import EvidenceRef
-from tests.orchestration.test_models import project
+from tests.orchestration.test_models import project, task
 
 
 def proposed(local_id: str, dependencies: tuple[str, ...] = ()) -> ProposedTask:
@@ -142,3 +142,34 @@ def test_reviewer_cannot_smuggle_authoritative_state_or_unbounded_findings() -> 
             repair_recommendation=None,
             evidence_refs=(),
         )
+
+
+def test_plan_completion_and_dag_compile_are_one_atomic_board_revision(tmp_path) -> None:
+    plan_task = task(
+        task_id="bootstrap-plan",
+        root_task_id="bootstrap-plan",
+        task_type=TaskType.PLAN,
+        preferred_role=Role.PLANNER,
+        assigned_role=Role.PLANNER,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+    )
+    authority = BoardAuthority.create(
+        TransactionJournal(tmp_path, "project-1"),
+        BoardSnapshot.create(project(), (plan_task,)),
+        transaction_id="tx-init",
+    )
+    result = compile_planner_proposal(
+        authority,
+        expected_revision=0,
+        proposal=proposal(proposed("feature"), proposed("follow-up", ("feature",))),
+        transaction_id="tx-plan",
+        plan_task_id="bootstrap-plan",
+        stage_result_digest="e" * 64,
+    )
+    assert result.authoritative_task_ids == ("task-000002", "task-000003")
+    assert authority.snapshot.revision == 1
+    completed = authority.snapshot.task("bootstrap-plan")
+    assert completed.status is TaskStatus.DONE
+    assert completed.stage_result_digest == "e" * 64
+    assert authority.snapshot.task("task-000003").dependencies == ("task-000002",)

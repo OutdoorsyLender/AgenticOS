@@ -60,6 +60,9 @@ def _scenario_action(scenario: str, workspace: Path) -> tuple[str, str]:
         _write(workspace / "slice-c-tracked.txt", "slice-c deterministic tracked edit\n")
         _write(workspace / "slice-c-created.txt", "slice-c deterministic untracked file\n")
         return "SUCCEEDED", "Deterministic workspace edit completed."
+    if scenario == "FOLLOW_UP_EDIT":
+        _write(workspace / "follow-up.txt", "dependent work complete\n")
+        return "SUCCEEDED", "Deterministic dependent follow-up completed."
     if scenario == "NO_OP":
         return "NO_OP", "Deterministic no-op completed."
     if scenario == "INVALID_PATH_ATTEMPT":

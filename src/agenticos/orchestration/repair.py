@@ -572,10 +572,11 @@ class RepairController:
         )
         if not all(valid_binding):
             raise RepairError("INVALID_REPAIR_EXECUTION_RESULT")
-        mutation = authority.transition_task(
+        mutation = authority.record_execution_success(
             authority.snapshot.revision,
             task_id,
-            TaskStatus.VERIFYING,
+            checkpoint_digest=execution.first_checkpoint.checkpoint_digest,
+            evidence_digest=execution.terminal_record.record_digest,
             transaction_id=transaction_id,
         )
         if not isinstance(mutation, AcceptedBoardMutation):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from agenticos.orchestration.canonical import load_canonical_json
+from agenticos.orchestration.proposals import PlannerProposal
 from agenticos.orchestration.synthetic import (
     SyntheticScenario,
     build_synthetic_fixture,
@@ -65,3 +67,15 @@ def test_synthetic_fixtures_are_non_workspace_and_provider_neutral() -> None:
     assert fixture.workspace_accesses == 0
     assert fixture.network_accesses == 0
     assert fixture.artifacts
+
+
+def test_demo_planner_fixture_proposes_two_dependent_controller_compiled_tasks() -> None:
+    fixture = build_synthetic_fixture(
+        request(), SyntheticScenario.DEMO_PLANNER_SUCCESS
+    )
+    assert len(fixture.artifacts) == 1
+    proposal = PlannerProposal.from_dict(load_canonical_json(fixture.artifacts[0][1]))
+    assert [item.local_id for item in proposal.tasks] == ["feature", "follow-up"]
+    assert proposal.tasks[1].dependencies == ("feature",)
+    assert [item.task_type.value for item in proposal.tasks] == ["BUILD", "DOCUMENT"]
+    assert run_synthetic_fixture(request(), fixture).accepted

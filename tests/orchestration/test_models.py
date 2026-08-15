@@ -80,6 +80,7 @@ def task(**changes: object) -> BoardTask:
         "satisfying_descendant_id": None,
         "verification_result_digest": None,
         "review_result_digest": None,
+        "stage_result_digest": None,
     }
     values.update(changes)
     return BoardTask(**values)  # type: ignore[arg-type]
@@ -176,3 +177,16 @@ def test_project_deadline_and_workspace_generation_are_bounded() -> None:
 def test_project_failed_rejects_non_failure_reasons(reason: TerminalReason) -> None:
     with pytest.raises(ControllerValidationError, match="INVALID_STATE_REASON"):
         replace(project(), status=ProjectStatus.FAILED, terminal_reason=reason)
+
+
+def test_stage_result_digest_is_strict_and_round_trips() -> None:
+    completed = task(
+        task_type=TaskType.RESEARCH,
+        preferred_role=Role.RESEARCHER,
+        status=TaskStatus.DONE,
+        terminal_reason=TerminalReason.COMPLETED,
+        stage_result_digest="d" * 64,
+    )
+    assert BoardTask.from_dict(completed.to_dict()) == completed
+    with pytest.raises(ControllerValidationError, match="INVALID_DIGEST"):
+        task(stage_result_digest="model-says-done")

@@ -37,6 +37,20 @@ from .repair import (
     RepairExecutionOutcome,
     SyntheticRepairAdapter,
 )
+from .scheduler import (
+    AutonomousScheduler,
+    ExecutionClassification,
+    ExecutionStageResult,
+    FinalizationEvidence,
+    PlanningStageResult,
+    ResearchStageResult,
+    SchedulerError,
+    SchedulerEvent,
+    SchedulerLimits,
+    SchedulerResult,
+    create_project,
+    select_next_ready,
+)
 
 __all__ = [
     "BoardAuthority",
@@ -68,4 +82,16 @@ __all__ = [
     "RepairCreationOutcome",
     "RepairExecutionOutcome",
     "SyntheticRepairAdapter",
+    "AutonomousScheduler",
+    "ExecutionClassification",
+    "ExecutionStageResult",
+    "FinalizationEvidence",
+    "PlanningStageResult",
+    "ResearchStageResult",
+    "SchedulerError",
+    "SchedulerEvent",
+    "SchedulerLimits",
+    "SchedulerResult",
+    "create_project",
+    "select_next_ready",
 ]

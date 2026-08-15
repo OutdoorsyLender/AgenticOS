@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import Path
 
 from .models import (
     BlockReason,
@@ -15,6 +16,7 @@ from .models import (
     TaskType,
     TerminalReason,
     require_exact_fields,
+    require_digest,
 )
 
 TASK_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
@@ -195,7 +197,15 @@ class BoardTransitionEngine:
             attempt_count += 1
         try:
             lease_epoch = current.lease_epoch
-            if target is TaskStatus.IN_PROGRESS:
+            mutating_attempt = (
+                target is TaskStatus.IN_PROGRESS
+                and current.task_type in {
+                    TaskType.BUILD,
+                    TaskType.REPAIR,
+                    TaskType.DOCUMENT,
+                }
+            )
+            if mutating_attempt:
                 lease_epoch = self._snapshot.project.lease_epoch + 1
             updated = replace(
                 current,
@@ -205,7 +215,7 @@ class BoardTransitionEngine:
                 terminal_reason=terminal_reason,
                 block_reason=block_reason,
             )
-            if target is TaskStatus.IN_PROGRESS:
+            if mutating_attempt:
                 tasks = tuple(
                     updated if item.task_id == current.task_id else item
                     for item in self._snapshot.tasks
@@ -239,6 +249,11 @@ class BoardTransitionEngine:
             return self._reject(MutationRejectionCode.DUPLICATE_TRANSITION)
         if target not in PROJECT_TRANSITIONS[current.status]:
             return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        if target is ProjectStatus.DONE:
+            return self._reject(
+                MutationRejectionCode.INVALID_REASON,
+                "FINALIZATION_EVIDENCE_REQUIRED",
+            )
         terminal = target in {ProjectStatus.OWNER_BLOCKED, ProjectStatus.DONE, ProjectStatus.FAILED, ProjectStatus.CANCELLED}
         if terminal != (terminal_reason is not None):
             return self._reject(MutationRejectionCode.INVALID_REASON)
@@ -247,6 +262,44 @@ class BoardTransitionEngine:
         try:
             new_project = replace(current, status=target, terminal_reason=terminal_reason, board_revision=current.board_revision + 1)
             self._snapshot = BoardSnapshot.create(new_project, self._snapshot.tasks)
+        except ControllerValidationError as exc:
+            return self._reject(MutationRejectionCode.INVALID_REASON, exc.code)
+        return AcceptedBoardMutation(self._snapshot)
+
+    def complete_project(
+        self,
+        expected_revision: int,
+        *,
+        checkpoint_digest: str,
+        evidence_digest: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        """Atomically bind final evidence and mark a fully complete project DONE."""
+        if (stale := self._revision_ok(expected_revision)) is not None:
+            return stale
+        current = self._snapshot.project
+        if current.status is ProjectStatus.DONE:
+            if (
+                current.final_checkpoint_digest == checkpoint_digest
+                and current.finalization_evidence_digest == evidence_digest
+            ):
+                return self._reject(MutationRejectionCode.DUPLICATE_TRANSITION)
+            return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        if current.status is not ProjectStatus.ACTIVE or not all(
+            task.status is TaskStatus.DONE for task in self._snapshot.tasks
+        ):
+            return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        try:
+            require_digest("checkpoint_digest", checkpoint_digest)
+            require_digest("evidence_digest", evidence_digest)
+            project = replace(
+                current,
+                status=ProjectStatus.DONE,
+                terminal_reason=TerminalReason.COMPLETED,
+                board_revision=current.board_revision + 1,
+                final_checkpoint_digest=checkpoint_digest,
+                finalization_evidence_digest=evidence_digest,
+            )
+            self._snapshot = BoardSnapshot.create(project, self._snapshot.tasks)
         except ControllerValidationError as exc:
             return self._reject(MutationRejectionCode.INVALID_REASON, exc.code)
         return AcceptedBoardMutation(self._snapshot)
@@ -278,6 +331,121 @@ class BoardTransitionEngine:
             return self._reject(MutationRejectionCode.INVALID_BOARD, exc.code)
         self._snapshot = candidate
         return AcceptedBoardMutation(candidate, tasks)
+
+    def record_stage_success(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        result_digest: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        """Atomically bind one non-workspace bootstrap result and complete it."""
+        if (stale := self._revision_ok(expected_revision)) is not None:
+            return stale
+        try:
+            current = self._snapshot.task(task_id)
+        except KeyError:
+            return self._reject(MutationRejectionCode.UNKNOWN_TASK)
+        if current.status is TaskStatus.DONE and current.stage_result_digest == result_digest:
+            return self._reject(MutationRejectionCode.DUPLICATE_TRANSITION)
+        if (
+            current.status is not TaskStatus.IN_PROGRESS
+            or current.task_type not in {TaskType.RESEARCH, TaskType.PLAN}
+        ):
+            return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        try:
+            completed = replace(
+                current,
+                status=TaskStatus.DONE,
+                terminal_reason=TerminalReason.COMPLETED,
+                stage_result_digest=result_digest,
+            )
+        except ControllerValidationError as exc:
+            return self._reject(MutationRejectionCode.INVALID_REASON, exc.code)
+        return self._replace_tasks((completed,))
+
+    def record_execution_success(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        checkpoint_digest: str,
+        evidence_digest: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        """Atomically bind measured mutation evidence before verification."""
+        if (stale := self._revision_ok(expected_revision)) is not None:
+            return stale
+        try:
+            current = self._snapshot.task(task_id)
+        except KeyError:
+            return self._reject(MutationRejectionCode.UNKNOWN_TASK)
+        if (
+            current.status is TaskStatus.VERIFYING
+            and current.execution_checkpoint_digest == checkpoint_digest
+            and current.execution_evidence_digest == evidence_digest
+        ):
+            return self._reject(MutationRejectionCode.DUPLICATE_TRANSITION)
+        if (
+            current.status is not TaskStatus.IN_PROGRESS
+            or current.task_type in {TaskType.RESEARCH, TaskType.PLAN}
+        ):
+            return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        try:
+            require_digest("checkpoint_digest", checkpoint_digest)
+            require_digest("evidence_digest", evidence_digest)
+            verifying = replace(
+                current,
+                status=TaskStatus.VERIFYING,
+                execution_checkpoint_digest=checkpoint_digest,
+                execution_evidence_digest=evidence_digest,
+            )
+        except ControllerValidationError as exc:
+            return self._reject(MutationRejectionCode.INVALID_REASON, exc.code)
+        return self._replace_tasks((verifying,))
+
+    def complete_stage_with_tasks(
+        self,
+        expected_revision: int,
+        stage_task_id: str,
+        tasks: tuple[BoardTask, ...],
+        *,
+        result_digest: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        """Atomically publish a compiled DAG and the PLAN result that produced it."""
+        if (stale := self._revision_ok(expected_revision)) is not None:
+            return stale
+        try:
+            current = self._snapshot.task(stage_task_id)
+        except KeyError:
+            return self._reject(MutationRejectionCode.UNKNOWN_TASK)
+        if current.status is not TaskStatus.IN_PROGRESS or current.task_type is not TaskType.PLAN:
+            return self._reject(MutationRejectionCode.IMPOSSIBLE_TRANSITION)
+        if not tasks:
+            return self._reject(MutationRejectionCode.NO_STATE_CHANGE)
+        try:
+            completed = replace(
+                current,
+                status=TaskStatus.DONE,
+                terminal_reason=TerminalReason.COMPLETED,
+                stage_result_digest=result_digest,
+            )
+            existing = tuple(
+                completed if item.task_id == stage_task_id else item
+                for item in self._snapshot.tasks
+            )
+            project = replace(
+                self._snapshot.project,
+                board_revision=self._snapshot.revision + 1,
+            )
+            candidate = BoardSnapshot.create(project, existing + tasks)
+        except ControllerValidationError as exc:
+            return self._reject(MutationRejectionCode.INVALID_BOARD, exc.code)
+        self._snapshot = candidate
+        return AcceptedBoardMutation(
+            candidate,
+            (candidate.task(stage_task_id),)
+            + tuple(candidate.task(item.task_id) for item in tasks),
+        )
 
     def create_repair(
         self,
@@ -502,11 +670,25 @@ class BoardAuthority:
     @classmethod
     def recover(cls, journal: object) -> BoardAuthority:
         recovered = journal.recover()  # type: ignore[attr-defined]
+        if recovered.dangling_prepares:
+            if len(recovered.dangling_prepares) != 1:
+                raise ControllerValidationError("AMBIGUOUS_DANGLING_PREPARE")
+            recovered = journal.complete_prepared(  # type: ignore[attr-defined]
+                recovered.dangling_prepares[0]
+            )
         return cls(journal, recovered.snapshot)
 
     @property
     def snapshot(self) -> BoardSnapshot:
         return self._snapshot
+
+    @property
+    def journal_root(self) -> Path:
+        """Return the durable state root used to scope controller ownership."""
+        root = getattr(self._journal, "root", None)
+        if root is None:
+            raise ControllerValidationError("BOARD_JOURNAL_ROOT_UNAVAILABLE")
+        return Path(root)
 
     def transition_task(
         self,
@@ -542,6 +724,21 @@ class BoardAuthority:
         )
         return self._commit_staged(staged, transaction_id)
 
+    def complete_project(
+        self,
+        expected_revision: int,
+        *,
+        checkpoint_digest: str,
+        evidence_digest: str,
+        transaction_id: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        staged = BoardTransitionEngine(self._snapshot).complete_project(
+            expected_revision,
+            checkpoint_digest=checkpoint_digest,
+            evidence_digest=evidence_digest,
+        )
+        return self._commit_staged(staged, transaction_id)
+
     def derive_ready(
         self,
         expected_revision: int,
@@ -559,6 +756,53 @@ class BoardAuthority:
         transaction_id: str,
     ) -> AcceptedBoardMutation | RejectedBoardMutation:
         staged = BoardTransitionEngine(self._snapshot).add_tasks(expected_revision, tasks)
+        return self._commit_staged(staged, transaction_id)
+
+    def record_stage_success(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        result_digest: str,
+        transaction_id: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        staged = BoardTransitionEngine(self._snapshot).record_stage_success(
+            expected_revision, task_id, result_digest=result_digest
+        )
+        return self._commit_staged(staged, transaction_id)
+
+    def record_execution_success(
+        self,
+        expected_revision: int,
+        task_id: str,
+        *,
+        checkpoint_digest: str,
+        evidence_digest: str,
+        transaction_id: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        staged = BoardTransitionEngine(self._snapshot).record_execution_success(
+            expected_revision,
+            task_id,
+            checkpoint_digest=checkpoint_digest,
+            evidence_digest=evidence_digest,
+        )
+        return self._commit_staged(staged, transaction_id)
+
+    def complete_stage_with_tasks(
+        self,
+        expected_revision: int,
+        stage_task_id: str,
+        tasks: tuple[BoardTask, ...],
+        *,
+        result_digest: str,
+        transaction_id: str,
+    ) -> AcceptedBoardMutation | RejectedBoardMutation:
+        staged = BoardTransitionEngine(self._snapshot).complete_stage_with_tasks(
+            expected_revision,
+            stage_task_id,
+            tasks,
+            result_digest=result_digest,
+        )
         return self._commit_staged(staged, transaction_id)
 
     def create_repair(

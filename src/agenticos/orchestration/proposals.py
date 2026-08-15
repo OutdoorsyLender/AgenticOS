@@ -198,11 +198,15 @@ def compile_planner_proposal(
     proposal: PlannerProposal,
     transaction_id: str,
     policy: PlannerCompilationPolicy = DEFAULT_PLANNER_POLICY,
+    plan_task_id: str | None = None,
+    stage_result_digest: str | None = None,
 ) -> ProposalCompilationResult:
     if not isinstance(authority, BoardAuthority) or not isinstance(proposal, PlannerProposal) or not isinstance(policy, PlannerCompilationPolicy):
         raise ProposalCompilationError("INVALID_COMPILER_INPUT")
     if expected_revision != authority.snapshot.revision:
         raise ProposalCompilationError("STALE_REVISION")
+    if (plan_task_id is None) != (stage_result_digest is None):
+        raise ProposalCompilationError("INVALID_PLAN_STAGE_BINDING")
     _validate_proposal_dag(proposal)
     if len(authority.snapshot.tasks) + len(proposal.tasks) > authority.snapshot.project.limits.max_tasks:
         raise ProposalCompilationError("PROJECT_TASK_LIMIT")
@@ -252,7 +256,18 @@ def compile_planner_proposal(
         )
         for index, item in enumerate(proposal.tasks)
     )
-    mutation = authority.add_tasks(expected_revision, compiled, transaction_id=transaction_id)
+    if plan_task_id is None:
+        mutation = authority.add_tasks(
+            expected_revision, compiled, transaction_id=transaction_id
+        )
+    else:
+        mutation = authority.complete_stage_with_tasks(
+            expected_revision,
+            plan_task_id,
+            compiled,
+            result_digest=stage_result_digest,  # type: ignore[arg-type]
+            transaction_id=transaction_id,
+        )
     if not isinstance(mutation, AcceptedBoardMutation):
         raise ProposalCompilationError("AUTHORITATIVE_BOARD_REJECTED", mutation.detail)
     return ProposalCompilationResult(True, tuple(item.task_id for item in compiled))

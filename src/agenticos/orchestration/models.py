@@ -247,6 +247,8 @@ class ProjectRecord:
     deadline_unix_ms: int
     transition_sequence: int
     transition_digest: str
+    final_checkpoint_digest: str | None = None
+    finalization_evidence_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema != BOARD_SCHEMA:
@@ -279,6 +281,14 @@ class ProjectRecord:
             TerminalReason.CANCELLED_BY_OWNER,
         }:
             raise ControllerValidationError("INVALID_STATE_REASON")
+        for name in ("final_checkpoint_digest", "finalization_evidence_digest"):
+            require_digest(name, getattr(self, name), allow_none=True)
+        final_evidence_present = (
+            self.final_checkpoint_digest is not None
+            and self.finalization_evidence_digest is not None
+        )
+        if (self.status is ProjectStatus.DONE) != final_evidence_present:
+            raise ControllerValidationError("INVALID_FINALIZATION_EVIDENCE")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -297,6 +307,8 @@ class ProjectRecord:
             "deadline_unix_ms": self.deadline_unix_ms,
             "transition_sequence": self.transition_sequence,
             "transition_digest": self.transition_digest,
+            "final_checkpoint_digest": self.final_checkpoint_digest,
+            "finalization_evidence_digest": self.finalization_evidence_digest,
         }
 
     @classmethod
@@ -344,6 +356,9 @@ class BoardTask:
     satisfying_descendant_id: str | None
     verification_result_digest: str | None
     review_result_digest: str | None
+    stage_result_digest: str | None = None
+    execution_checkpoint_digest: str | None = None
+    execution_evidence_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema != BOARD_SCHEMA:
@@ -391,8 +406,14 @@ class BoardTask:
             value = getattr(self, name)
             if value is not None:
                 require_identifier(name, value)
-        for name in ("verification_result_digest", "review_result_digest"):
+        for name in (
+            "verification_result_digest",
+            "review_result_digest",
+            "execution_checkpoint_digest",
+            "execution_evidence_digest",
+        ):
             require_digest(name, getattr(self, name), allow_none=True)
+        require_digest("stage_result_digest", self.stage_result_digest, allow_none=True)
         if self.block_reason is not None and not isinstance(self.block_reason, BlockReason):
             raise ControllerValidationError("INVALID_ENUM", "block_reason")
         if self.terminal_reason is not None and not isinstance(self.terminal_reason, TerminalReason):
@@ -443,6 +464,9 @@ class BoardTask:
             "satisfying_descendant_id": self.satisfying_descendant_id,
             "verification_result_digest": self.verification_result_digest,
             "review_result_digest": self.review_result_digest,
+            "stage_result_digest": self.stage_result_digest,
+            "execution_checkpoint_digest": self.execution_checkpoint_digest,
+            "execution_evidence_digest": self.execution_evidence_digest,
         }
 
     @classmethod

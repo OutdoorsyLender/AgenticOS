@@ -5,6 +5,9 @@ description = "AgenticOS Phase Zero — synthetic hostile-worker + sandbox confo
 requires-python = ">=3.12"
 # Runtime code is standard-library only. Do not add runtime dependencies here.
 
+[project.scripts]
+agenticos-demo = "agenticos.orchestration.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<9",

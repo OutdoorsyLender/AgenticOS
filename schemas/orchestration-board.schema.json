@@ -39,7 +39,7 @@
     },
     "project": {
       "type": "object", "additionalProperties": false,
-      "required": ["schema", "project_id", "goal", "baseline", "workspace", "status", "terminal_reason", "board_revision", "controller_epoch", "lease_epoch", "limits", "started_at_unix_ms", "deadline_unix_ms", "transition_sequence", "transition_digest"],
+      "required": ["schema", "project_id", "goal", "baseline", "workspace", "status", "terminal_reason", "board_revision", "controller_epoch", "lease_epoch", "limits", "started_at_unix_ms", "deadline_unix_ms", "transition_sequence", "transition_digest", "final_checkpoint_digest", "finalization_evidence_digest"],
       "properties": {
         "schema": {"const": "AOSBOARD/1"}, "project_id": {"$ref": "#/$defs/identifier"},
         "goal": {"type": "string", "minLength": 1, "maxLength": 8192},
@@ -50,7 +50,9 @@
         "board_revision": {"type": "integer", "minimum": 0}, "controller_epoch": {"type": "integer", "minimum": 1},
         "lease_epoch": {"type": "integer", "minimum": 0}, "limits": {"$ref": "#/$defs/limits"},
         "started_at_unix_ms": {"type": "integer", "minimum": 0}, "deadline_unix_ms": {"type": "integer", "minimum": 1},
-        "transition_sequence": {"type": "integer", "minimum": 0}, "transition_digest": {"$ref": "#/$defs/sha64"}
+        "transition_sequence": {"type": "integer", "minimum": 0}, "transition_digest": {"$ref": "#/$defs/sha64"},
+        "final_checkpoint_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]},
+        "finalization_evidence_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]}
       },
       "allOf": [
         {"if": {"properties": {"status": {"enum": ["CREATED", "ACTIVE"]}}}, "then": {"properties": {"terminal_reason": {"type": "null"}}}},
@@ -62,7 +64,7 @@
     },
     "task": {
       "type": "object", "additionalProperties": false,
-      "required": ["schema", "task_id", "project_id", "title", "description", "task_type", "priority", "dependencies", "acceptance_criteria", "preferred_role", "assigned_role", "status", "attempt_count", "max_attempts", "creation_sequence", "creator", "parent_task_id", "root_task_id", "generation", "workspace", "lease_epoch", "block_reason", "terminal_reason", "repair_failure_fingerprint", "satisfying_descendant_id", "verification_result_digest", "review_result_digest"],
+      "required": ["schema", "task_id", "project_id", "title", "description", "task_type", "priority", "dependencies", "acceptance_criteria", "preferred_role", "assigned_role", "status", "attempt_count", "max_attempts", "creation_sequence", "creator", "parent_task_id", "root_task_id", "generation", "workspace", "lease_epoch", "block_reason", "terminal_reason", "repair_failure_fingerprint", "satisfying_descendant_id", "verification_result_digest", "review_result_digest", "stage_result_digest", "execution_checkpoint_digest", "execution_evidence_digest"],
       "properties": {
         "schema": {"const": "AOSBOARD/1"}, "task_id": {"$ref": "#/$defs/identifier"}, "project_id": {"$ref": "#/$defs/identifier"},
         "title": {"type": "string", "minLength": 1, "maxLength": 200}, "description": {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -80,7 +82,10 @@
         "repair_failure_fingerprint": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]},
         "satisfying_descendant_id": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]},
         "verification_result_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]},
-        "review_result_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]}
+        "review_result_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]},
+        "stage_result_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]},
+        "execution_checkpoint_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]},
+        "execution_evidence_digest": {"anyOf": [{"$ref": "#/$defs/sha64"}, {"type": "null"}]}
       },
       "allOf": [
         {"if": {"properties": {"status": {"enum": ["BACKLOG", "READY", "IN_PROGRESS", "VERIFYING", "REVIEW", "WAITING_REPAIR"]}}}, "then": {"properties": {"terminal_reason": {"type": "null"}, "block_reason": {"type": "null"}}}},
