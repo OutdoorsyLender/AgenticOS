@@ -12,7 +12,9 @@ import stat
 from pathlib import Path
 import signal
 import subprocess
+import tempfile
 import threading
+import time
 
 import pytest
 
@@ -1966,6 +1968,20 @@ class _RecordingInput:
         self.closed = True
 
 
+class _StaticCaptureStream:
+    def __init__(self, payload: bytes) -> None:
+        self._stream = tempfile.TemporaryFile()
+        self._stream.write(payload)
+        self._stream.flush()
+        self._stream.seek(0)
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def close(self) -> None:
+        self._stream.close()
+
+
 class _ScriptedProcess:
     def __init__(
         self,
@@ -1973,12 +1989,25 @@ class _ScriptedProcess:
         *,
         stderr: object | None = None,
         returncode: int | None = None,
+        retain_capture_source: bool = False,
     ) -> None:
         self.pid = 4242
         self.stdin = _RecordingInput()
-        self.stdout = stdout
-        self.stderr = io.BytesIO() if stderr is None else stderr
+        self.stdout = (
+            _StaticCaptureStream(stdout.getvalue())
+            if isinstance(stdout, io.BytesIO)
+            else stdout
+        )
+        stderr = io.BytesIO() if stderr is None else stderr
+        self.stderr = (
+            _StaticCaptureStream(stderr.getvalue())
+            if isinstance(stderr, io.BytesIO)
+            else stderr
+        )
         self.returncode = returncode
+        self.retain_capture_source = retain_capture_source
+        self.frozen = False
+        self.controller_signals: list[int] = []
 
     def poll(self) -> int | None:
         return self.returncode
@@ -1986,54 +2015,20 @@ class _ScriptedProcess:
 
 class _LinesThenBlock:
     def __init__(self, lines: bytes) -> None:
-        self._lines = io.BytesIO(lines)
-        self._released = threading.Event()
+        read_descriptor, self._write_descriptor = os.pipe()
+        self._reader = os.fdopen(read_descriptor, "rb", buffering=0)
+        os.write(self._write_descriptor, lines)
 
-    def readline(self, limit: int = -1) -> bytes:
-        line = self._lines.readline(limit)
-        if line:
-            return line
-        self._released.wait(5)
-        return b""
+    def fileno(self) -> int:
+        return self._reader.fileno()
 
     def close(self) -> None:
-        pass
+        self._reader.close()
 
     def release(self) -> None:
-        self._released.set()
-
-
-class _DelayedLines:
-    def __init__(self, lines: bytes, delay_seconds: float) -> None:
-        self._lines = io.BytesIO(lines)
-        self._delay_seconds = delay_seconds
-
-    def readline(self, limit: int = -1) -> bytes:
-        line = self._lines.readline(limit)
-        if line:
-            threading.Event().wait(self._delay_seconds)
-        return line
-
-    def close(self) -> None:
-        self._lines.close()
-
-
-class _CloseSensitiveDelayedOverflow:
-    def __init__(self) -> None:
-        self._closed = False
-        self._returned = False
-
-    def read(self, _limit: int = -1) -> bytes:
-        if self._returned:
-            return b""
-        threading.Event().wait(0.1)
-        if self._closed:
-            raise ValueError("closed before bounded drain")
-        self._returned = True
-        return b"e" * 65_537
-
-    def close(self) -> None:
-        self._closed = True
+        if self._write_descriptor >= 0:
+            os.close(self._write_descriptor)
+            self._write_descriptor = -1
 
 
 def _valid_runner_census(*, descendant_count: int = 0):
@@ -2097,6 +2092,7 @@ def _run_scripted_process(
     census: object | None = None,
     census_effect: Callable[[_ScriptedProcess, list[str]], object] | None = None,
     drain_effect: Callable[[_ScriptedProcess], None] | None = None,
+    drain_is_controller: bool = False,
     drain_error: bool = False,
     monotonic: Callable[[], float] | None = None,
     timeout_seconds: float = 0.5,
@@ -2109,16 +2105,55 @@ def _run_scripted_process(
         launches.append((argv, kwargs))
         return process
 
-    def drain(observed: object) -> None:
+    def freeze(
+        observed: object,
+        _deadline: float,
+        _monotonic: Callable[[], float],
+    ) -> local_auth_runtime.LocalAuthFreezeProvenance:
+        assert observed is process
+        process.frozen = True
+        return local_auth_runtime.LocalAuthFreezeProvenance(
+            leader_pid=process.pid,
+            process_group_id=process.pid,
+            member_pids=(process.pid,),
+            controller_stop_sent=True,
+            all_members_stopped=True,
+        )
+
+    def drain(
+        observed: object,
+        frozen: local_auth_runtime.LocalAuthFreezeProvenance | None,
+    ) -> local_auth_runtime.LocalAuthDrainProvenance:
         assert observed is process
         drains.append(process.pid)
+        frozen_state_observed = (
+            frozen is not None and process.frozen and process.returncode is None
+        )
         if drain_error:
             raise RuntimeError("synthetic content-free drain failure")
         if drain_effect is not None:
             drain_effect(process)
-            return
-        if process.returncode is None:
-            process.returncode = -signal.SIGTERM
+        elif process.returncode is None:
+            process.returncode = -signal.SIGKILL
+            process.controller_signals.append(signal.SIGKILL)
+        if drain_effect is not None and drain_is_controller:
+            assert process.returncode in (-signal.SIGTERM, -signal.SIGKILL)
+            process.controller_signals.append(-process.returncode)
+        if not process.retain_capture_source:
+            release = getattr(process.stdout, "release", None)
+            if callable(release):
+                release()
+        controller_signal = (
+            process.controller_signals[-1] if process.controller_signals else None
+        )
+        return local_auth_runtime.LocalAuthDrainProvenance(
+            frozen=frozen,
+            frozen_state_observed=frozen_state_observed,
+            controller_signal=controller_signal,
+            controller_signal_sent=controller_signal is not None,
+            group_disappeared=process.returncode is not None,
+            final_returncode=process.returncode,
+        )
 
     runner_kwargs: dict[str, object] = {}
     if monotonic is not None:
@@ -2130,6 +2165,7 @@ def _run_scripted_process(
         census_sampler=lambda observed, argv: census_effect(process, argv)
         if census_effect is not None
         else (_valid_runner_census() if census is None else census),
+        freeze_process=freeze,
         drain_process=drain,
         timeout_seconds=timeout_seconds,
         **runner_kwargs,
@@ -2178,6 +2214,8 @@ def test_la_r01_runner_sends_only_initialize_then_authenticate_and_drains_once(
     assert process.stdin.flush_count == 2
     assert process.stdin.closed is True
     assert drains == [process.pid]
+    assert process.frozen is True
+    assert process.controller_signals == [signal.SIGKILL]
     assert credential._closed is True
     assert len(launches) == 1
     _argv, kwargs = launches[0]
@@ -2284,13 +2322,13 @@ def test_la_r03_runner_blocks_bounded_stderr_overflow(
     assert drains == [process.pid]
 
 
-def test_la_r03_runner_drains_delayed_stderr_before_closing_reader(
+def test_la_r03_runner_drains_stderr_before_closing_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = _ScriptedProcess(
         io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS),
-        stderr=_CloseSensitiveDelayedOverflow(),
+        stderr=io.BytesIO(b"e" * 65_537),
     )
     outcome, _credential, _launches, drains = _run_scripted_process(
         tmp_path, monkeypatch, process
@@ -2306,17 +2344,17 @@ def test_la_r01_runner_uses_one_nonresetting_timeout_and_drains(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    delayed = _DelayedLines(
-        INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS,
-        delay_seconds=0.015,
-    )
+    delayed = _LinesThenBlock(INITIALIZE_SUCCESS)
     process = _ScriptedProcess(delayed)
-    outcome, credential, launches, drains = _run_scripted_process(
-        tmp_path,
-        monkeypatch,
-        process,
-        timeout_seconds=0.02,
-    )
+    try:
+        outcome, credential, launches, drains = _run_scripted_process(
+            tmp_path,
+            monkeypatch,
+            process,
+            timeout_seconds=0.02,
+        )
+    finally:
+        delayed.release()
 
     assert outcome.protocol.qualification is QualificationState.BLOCKED
     assert outcome.reason_code == "LOCAL_AUTH_TIMEOUT"
@@ -2335,23 +2373,34 @@ def test_la_r03_stuck_reader_blocks_even_after_valid_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     blocked = _LinesThenBlock(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
-    process = _ScriptedProcess(blocked)
-    monkeypatch.setattr(
-        local_auth_runtime,
-        "LOCAL_AUTH_READER_JOIN_SECONDS",
-        0.01,
-    )
+    process = _ScriptedProcess(blocked, retain_capture_source=True)
+    threads_before = set(threading.enumerate())
+    surviving_capture_threads: list[threading.Thread] = []
+    started = time.monotonic()
     try:
         outcome, _credential, _launches, drains = _run_scripted_process(
-            tmp_path, monkeypatch, process
+            tmp_path,
+            monkeypatch,
+            process,
+            timeout_seconds=0.05,
         )
+        surviving_capture_threads = [
+            thread
+            for thread in threading.enumerate()
+            if thread not in threads_before and thread.is_alive()
+        ]
     finally:
         blocked.release()
+        for thread in surviving_capture_threads:
+            thread.join(timeout=1)
+    elapsed = time.monotonic() - started
 
     assert outcome.protocol.qualification is QualificationState.BLOCKED
     assert outcome.reason_code == "LOCAL_AUTH_CAPTURE_READER_STUCK"
     assert outcome.census.cleanup_complete is False
     assert drains == [process.pid]
+    assert surviving_capture_threads == []
+    assert elapsed < 0.5
 
 
 def test_la_r05_r07_descendant_or_cleanup_uncertainty_cannot_succeed(
@@ -2437,10 +2486,12 @@ def test_la_r07_late_exit_during_census_cannot_retain_complete(
     ("late_returncode", "expected_reason"),
     [
         (-signal.SIGSYS, "LOCAL_AUTH_NETWORK_POLICY_VIOLATION"),
+        (-signal.SIGTERM, "LOCAL_AUTH_PROCESS_CRASH"),
+        (-signal.SIGKILL, "LOCAL_AUTH_PROCESS_CRASH"),
         (9, "LOCAL_AUTH_PROCESS_CRASH"),
     ],
 )
-def test_la_r07_late_exit_during_drain_cannot_retain_complete(
+def test_la_r07_independent_signal_during_drain_cannot_retain_complete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     late_returncode: int,
@@ -2462,6 +2513,46 @@ def test_la_r07_late_exit_during_drain_cannot_retain_complete(
 
     assert outcome.protocol.qualification is QualificationState.BLOCKED
     assert outcome.reason_code == expected_reason
+    assert drains == [process.pid]
+
+
+@pytest.mark.parametrize("controller_signal", [signal.SIGTERM, signal.SIGKILL])
+def test_la_r07_only_typed_controller_signal_action_can_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    controller_signal: int,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    frozen_at_census: list[bool] = []
+
+    def census_effect(
+        observed: _ScriptedProcess,
+        _argv: list[str],
+    ) -> local_auth_runtime.LocalAuthCensus:
+        frozen_at_census.append(observed.frozen)
+        return _valid_runner_census()
+
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        census_effect=census_effect,
+        drain_effect=lambda observed: setattr(
+            observed,
+            "returncode",
+            -controller_signal,
+        ),
+        drain_is_controller=True,
+    )
+
+    assert outcome.protocol.qualification is QualificationState.COMPLETE
+    assert outcome.reason_code == "ACP_LOCAL_AUTH_SUCCESS"
+    assert outcome.census.cleanup_complete is True
+    assert process.frozen is True
+    assert frozen_at_census == [True]
+    assert process.controller_signals == [controller_signal]
     assert drains == [process.pid]
 
 
@@ -2534,6 +2625,7 @@ def test_la_r01_slow_cleanup_cannot_complete_after_absolute_deadline(
         monkeypatch,
         process,
         drain_effect=slow_drain,
+        drain_is_controller=True,
         monotonic=lambda: clock[0],
         timeout_seconds=0.5,
     )
@@ -2606,6 +2698,63 @@ def test_la_r06_content_free_artifact_census_covers_workspace_home_and_tmp(
         "synthetic temp canary\n", encoding="utf-8"
     )
     assert local_auth_runtime._count_sandbox_artifacts(sandbox) == 3
+
+
+@pytest.mark.parametrize("unexpected_kind", ["file", "directory", "symlink"])
+def test_la_r06_artifact_census_counts_every_unexpected_agents_entry(
+    tmp_path: Path,
+    unexpected_kind: str,
+) -> None:
+    sandbox = tmp_path / "sandbox-root"
+    (sandbox / "workspace").mkdir(parents=True)
+    (sandbox / "tmp").mkdir()
+    kimi_home = sandbox / "home" / "aos" / "kimi"
+    agents = kimi_home / "agents"
+    agents.mkdir(parents=True)
+    (kimi_home / "credentials").mkdir()
+    (kimi_home / "config.toml").write_text("synthetic config\n", encoding="utf-8")
+    (agents / "agent.md").write_text("synthetic agent\n", encoding="utf-8")
+    (kimi_home / "credentials" / "kimi-code.json").write_text(
+        "synthetic credential never read by production\n",
+        encoding="utf-8",
+    )
+    unexpected = agents / "state.bin"
+    if unexpected_kind == "file":
+        unexpected.write_text("synthetic state\n", encoding="utf-8")
+    elif unexpected_kind == "directory":
+        unexpected.mkdir()
+    else:
+        unexpected.symlink_to(agents / "agent.md")
+
+    assert local_auth_runtime._count_sandbox_artifacts(sandbox) == 1
+
+
+@pytest.mark.parametrize("agent_fault", ["missing", "directory", "symlink"])
+def test_la_r06_artifact_census_requires_regular_nonsymlink_agent_file(
+    tmp_path: Path,
+    agent_fault: str,
+) -> None:
+    sandbox = tmp_path / "sandbox-root"
+    (sandbox / "workspace").mkdir(parents=True)
+    (sandbox / "tmp").mkdir()
+    kimi_home = sandbox / "home" / "aos" / "kimi"
+    agents = kimi_home / "agents"
+    agents.mkdir(parents=True)
+    (kimi_home / "credentials").mkdir()
+    (kimi_home / "config.toml").write_text("synthetic config\n", encoding="utf-8")
+    (kimi_home / "credentials" / "kimi-code.json").write_text(
+        "synthetic credential never read by production\n",
+        encoding="utf-8",
+    )
+    agent = agents / "agent.md"
+    if agent_fault == "directory":
+        agent.mkdir()
+    elif agent_fault == "symlink":
+        agent.symlink_to(kimi_home / "config.toml")
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        local_auth_runtime._count_sandbox_artifacts(sandbox)
+    assert rejected.value.code == "LOCAL_AUTH_CENSUS_FAILED"
 
 
 @pytest.mark.parametrize(

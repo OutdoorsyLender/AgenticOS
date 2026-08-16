@@ -297,6 +297,91 @@ def test_descriptor_guard_rejects_a_real_inherited_descriptor() -> None:
     assert b"INHERITED_DESCRIPTOR" in completed.stderr
 
 
+def test_controller_freezes_then_kills_exact_process_group_with_typed_provenance() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={},
+        close_fds=True,
+        start_new_session=True,
+    )
+    try:
+        frozen = local_auth_runtime._freeze_local_auth_process_group(
+            process,
+            local_auth_runtime.time.monotonic() + 1.0,
+            local_auth_runtime.time.monotonic,
+        )
+        assert frozen.leader_pid == process.pid
+        assert frozen.process_group_id == process.pid
+        assert frozen.member_pids == (process.pid,)
+        assert frozen.controller_stop_sent is True
+        assert frozen.all_members_stopped is True
+
+        provenance = local_auth_runtime._drain_local_auth_process_group(
+            process,
+            frozen,
+        )
+        assert provenance.frozen == frozen
+        assert provenance.frozen_state_observed is True
+        assert provenance.controller_signal == signal.SIGKILL
+        assert provenance.controller_signal_sent is True
+        assert provenance.group_disappeared is True
+        assert provenance.final_returncode == -signal.SIGKILL
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+
+
+@pytest.mark.parametrize("independent_signal", [signal.SIGTERM, signal.SIGKILL])
+def test_independent_signal_race_cannot_become_controller_provenance(
+    independent_signal: int,
+) -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={},
+        close_fds=True,
+        start_new_session=True,
+    )
+    try:
+        frozen = local_auth_runtime._freeze_local_auth_process_group(
+            process,
+            local_auth_runtime.time.monotonic() + 1.0,
+            local_auth_runtime.time.monotonic,
+        )
+        os.killpg(process.pid, independent_signal)
+        if independent_signal == signal.SIGTERM:
+            os.killpg(process.pid, signal.SIGCONT)
+        deadline = local_auth_runtime.time.monotonic() + 1.0
+        while local_auth_runtime._process_state(process.pid) != "Z":
+            if local_auth_runtime.time.monotonic() >= deadline:
+                pytest.fail("independent signal did not terminate synthetic process")
+            local_auth_runtime.time.sleep(0.001)
+
+        provenance = local_auth_runtime._drain_local_auth_process_group(
+            process,
+            frozen,
+        )
+        assert provenance.frozen_state_observed is False
+        assert provenance.controller_signal is None
+        assert provenance.controller_signal_sent is False
+        assert provenance.group_disappeared is True
+        assert provenance.final_returncode == -independent_signal
+        assert local_auth_runtime._controller_drain_succeeded(
+            frozen,
+            provenance,
+        ) is False
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+
+
 def test_seccomp_filter_has_literal_x86_64_kill_and_checked_jump_targets() -> None:
     instructions = _no_inet_filter_instructions()
     assert instructions == (
