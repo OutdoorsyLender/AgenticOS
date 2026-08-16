@@ -110,7 +110,11 @@ class KimiLocalAuthSession:
             else "ACP_LOCAL_AUTH_SUCCESS"
         )
         self._outcome = LocalAuthProtocolOutcome(
-            QualificationState.COMPLETE,
+            (
+                QualificationState.BLOCKED
+                if credential_state is LocalCredentialState.REJECTED
+                else QualificationState.COMPLETE
+            ),
             credential_state,
             reason_code=reason_code,
         )
