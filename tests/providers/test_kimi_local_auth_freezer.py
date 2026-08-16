@@ -48,6 +48,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Protocol/freezer fixture only.  It is not packaged-runtime metadata proof.
 INITIALIZE_SUCCESS = (
     json.dumps(
         {

@@ -10,7 +10,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, Final, Iterable
+from typing import Any, Final, Iterable, cast
 
 from agenticos.orchestration.canonical import canonical_json_line
 from agenticos.orchestration.models import Role
@@ -34,6 +34,45 @@ from agenticos.orchestration.protocol import (
 MAX_ACP_FRAME_BYTES: Final = 65_536
 MAX_MODEL_OUTPUT_BYTES: Final = 262_144
 MAX_ACP_TRANSCRIPT_FRAMES: Final = 1_024
+_EXPECTED_KIMI_AGENT_INFO: Final = {
+    "name": "Kimi Code CLI",
+    "version": "0.36.1",
+}
+_EXPECTED_KIMI_AGENT_CAPABILITIES: Final = {
+    "loadSession": True,
+    "promptCapabilities": {
+        "image": True,
+        "audio": False,
+        "embeddedContext": True,
+    },
+    "sessionCapabilities": {
+        "list": {},
+        "resume": {},
+        "close": {},
+        "delete": {},
+        "fork": {},
+        "additionalDirectories": {},
+    },
+    "mcpCapabilities": {"http": True, "sse": True},
+    "auth": {"logout": {}},
+}
+_EXPECTED_KIMI_AUTH_METHOD: Final = {
+    "id": "login",
+    "type": "terminal",
+    "name": "Login with Kimi account",
+    "description": "Open the device-code login flow in a terminal.",
+    "args": ["--login"],
+    "env": {"KIMI_CODE_HOME": "/home/aos/kimi"},
+    "_meta": {
+        "terminal-auth": {
+            "type": "terminal",
+            "label": "Login with Kimi account",
+            "command": "/opt/agenticos/kimi/bin/kimi",
+            "args": ["login"],
+            "env": {"KIMI_CODE_HOME": "/home/aos/kimi"},
+        }
+    },
+}
 
 
 class KimiAcpError(ValueError):
@@ -105,32 +144,44 @@ def encode_acp_request(method: str, request_id: int, params: dict[str, object]) 
     return _encode({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
 
 
+def _exact_json_value(value: object, expected: object) -> bool:
+    if type(value) is not type(expected):
+        return False
+    if type(expected) is dict:
+        actual_dict = cast(dict[Any, Any], value)
+        expected_dict = cast(dict[Any, Any], expected)
+        return set(actual_dict) == set(expected_dict) and all(
+            _exact_json_value(actual_dict[name], expected_dict[name])
+            for name in expected_dict
+        )
+    if type(expected) is list:
+        actual_list = cast(list[Any], value)
+        expected_list = cast(list[Any], expected)
+        return len(actual_list) == len(expected_list) and all(
+            _exact_json_value(item, expected_item)
+            for item, expected_item in zip(actual_list, expected_list, strict=True)
+        )
+    return value == expected
+
+
 def validate_kimi_initialize_result(result: object) -> dict[str, object]:
     if type(result) is not dict or set(result) != {"protocolVersion", "agentCapabilities", "authMethods", "agentInfo"}:
         raise KimiAcpError("INITIALIZE_SHAPE")
-    if result["protocolVersion"] != 1:
+    if type(result["protocolVersion"]) is not int or result["protocolVersion"] != 1:
         raise KimiAcpError("WRONG_ACP_VERSION")
     info = result["agentInfo"]
-    if info != {"name": "Kimi Code CLI", "version": "0.36.1"}:
+    if not _exact_json_value(info, _EXPECTED_KIMI_AGENT_INFO):
         raise KimiAcpError("WRONG_AGENT_IDENTITY")
     methods = result["authMethods"]
     if type(methods) is not list or len(methods) != 1 or type(methods[0]) is not dict:
         raise KimiAcpError("AUTH_METHOD_SHAPE")
     method = methods[0]
-    if (
-        method.get("id") != "login"
-        or method.get("type") != "terminal"
-        or method.get("args") != ["--login"]
-        or method.get("env") != {"KIMI_CODE_HOME": "/home/aos/kimi"}
+    if not _exact_json_value(method, _EXPECTED_KIMI_AUTH_METHOD):
+        raise KimiAcpError("AUTH_METHOD_SHAPE")
+    if not _exact_json_value(
+        result["agentCapabilities"],
+        _EXPECTED_KIMI_AGENT_CAPABILITIES,
     ):
-        raise KimiAcpError("AUTH_METHOD_SHAPE")
-    meta = method.get("_meta")
-    if type(meta) is not dict:
-        raise KimiAcpError("AUTH_METHOD_SHAPE")
-    terminal = meta.get("terminal-auth")
-    if type(terminal) is not dict or terminal.get("command") != "/opt/agenticos/kimi/bin/kimi" or terminal.get("args") != ["login"] or terminal.get("env") != {"KIMI_CODE_HOME": "/home/aos/kimi"}:
-        raise KimiAcpError("AUTH_METHOD_SHAPE")
-    if type(result["agentCapabilities"]) is not dict:
         raise KimiAcpError("CAPABILITIES_SHAPE")
     return result
 

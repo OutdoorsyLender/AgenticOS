@@ -83,7 +83,7 @@ _CANONICAL_LOCAL_AUTH_LAUNCHER: Final = Path(__file__).with_name(
     "kimi_local_auth_namespace.py"
 )
 _PINNED_LOCAL_AUTH_LAUNCHER_SHA256: Final = (
-    "861c5fecbf9599e158000fb732c661e51c9592c20be55e0eef458d1d663e60db"
+    "800dbc83e1d1dc7efd127151d257025b4160ae92dfc23d13ed175f09778d15dc"
 )
 LOCAL_AUTH_SCRIPT: Final = REPO_ROOT / "scripts" / "run_kimi_local_auth.py"
 PRE_REAL_GATE: Final = (

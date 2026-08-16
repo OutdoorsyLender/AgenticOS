@@ -85,6 +85,7 @@ def _plan() -> dict[str, object]:
 
 
 def _initialize_result(*, version: str = "0.36.1") -> bytes:
+    # Protocol fixture only; the exact packaged binary is exercised natively.
     return _line(
         {
             "jsonrpc": "2.0",
@@ -185,6 +186,59 @@ def test_shared_initialize_validator_preserves_pinned_identity_checks() -> None:
     wrong_identity["agentInfo"] = {"name": "Kimi Code CLI", "version": "0.36.2"}
     with pytest.raises(KimiAcpError, match="WRONG_AGENT_IDENTITY"):
         validate_kimi_initialize_result(wrong_identity)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("boolean-protocol-version", "WRONG_ACP_VERSION"),
+        ("empty-capabilities", "CAPABILITIES_SHAPE"),
+        ("extra-capability", "CAPABILITIES_SHAPE"),
+        ("numeric-capability-boolean", "CAPABILITIES_SHAPE"),
+        ("wrong-method-name", "AUTH_METHOD_SHAPE"),
+        ("wrong-method-description", "AUTH_METHOD_SHAPE"),
+        ("extra-method-field", "AUTH_METHOD_SHAPE"),
+        ("extra-meta-field", "AUTH_METHOD_SHAPE"),
+        ("wrong-terminal-type", "AUTH_METHOD_SHAPE"),
+        ("wrong-terminal-label", "AUTH_METHOD_SHAPE"),
+        ("extra-terminal-field", "AUTH_METHOD_SHAPE"),
+    ],
+)
+def test_shared_initialize_validator_rejects_every_nonexact_contract_shape(
+    mutation: str,
+    code: str,
+) -> None:
+    result = json.loads(json.dumps(decode_acp_line(_initialize_result())["result"]))
+    method = result["authMethods"][0]
+    terminal = method["_meta"]["terminal-auth"]
+
+    if mutation == "boolean-protocol-version":
+        result["protocolVersion"] = True
+    elif mutation == "empty-capabilities":
+        result["agentCapabilities"] = {}
+    elif mutation == "extra-capability":
+        result["agentCapabilities"]["unexpected"] = {}
+    elif mutation == "numeric-capability-boolean":
+        result["agentCapabilities"]["loadSession"] = 1
+    elif mutation == "wrong-method-name":
+        method["name"] = "Different login"
+    elif mutation == "wrong-method-description":
+        method["description"] = "Different description"
+    elif mutation == "extra-method-field":
+        method["unexpected"] = None
+    elif mutation == "extra-meta-field":
+        method["_meta"]["unexpected"] = None
+    elif mutation == "wrong-terminal-type":
+        terminal["type"] = "relative"
+    elif mutation == "wrong-terminal-label":
+        terminal["label"] = "Different login"
+    elif mutation == "extra-terminal-field":
+        terminal["unexpected"] = None
+    else:  # pragma: no cover - parameter table exhaustiveness guard
+        raise AssertionError(mutation)
+
+    with pytest.raises(KimiAcpError, match=code):
+        validate_kimi_initialize_result(result)
 
 
 def test_outbound_surface_is_exact_and_contains_no_checkout_or_auth_material() -> None:

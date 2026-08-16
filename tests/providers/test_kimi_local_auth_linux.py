@@ -14,7 +14,9 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 
 import pytest
 
@@ -27,6 +29,11 @@ if os.name != "posix":  # pragma: no cover - Windows collection guard
     pytest.skip("native Linux Bubblewrap required", allow_module_level=True)
 
 import agenticos.providers.kimi_local_auth_runtime as local_auth_runtime
+from agenticos.providers.kimi_acp import (
+    decode_acp_line,
+    validate_kimi_initialize_result,
+)
+from agenticos.providers.kimi_local_auth import KimiLocalAuthSession
 from agenticos.providers.kimi_local_auth_namespace import (
     NamespaceLauncherError,
     _no_inet_filter_instructions,
@@ -40,6 +47,10 @@ from agenticos.providers.kimi_local_auth_runtime import (
     build_local_auth_bwrap_argv,
     open_validated_credential_leaf,
 )
+from agenticos.providers.kimi_policy import (
+    PINNED_EXECUTABLE_SHA256,
+    sha256_file,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +63,58 @@ QUALIFIED_BUNDLE = ROOT / "qualification" / "kimi-code" / "0.36.1"
 LAUNCHER = ROOT / "src" / "agenticos" / "providers" / "kimi_local_auth_namespace.py"
 SANDBOX_LAUNCHER = "/opt/agenticos/kimi/local_auth_namespace.py"
 SYNTHETIC_CREDENTIAL_BYTES = b'{"access_token":"synthetic-kernel-canary"}\n'
+REMEDIATED_LAUNCHER_SHA256 = (
+    "800dbc83e1d1dc7efd127151d257025b4160ae92dfc23d13ed175f09778d15dc"
+)
+EXACT_ENVIRONMENT = {
+    "HOME": "/home/aos",
+    "KIMI_CODE_HOME": "/home/aos/kimi",
+    "KIMI_CODE_NO_AUTO_UPDATE": "1",
+    "KIMI_DISABLE_CRON": "1",
+    "KIMI_DISABLE_TELEMETRY": "1",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/opt/agenticos/kimi/bin:/usr/bin",
+    "PWD": "/workspace",
+    "TMPDIR": "/tmp",
+}
+EXPECTED_AGENT_CAPABILITIES = {
+    "loadSession": True,
+    "promptCapabilities": {
+        "image": True,
+        "audio": False,
+        "embeddedContext": True,
+    },
+    "sessionCapabilities": {
+        "list": {},
+        "resume": {},
+        "close": {},
+        "delete": {},
+        "fork": {},
+        "additionalDirectories": {},
+    },
+    "mcpCapabilities": {"http": True, "sse": True},
+    "auth": {"logout": {}},
+}
+EXPECTED_AUTH_METHODS = [
+    {
+        "id": "login",
+        "type": "terminal",
+        "name": "Login with Kimi account",
+        "description": "Open the device-code login flow in a terminal.",
+        "args": ["--login"],
+        "env": {"KIMI_CODE_HOME": "/home/aos/kimi"},
+        "_meta": {
+            "terminal-auth": {
+                "type": "terminal",
+                "label": "Login with Kimi account",
+                "command": "/opt/agenticos/kimi/bin/kimi",
+                "args": ["login"],
+                "env": {"KIMI_CODE_HOME": "/home/aos/kimi"},
+            }
+        },
+    }
+]
 
 
 pytestmark = pytest.mark.skipif(
@@ -130,6 +193,310 @@ def _load_launcher_script(
         """
     )
     return loader + textwrap.dedent(body)
+
+
+def _expected_production_bwrap_argv(
+    spec: KimiLocalAuthSpec,
+    credential: CredentialLeafHandle,
+) -> list[str]:
+    argv = [
+        "/usr/bin/bwrap",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--disable-userns",
+        "--die-with-parent",
+        "--new-session",
+        "--hostname",
+        "agenticos-kimi-local-auth",
+        "--clearenv",
+        "--tmpfs",
+        "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/lib",
+        "/lib",
+        "--ro-bind",
+        "/lib64",
+        "/lib64",
+        "--dir",
+        "/opt",
+        "--dir",
+        "/opt/agenticos",
+        "--dir",
+        "/opt/agenticos/kimi",
+        "--dir",
+        "/opt/agenticos/kimi/bin",
+        "--ro-bind",
+        str(spec.executable),
+        "/opt/agenticos/kimi/bin/kimi",
+        "--ro-bind",
+        str(spec.namespace_launcher),
+        SANDBOX_LAUNCHER,
+        "--dir",
+        "/home",
+        "--dir",
+        "/home/aos",
+        "--tmpfs",
+        "/home/aos/kimi",
+        "--ro-bind",
+        str(spec.bundle / "config.toml"),
+        "/home/aos/kimi/config.toml",
+        "--ro-bind",
+        str(spec.bundle / "agents"),
+        "/home/aos/kimi/agents",
+        "--tmpfs",
+        "/home/aos/kimi/credentials",
+        "--dir",
+        "/home/aos/kimi/credentials",
+        "--ro-bind-fd",
+        str(credential.descriptor),
+        "/home/aos/kimi/credentials/kimi-code.json",
+        "--remount-ro",
+        "/home/aos/kimi/credentials",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/workspace",
+        "--chdir",
+        "/workspace",
+    ]
+    for name, value in EXACT_ENVIRONMENT.items():
+        argv.extend(("--setenv", name, value))
+    argv.extend(
+        (
+            "--",
+            "/usr/bin/python3",
+            SANDBOX_LAUNCHER,
+            str(credential.device),
+            str(credential.inode),
+        )
+    )
+    return argv
+
+
+def _read_single_frame(stream: object, timeout: float) -> bytes:
+    descriptor = stream.fileno()  # type: ignore[attr-defined]
+    deadline = time.monotonic() + timeout
+    payload = bytearray()
+    while b"\n" not in payload:
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "initialize response timed out"
+        readable, _, _ = select.select([descriptor], [], [], remaining)
+        assert readable, "initialize response timed out"
+        chunk = os.read(descriptor, 65_537 - len(payload))
+        assert chunk, "stdout closed before initialize response"
+        payload.extend(chunk)
+        assert len(payload) <= 65_536, "initialize response exceeded frame limit"
+    assert payload.count(b"\n") == 1, "multiple frames arrived for one request"
+    assert payload.endswith(b"\n"), "bytes followed the initialize frame"
+    return bytes(payload)
+
+
+def _process_tree(root_pid: int) -> set[int]:
+    pending = [root_pid]
+    observed: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in observed:
+            continue
+        observed.add(pid)
+        try:
+            children = Path(
+                f"/proc/{pid}/task/{pid}/children"
+            ).read_text(encoding="ascii")
+        except OSError:
+            continue
+        pending.extend(int(value) for value in children.split())
+        assert len(observed) + len(pending) <= 8
+    return observed
+
+
+def _kernel_status(pid: int) -> dict[str, str]:
+    admitted = {"NoNewPrivs", "Seccomp"}
+    result: dict[str, str] = {}
+    with Path(f"/proc/{pid}/status").open(encoding="ascii") as stream:
+        for line in stream:
+            name, separator, value = line.partition(":")
+            if separator and name in admitted:
+                result[name] = value.strip()
+    return result
+
+
+def _network_rows(pid: int, name: str) -> list[str]:
+    lines = Path(f"/proc/{pid}/net/{name}").read_text(
+        encoding="ascii"
+    ).splitlines()
+    return lines[1:]
+
+
+def _workload_cgroups() -> set[Path]:
+    root = Path(
+        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/"
+        f"user@{os.getuid()}.service/app.slice"
+    )
+    return set(root.glob("**/workload")) if root.is_dir() else set()
+
+
+def test_exact_pinned_binary_production_initialize_matches_strict_auth_contract(
+    tmp_path: Path,
+) -> None:
+    """Production binary proof; protocol fixtures cannot satisfy this test."""
+
+    real_state = Path(
+        "/home/brand/.local/share/agenticos/provider-state/kimi-code/0.36.1"
+    )
+    real_evidence = Path(
+        "/home/brand/.local/share/agenticos/controller-evidence/"
+        "kimi-code/0.36.1/level1-local-auth"
+    )
+    cgroups_before = _workload_cgroups()
+    temporary_path: Path | None = None
+
+    with tempfile.TemporaryDirectory(
+        prefix="aos-kimi-shape-",
+        dir=tmp_path,
+    ) as temporary:
+        temporary_path = Path(temporary).resolve()
+        assert not temporary_path.is_relative_to(real_state)
+        assert not real_state.is_relative_to(temporary_path)
+        assert not temporary_path.is_relative_to(real_evidence)
+        assert not real_evidence.is_relative_to(temporary_path)
+
+        spec = _spec(temporary_path)
+        synthetic_leaf = spec.state_root / "credentials" / "kimi-code.json"
+        synthetic_leaf.write_bytes(b"")
+        synthetic_leaf.chmod(0o600)
+        assert synthetic_leaf.stat().st_size == 0
+
+        credential = open_validated_credential_leaf(
+            spec.state_root,
+            trusted_state_root=spec.state_root,
+            expected_uid=os.getuid(),
+        )
+        process: subprocess.Popen[bytes] | None = None
+        pidfds: dict[int, int] = {}
+        try:
+            argv = build_local_auth_bwrap_argv(spec, credential)
+            assert argv == _expected_production_bwrap_argv(spec, credential)
+
+            session = KimiLocalAuthSession()
+            requests = [session.initialize_request()]
+            assert [decode_acp_line(request)["method"] for request in requests] == [
+                "initialize"
+            ]
+
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={},
+                close_fds=True,
+                pass_fds=(credential.descriptor,),
+                bufsize=0,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+            assert process.stderr is not None
+            process.stdin.write(requests[0])
+            process.stdin.flush()
+
+            frame = _read_single_frame(process.stdout, 10.0)
+            response = decode_acp_line(frame)
+            assert set(response) == {"jsonrpc", "id", "result"}
+            assert response["jsonrpc"] == "2.0"
+            assert response["id"] == 1
+            result = response["result"]
+            assert isinstance(result, dict)
+            assert result["protocolVersion"] == 1
+            assert result["agentInfo"] == {
+                "name": "Kimi Code CLI",
+                "version": "0.36.1",
+            }
+            assert result["agentCapabilities"] == EXPECTED_AGENT_CAPABILITIES
+            assert result["authMethods"] == EXPECTED_AUTH_METHODS
+            session.accept(frame)
+            assert validate_kimi_initialize_result(result) == result
+
+            assert sha256_file(PINNED_RUNTIME) == PINNED_EXECUTABLE_SHA256
+            assert sha256_file(LAUNCHER) == REMEDIATED_LAUNCHER_SHA256
+            assert len(requests) == 1
+            assert process.poll() is None
+            readable, _, _ = select.select([process.stdout], [], [], 0.2)
+            assert readable == []
+
+            deadline = time.monotonic() + 5.0
+            seccomp_pids: list[int] = []
+            observed_pids: set[int] = set()
+            while time.monotonic() < deadline:
+                observed_pids = _process_tree(process.pid)
+                seccomp_pids = []
+                for pid in observed_pids:
+                    try:
+                        status = _kernel_status(pid)
+                    except OSError:
+                        continue
+                    if status == {"NoNewPrivs": "1", "Seccomp": "2"}:
+                        seccomp_pids.append(pid)
+                if seccomp_pids:
+                    break
+                time.sleep(0.02)
+            assert len(seccomp_pids) == 1
+            provider_pid = seccomp_pids[0]
+            assert os.readlink(f"/proc/{provider_pid}/ns/net") != os.readlink(
+                "/proc/self/ns/net"
+            )
+            routes = _network_rows(provider_pid, "route")
+            assert not any(
+                len(row.split()) > 1 and row.split()[1] == "00000000"
+                for row in routes
+            )
+            for table in ("tcp", "tcp6", "udp", "udp6"):
+                assert _network_rows(provider_pid, table) == []
+
+            for pid in observed_pids:
+                try:
+                    pidfds[pid] = os.pidfd_open(pid)
+                except ProcessLookupError:
+                    pass
+            assert process.pid in pidfds
+
+            process.stdin.close()
+            process.stdin = None
+            assert process.wait(timeout=10) == 0
+            assert process.stdout.read() == b""
+            assert process.stderr.read() == b""
+            for descriptor in pidfds.values():
+                readable, _, _ = select.select([descriptor], [], [], 0)
+                assert readable == [descriptor]
+
+            assert list(spec.evidence_root.iterdir()) == []
+            assert sorted(
+                path.relative_to(spec.state_root).as_posix()
+                for path in spec.state_root.rglob("*")
+            ) == ["credentials", "credentials/kimi-code.json"]
+            assert synthetic_leaf.read_bytes() == b""
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            for descriptor in pidfds.values():
+                os.close(descriptor)
+            credential.close()
+
+    assert temporary_path is not None
+    assert not temporary_path.exists()
+    assert _workload_cgroups() == cgroups_before
 
 
 def test_native_mount_is_exact_inode_read_only_and_consumes_credential_fd(
@@ -372,7 +739,7 @@ def test_exec_guard_allows_only_exact_official_acp_vector_and_environment() -> N
     assert observed == [
         (
             "/opt/agenticos/kimi/bin/kimi",
-            ["kimi-code", "acp"],
+            ["/opt/agenticos/kimi/bin/kimi", "acp"],
             environment,
         )
     ]

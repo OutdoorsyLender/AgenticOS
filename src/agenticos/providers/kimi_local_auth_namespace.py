@@ -182,7 +182,7 @@ def exec_official_acp(
 
     if dict(environment) != _EXACT_ENVIRONMENT:
         raise NamespaceLauncherError("ACP_ENVIRONMENT_DRIFT")
-    execve(KIMI_EXECUTABLE, ["kimi-code", "acp"], dict(environment))
+    execve(KIMI_EXECUTABLE, [KIMI_EXECUTABLE, "acp"], dict(environment))
     raise NamespaceLauncherError("ACP_EXEC_RETURNED")
 
 
