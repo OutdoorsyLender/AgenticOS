@@ -96,6 +96,28 @@ CANONICAL_LOCAL_AUTH_LAUNCHER = (
 PINNED_LOCAL_AUTH_LAUNCHER_SHA256 = (
     "861c5fecbf9599e158000fb732c661e51c9592c20be55e0eef458d1d663e60db"
 )
+_BWRAP_OPTION_OPERAND_ROLES = {
+    "--unshare-user": (),
+    "--unshare-pid": (),
+    "--unshare-net": (),
+    "--unshare-ipc": (),
+    "--unshare-uts": (),
+    "--unshare-cgroup": (),
+    "--disable-userns": (),
+    "--die-with-parent": (),
+    "--new-session": (),
+    "--clearenv": (),
+    "--hostname": ("other",),
+    "--chdir": ("other",),
+    "--setenv": ("other", "other"),
+    "--proc": ("destination",),
+    "--dev": ("destination",),
+    "--ro-bind": ("source", "destination"),
+    "--dir": ("destination",),
+    "--ro-bind-fd": ("descriptor", "destination"),
+    "--remount-ro": ("destination",),
+    "--tmpfs": ("destination",),
+}
 
 
 def make_structurally_valid_synthetic_state(state_root: Path) -> Path:
@@ -113,6 +135,73 @@ def make_private_evidence_root(evidence_root: Path) -> Path:
     evidence_root.mkdir(parents=True, mode=0o700)
     evidence_root.chmod(0o700)
     return evidence_root
+
+
+def _parse_bwrap_mount_operands(argv: list[str]) -> list[tuple[str, str, str]]:
+    operands: list[tuple[str, str, str]] = []
+    index = 1
+    while index < len(argv) and argv[index] != "--":
+        option = argv[index]
+        roles = _BWRAP_OPTION_OPERAND_ROLES.get(option)
+        assert roles is not None, f"unclassified Bubblewrap option: {option}"
+        arity = len(roles)
+        values = argv[index + 1 : index + 1 + arity]
+        assert len(values) == arity, f"truncated Bubblewrap option: {option}"
+        operands.extend(
+            (option, role, value)
+            for role, value in zip(roles, values, strict=True)
+            if role != "other"
+        )
+        index += arity + 1
+    assert index < len(argv) and argv[index] == "--", (
+        "missing Bubblewrap command separator"
+    )
+    return operands
+
+
+def _normalized_mount_path(value: str | Path) -> Path:
+    path = Path(os.path.normpath(str(value)))
+    assert path.is_absolute(), f"mount path is not absolute: {value}"
+    return path
+
+
+def _path_is_at_or_below(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _assert_no_checkout_mount_exposure(
+    mount_operands: list[tuple[str, str, str]],
+    checkout_root: Path,
+    approved_sources: set[Path],
+) -> None:
+    normalized_root = _normalized_mount_path(checkout_root)
+    normalized_approved_sources = {
+        _normalized_mount_path(source) for source in approved_sources
+    }
+    mount_sources = [
+        _normalized_mount_path(value)
+        for _option, role, value in mount_operands
+        if role == "source"
+    ]
+    mount_destinations = [
+        _normalized_mount_path(value)
+        for _option, role, value in mount_operands
+        if role == "destination"
+    ]
+
+    for source in mount_sources:
+        if _path_is_at_or_below(source, normalized_root):
+            assert source in normalized_approved_sources, (
+                f"unapproved checkout mount source: {source}"
+            )
+        else:
+            assert not _path_is_at_or_below(normalized_root, source), (
+                f"checkout exposed through ancestor mount source: {source}"
+            )
+    for destination in mount_destinations:
+        assert not _path_is_at_or_below(destination, normalized_root), (
+            f"checkout destination: {destination}"
+        )
 
 
 def isolate_real_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -380,19 +469,80 @@ def test_la_n01_namespace_is_route_less_without_host_network_files(
     assert ["--chdir", "/workspace"] in [
         argv[index : index + 2] for index in range(len(argv) - 1)
     ]
-    assert "/etc" not in argv
     assert "/run" not in argv
     assert "/var" not in argv
-    joined = "\n".join(argv)
-    for forbidden in (
-        "resolv.conf",
-        "/mnt/c",
-        "/home/brand/src/AgenticOS",
-        ".git",
-        "socket",
-        "relay",
-    ):
-        assert forbidden not in joined
+    mount_operands = _parse_bwrap_mount_operands(argv)
+    _assert_no_checkout_mount_exposure(
+        mount_operands,
+        ROOT,
+        {
+            spec.namespace_launcher,
+            spec.bundle / "config.toml",
+            spec.bundle / "agents",
+        },
+    )
+    absolute_argv_paths = [
+        _normalized_mount_path(value) for value in argv if value.startswith("/")
+    ]
+    assert all(".git" not in value for value in argv)
+    assert not any(
+        _path_is_at_or_below(path, Path("/etc")) for path in absolute_argv_paths
+    )
+    assert all("resolv.conf" not in value for value in argv)
+    assert all("/mnt/c" not in value for value in argv)
+    assert all("socket" not in value.casefold() for value in argv)
+    assert all("relay" not in value.casefold() for value in argv)
+
+
+def test_la_n01_exact_canonical_launcher_source_is_not_broad_checkout_exposure() -> None:
+    checkout_root = Path("/home/brand/src/AgenticOS")
+    launcher = checkout_root / (
+        "src/agenticos/providers/kimi_local_auth_namespace.py"
+    )
+    argv = [
+        "/usr/bin/bwrap",
+        "--ro-bind",
+        str(launcher),
+        "/opt/agenticos/local-auth/kimi_local_auth_namespace.py",
+        "--",
+        "/usr/bin/python3",
+        "/opt/agenticos/local-auth/kimi_local_auth_namespace.py",
+        "1",
+        "2",
+    ]
+
+    assert str(checkout_root) in "\n".join(argv)
+    _assert_no_checkout_mount_exposure(
+        _parse_bwrap_mount_operands(argv),
+        checkout_root,
+        {launcher},
+    )
+
+    forbidden_mounts = (
+        (str(checkout_root), "/workspace/checkout", "unapproved checkout mount source"),
+        (str(checkout_root / "src"), "/workspace/src", "unapproved checkout mount source"),
+        (
+            str(checkout_root.parent),
+            "/workspace/src-parent",
+            "checkout exposed through ancestor mount source",
+        ),
+        ("/usr", str(checkout_root / "sandbox-destination"), "checkout destination"),
+    )
+    for source, destination, reason in forbidden_mounts:
+        forbidden_argv = [
+            "/usr/bin/bwrap",
+            "--ro-bind",
+            source,
+            destination,
+            "--",
+            "/usr/bin/true",
+        ]
+        with pytest.raises(AssertionError, match=reason):
+            _assert_no_checkout_mount_exposure(
+                _parse_bwrap_mount_operands(forbidden_argv),
+                checkout_root,
+                {launcher},
+            )
 
 
 def test_la_n02_argv_environment_is_exact_and_has_no_proxy(
