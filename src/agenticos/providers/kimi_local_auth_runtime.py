@@ -34,7 +34,25 @@ SANDBOX_WORKSPACE_ROOT: Final = Path("/workspace")
 _ATTEMPT_FILE: Final = "attempt.json"
 _RESULT_FILE: Final = "result.json"
 _COMMIT_ID: Final = re.compile(r"[0-9a-f]{40}\Z")
-_REASON_CODE: Final = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+_PROTOCOL_COMBINATIONS: Final = frozenset(
+    {
+        (
+            QualificationState.COMPLETE,
+            LocalCredentialState.LOADABLE,
+            "ACP_LOCAL_AUTH_SUCCESS",
+        ),
+        (
+            QualificationState.COMPLETE,
+            LocalCredentialState.REJECTED,
+            "ACP_LOCAL_AUTH_REJECTED",
+        ),
+        (
+            QualificationState.BLOCKED,
+            LocalCredentialState.BLOCKED,
+            "ACP_LOCAL_AUTH_BLOCKED",
+        ),
+    }
+)
 _COUNT_FIELDS: Final = frozenset(
     {
         "process_count",
@@ -79,6 +97,10 @@ def _is_within(path: Path, root: Path) -> bool:
     return True
 
 
+def _overlaps(left: Path, right: Path) -> bool:
+    return _is_within(left, right) or _is_within(right, left)
+
+
 def _resolve_existing(path: Path, code: str) -> Path:
     if not isinstance(path, Path) or not path.is_absolute():
         raise KimiLocalAuthRuntimeError(code)
@@ -92,9 +114,9 @@ def _reject_credential_crossover(resolved: Path) -> None:
     if resolved == REAL_PROVIDER_STATE_ROOT:
         return
     if (
-        _is_within(resolved, REAL_PROVIDER_STATE_ROOT)
-        or _is_within(resolved, REAL_EVIDENCE_ROOT)
-        or _is_within(resolved, SANDBOX_WORKSPACE_ROOT)
+        _overlaps(resolved, REAL_PROVIDER_STATE_ROOT)
+        or _overlaps(resolved, REAL_EVIDENCE_ROOT)
+        or _overlaps(resolved, SANDBOX_WORKSPACE_ROOT)
     ):
         raise KimiLocalAuthRuntimeError("SYNTHETIC_REAL_CROSSOVER")
 
@@ -103,9 +125,9 @@ def _reject_evidence_crossover(resolved: Path) -> None:
     if resolved == REAL_EVIDENCE_ROOT:
         return
     if (
-        _is_within(resolved, REAL_PROVIDER_STATE_ROOT)
-        or _is_within(resolved, REAL_EVIDENCE_ROOT)
-        or _is_within(resolved, SANDBOX_WORKSPACE_ROOT)
+        _overlaps(resolved, REAL_PROVIDER_STATE_ROOT)
+        or _overlaps(resolved, REAL_EVIDENCE_ROOT)
+        or _overlaps(resolved, SANDBOX_WORKSPACE_ROOT)
     ):
         raise KimiLocalAuthRuntimeError("SYNTHETIC_REAL_CROSSOVER")
 
@@ -377,21 +399,14 @@ def _validate_protocol(protocol: LocalAuthProtocolOutcome) -> None:
         or protocol.level2_status
         != "BLOCKED_NO_SAFE_QUALIFIED_OFFICIAL_ENTRYPOINT"
         or type(protocol.reason_code) is not str
-        or _REASON_CODE.fullmatch(protocol.reason_code) is None
     ):
         raise KimiLocalAuthRuntimeError("RESULT_PROTOCOL_FIELDS")
-    expected_reason = {
-        LocalCredentialState.LOADABLE: "ACP_LOCAL_AUTH_SUCCESS",
-        LocalCredentialState.REJECTED: "ACP_LOCAL_AUTH_REJECTED",
-    }.get(protocol.credential_state)
-    if expected_reason is not None and protocol.reason_code != expected_reason:
-        raise KimiLocalAuthRuntimeError("RESULT_REASON_CONTRADICTION")
     if (
-        protocol.credential_state is LocalCredentialState.BLOCKED
-        and protocol.reason_code
-        in {"ACP_LOCAL_AUTH_SUCCESS", "ACP_LOCAL_AUTH_REJECTED"}
-    ):
-        raise KimiLocalAuthRuntimeError("RESULT_REASON_CONTRADICTION")
+        protocol.qualification,
+        protocol.credential_state,
+        protocol.reason_code,
+    ) not in _PROTOCOL_COMBINATIONS:
+        raise KimiLocalAuthRuntimeError("RESULT_PROTOCOL_COMBINATION")
 
 
 def _validated_census(census_counts: Mapping[str, int | bool]) -> dict[str, int | bool]:
@@ -429,10 +444,16 @@ def _read_exact_claim(
             or opened.st_uid != expected_uid
             or stat.S_IMODE(opened.st_mode) != 0o600
             or opened.st_nlink != 1
+            or opened.st_size != len(expected)
         ):
             raise KimiLocalAuthRuntimeError("ATTEMPT_MARKER_INVALID")
-        observed = os.read(descriptor, len(expected) + 1)
-        if observed != expected:
+        observed = bytearray()
+        while len(observed) <= len(expected):
+            chunk = os.read(descriptor, len(expected) + 1 - len(observed))
+            if not chunk:
+                break
+            observed.extend(chunk)
+        if bytes(observed) != expected:
             raise KimiLocalAuthRuntimeError("ATTEMPT_MARKER_INVALID")
     except KimiLocalAuthRuntimeError:
         raise
@@ -469,9 +490,6 @@ def persist_typed_result(
             expected_uid=expected_uid,
         )
         result = {
-            "schema": "AOS_KIMI_LEVEL1_RESULT/1",
-            "candidate_commit": candidate_commit,
-            "pinned_executable_sha256": PINNED_EXECUTABLE_SHA256,
             "F1_KIMI_LEVEL1_LOCAL_AUTH_QUALIFICATION": protocol.qualification.value,
             "F1_KIMI_LOCAL_CREDENTIAL_STATE": protocol.credential_state.value,
             "F1_KIMI_AUTH_STATE": protocol.auth_state,
