@@ -7,6 +7,7 @@ import fcntl
 import io
 import json
 import os
+import select
 import shutil
 import stat
 from pathlib import Path
@@ -2122,6 +2123,7 @@ def _run_scripted_process(
             leader_pid=process.pid,
             process_group_id=process.pid,
             member_pids=(process.pid,),
+            task_ids=(process.pid,),
             controller_stop_sent=True,
             all_members_stopped=True,
             pending_signals_clear=freeze_pending_reason is None,
@@ -2626,6 +2628,103 @@ def test_la_r03_stream_read_error_is_typed_and_drains_once(
     assert process.stderr.closed is True
 
 
+@pytest.mark.parametrize(
+    ("fault", "expected_reason"),
+    [
+        ("select", "LOCAL_AUTH_CAPTURE_READER_FAILED"),
+        ("read", "LOCAL_AUTH_CAPTURE_READER_FAILED"),
+        ("timeout", "LOCAL_AUTH_TIMEOUT"),
+        ("eagain-deadline", "LOCAL_AUTH_TIMEOUT"),
+    ],
+)
+def test_la_r03_partial_capture_fault_latches_scrubs_and_never_reads_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    expected_reason: str,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS + b"partial")
+    )
+    stdout_fd = process.stdout.fileno()
+    original_capture = local_auth_runtime._LocalAuthCapture
+    original_select = select.select
+    original_read = os.read
+    captures: list[local_auth_runtime._LocalAuthCapture] = []
+    fault_calls = [0]
+    select_calls = [0]
+    stdout_reads = [0]
+    clock = [0.0]
+    threads_before = set(threading.enumerate())
+
+    class RecordingCapture(original_capture):
+        def __init__(self, stdout: object, stderr: object) -> None:
+            super().__init__(stdout, stderr)
+            captures.append(self)
+
+    def faulting_select(
+        descriptors: list[int],
+        writable: list[int],
+        exceptional: list[int],
+        timeout: float,
+    ) -> tuple[list[int], list[int], list[int]]:
+        select_calls[0] += 1
+        if select_calls[0] == 1:
+            return original_select(descriptors, writable, exceptional, timeout)
+        if fault == "select":
+            fault_calls[0] += 1
+            raise OSError("synthetic select failure after partial stdout")
+        if fault == "timeout":
+            fault_calls[0] += 1
+            clock[0] = 0.5
+            return list(descriptors), [], []
+        return original_select(descriptors, writable, exceptional, timeout)
+
+    def faulting_read(descriptor: int, size: int) -> bytes:
+        if descriptor == stdout_fd:
+            stdout_reads[0] += 1
+            if stdout_reads[0] == 2 and fault == "read":
+                fault_calls[0] += 1
+                raise OSError("synthetic read failure after partial stdout")
+            if stdout_reads[0] == 2 and fault == "eagain-deadline":
+                fault_calls[0] += 1
+                clock[0] = 0.5
+                raise BlockingIOError(errno.EAGAIN, "synthetic deadline EAGAIN")
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(local_auth_runtime, "_LocalAuthCapture", RecordingCapture)
+    monkeypatch.setattr(local_auth_runtime.select, "select", faulting_select)
+    monkeypatch.setattr(local_auth_runtime.os, "read", faulting_read)
+    started = time.monotonic()
+
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        monotonic=lambda: clock[0],
+        timeout_seconds=0.5,
+    )
+
+    elapsed = time.monotonic() - started
+    surviving_capture_threads = [
+        thread
+        for thread in threading.enumerate()
+        if thread not in threads_before and thread.is_alive()
+    ]
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == expected_reason
+    assert drains == [process.pid]
+    assert fault_calls == [1]
+    assert len(captures) == 1
+    assert captures[0]._error_code == expected_reason
+    assert captures[0]._stdout_buffer == bytearray()
+    assert tuple(captures[0]._frames) == ()
+    assert process.stdout.closed is True
+    assert process.stderr.closed is True
+    assert surviving_capture_threads == []
+    assert elapsed < 0.5
+
+
 def test_la_r05_r07_descendant_or_cleanup_uncertainty_cannot_succeed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2859,6 +2958,133 @@ def test_la_r07_pending_signal_status_is_strict_and_fail_closed(
     assert rejected.value.code == "LOCAL_AUTH_FREEZE_FAILED"
 
 
+def test_la_r07_task_signal_snapshot_brackets_every_task_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader_pid = 4242
+    worker_tid = 4243
+    events: list[tuple[str, int | None]] = []
+
+    def enumerate_tasks(pid: int, *, failure_code: str) -> tuple[int, ...]:
+        assert pid == leader_pid
+        assert failure_code == "LOCAL_AUTH_FREEZE_FAILED"
+        events.append(("enumerate", None))
+        return (leader_pid, worker_tid)
+
+    def task_state(
+        pid: int,
+        task_id: int,
+        *,
+        failure_code: str,
+    ) -> str:
+        assert pid == leader_pid
+        assert failure_code == "LOCAL_AUTH_FREEZE_FAILED"
+        events.append(("state", task_id))
+        return "T"
+
+    def pending(
+        pid: int,
+        *,
+        task_id: int,
+        failure_code: str,
+    ) -> tuple[bool, str | None]:
+        assert pid == leader_pid
+        assert failure_code == "LOCAL_AUTH_FREEZE_FAILED"
+        events.append(("pending", task_id))
+        return True, None
+
+    monkeypatch.setattr(local_auth_runtime, "_enumerate_task_ids", enumerate_tasks)
+    monkeypatch.setattr(local_auth_runtime, "_task_state", task_state)
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_read_pending_signal_provenance",
+        pending,
+    )
+
+    observed = local_auth_runtime._read_stable_task_signal_provenance(
+        leader_pid,
+        failure_code="LOCAL_AUTH_FREEZE_FAILED",
+    )
+
+    assert observed == ((leader_pid, worker_tid), True, True, None)
+    assert events == [
+        ("enumerate", None),
+        ("state", leader_pid),
+        ("pending", leader_pid),
+        ("state", worker_tid),
+        ("pending", worker_tid),
+        ("enumerate", None),
+    ]
+
+
+def test_la_r07_task_signal_snapshot_rejects_task_churn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader_pid = 4242
+    snapshots = iter(((leader_pid, 4243), (leader_pid,)))
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_enumerate_task_ids",
+        lambda _pid, *, failure_code: next(snapshots),
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_task_state",
+        lambda _pid, _task_id, *, failure_code: "T",
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_read_pending_signal_provenance",
+        lambda _pid, *, task_id, failure_code: (True, None),
+    )
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        local_auth_runtime._read_stable_task_signal_provenance(
+            leader_pid,
+            failure_code="LOCAL_AUTH_FREEZE_FAILED",
+        )
+    assert rejected.value.code == "LOCAL_AUTH_FREEZE_FAILED"
+
+
+def test_la_r07_task_signal_snapshot_prioritizes_sigsys_on_any_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader_pid = 4242
+    worker_tid = 4243
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_enumerate_task_ids",
+        lambda _pid, *, failure_code: (leader_pid, worker_tid),
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_task_state",
+        lambda _pid, _task_id, *, failure_code: "T",
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_read_pending_signal_provenance",
+        lambda _pid, *, task_id, failure_code: (
+            False,
+            "LOCAL_AUTH_NETWORK_POLICY_VIOLATION",
+        )
+        if task_id == worker_tid
+        else (False, "LOCAL_AUTH_PROCESS_CRASH"),
+    )
+
+    observed = local_auth_runtime._read_stable_task_signal_provenance(
+        leader_pid,
+        failure_code="LOCAL_AUTH_FREEZE_FAILED",
+    )
+
+    assert observed == (
+        (leader_pid, worker_tid),
+        True,
+        False,
+        "LOCAL_AUTH_NETWORK_POLICY_VIOLATION",
+    )
+
+
 @pytest.mark.parametrize(
     "pending_reason",
     [
@@ -3068,6 +3294,62 @@ def test_la_r06_content_free_artifact_census_covers_workspace_home_and_tmp(
         "synthetic temp canary\n", encoding="utf-8"
     )
     assert local_auth_runtime._count_sandbox_artifacts(sandbox) == 3
+
+
+@pytest.mark.parametrize("unexpected_kind", ["file", "directory", "symlink"])
+def test_la_r06_artifact_census_counts_every_home_aos_sibling_without_following(
+    tmp_path: Path,
+    unexpected_kind: str,
+) -> None:
+    sandbox = tmp_path / "sandbox-root"
+    (sandbox / "workspace").mkdir(parents=True)
+    (sandbox / "tmp").mkdir()
+    aos_home = sandbox / "home" / "aos"
+    kimi_home = aos_home / "kimi"
+    (kimi_home / "agents").mkdir(parents=True)
+    (kimi_home / "credentials").mkdir()
+    (kimi_home / "config.toml").write_text("synthetic config\n", encoding="utf-8")
+    (kimi_home / "agents" / "agent.md").write_text(
+        "synthetic agent\n", encoding="utf-8"
+    )
+    (kimi_home / "credentials" / "kimi-code.json").write_text(
+        "synthetic credential never read by production\n",
+        encoding="utf-8",
+    )
+    unexpected = aos_home / "sibling"
+    if unexpected_kind == "file":
+        unexpected.write_text("synthetic state\n", encoding="utf-8")
+    elif unexpected_kind == "directory":
+        unexpected.mkdir()
+    else:
+        unexpected.symlink_to(tmp_path / "must-not-be-followed")
+
+    assert local_auth_runtime._count_sandbox_artifacts(sandbox) == 1
+
+
+def test_la_r06_artifact_census_requires_home_aos_nonsymlink_directory(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox-root"
+    (sandbox / "workspace").mkdir(parents=True)
+    (sandbox / "tmp").mkdir()
+    real_aos_home = sandbox / "home" / "real-aos"
+    kimi_home = real_aos_home / "kimi"
+    (kimi_home / "agents").mkdir(parents=True)
+    (kimi_home / "credentials").mkdir()
+    (kimi_home / "config.toml").write_text("synthetic config\n", encoding="utf-8")
+    (kimi_home / "agents" / "agent.md").write_text(
+        "synthetic agent\n", encoding="utf-8"
+    )
+    (kimi_home / "credentials" / "kimi-code.json").write_text(
+        "synthetic credential never read by production\n",
+        encoding="utf-8",
+    )
+    (sandbox / "home" / "aos").symlink_to(real_aos_home)
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        local_auth_runtime._count_sandbox_artifacts(sandbox)
+    assert rejected.value.code == "LOCAL_AUTH_CENSUS_FAILED"
 
 
 @pytest.mark.parametrize("unexpected_kind", ["file", "directory", "symlink"])

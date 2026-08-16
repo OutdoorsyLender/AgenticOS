@@ -209,6 +209,7 @@ class LocalAuthFreezeProvenance:
     leader_pid: int
     process_group_id: int
     member_pids: tuple[int, ...]
+    task_ids: tuple[int, ...]
     controller_stop_sent: bool
     all_members_stopped: bool
     pending_signals_clear: bool
@@ -1147,15 +1148,109 @@ def _parse_pending_signal_status(
 def _read_pending_signal_provenance(
     pid: int,
     *,
+    task_id: int | None = None,
     failure_code: str,
 ) -> tuple[bool, str | None]:
+    selected_task = pid if task_id is None else task_id
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or type(selected_task) is not int
+        or selected_task <= 0
+    ):
+        raise KimiLocalAuthRuntimeError(failure_code)
     try:
-        payload = (Path("/proc") / str(pid) / "status").read_text(
-            encoding="ascii"
-        )
+        payload = (
+            Path("/proc")
+            / str(pid)
+            / "task"
+            / str(selected_task)
+            / "status"
+        ).read_text(encoding="ascii")
     except (OSError, UnicodeError) as exc:
         raise KimiLocalAuthRuntimeError(failure_code) from exc
     return _parse_pending_signal_status(payload, failure_code=failure_code)
+
+
+_TASK_ID: Final = re.compile(r"[1-9][0-9]*\Z")
+
+
+def _enumerate_task_ids(pid: int, *, failure_code: str) -> tuple[int, ...]:
+    if type(pid) is not int or pid <= 0 or type(failure_code) is not str:
+        raise KimiLocalAuthRuntimeError(failure_code)
+    try:
+        names = tuple(
+            entry.name for entry in (Path("/proc") / str(pid) / "task").iterdir()
+        )
+    except OSError as exc:
+        raise KimiLocalAuthRuntimeError(failure_code) from exc
+    if not names or any(_TASK_ID.fullmatch(name) is None for name in names):
+        raise KimiLocalAuthRuntimeError(failure_code)
+    task_ids = tuple(sorted(int(name) for name in names))
+    if pid not in task_ids or len(task_ids) != len(set(task_ids)):
+        raise KimiLocalAuthRuntimeError(failure_code)
+    return task_ids
+
+
+def _task_state(
+    pid: int,
+    task_id: int,
+    *,
+    failure_code: str,
+) -> str:
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or type(task_id) is not int
+        or task_id <= 0
+    ):
+        raise KimiLocalAuthRuntimeError(failure_code)
+    try:
+        payload = (
+            Path("/proc") / str(pid) / "task" / str(task_id) / "stat"
+        ).read_text(encoding="ascii")
+        suffix = payload.rsplit(")", 1)[1].strip().split()
+    except (OSError, UnicodeError, IndexError) as exc:
+        raise KimiLocalAuthRuntimeError(failure_code) from exc
+    if not suffix or len(suffix[0]) != 1:
+        raise KimiLocalAuthRuntimeError(failure_code)
+    return suffix[0]
+
+
+def _read_stable_task_signal_provenance(
+    pid: int,
+    *,
+    failure_code: str,
+) -> tuple[tuple[int, ...], bool, bool, str | None]:
+    before = _enumerate_task_ids(pid, failure_code=failure_code)
+    all_stopped = True
+    pending_reasons: list[str] = []
+    for task_id in before:
+        if _task_state(pid, task_id, failure_code=failure_code) not in {"T", "t"}:
+            all_stopped = False
+        clear, reason = _read_pending_signal_provenance(
+            pid,
+            task_id=task_id,
+            failure_code=failure_code,
+        )
+        if not clear:
+            if reason not in {
+                "LOCAL_AUTH_NETWORK_POLICY_VIOLATION",
+                "LOCAL_AUTH_PROCESS_CRASH",
+            }:
+                raise KimiLocalAuthRuntimeError(failure_code)
+            pending_reasons.append(reason)
+    after = _enumerate_task_ids(pid, failure_code=failure_code)
+    if before != after:
+        raise KimiLocalAuthRuntimeError(failure_code)
+    pending_reason = (
+        "LOCAL_AUTH_NETWORK_POLICY_VIOLATION"
+        if "LOCAL_AUTH_NETWORK_POLICY_VIOLATION" in pending_reasons
+        else "LOCAL_AUTH_PROCESS_CRASH"
+        if pending_reasons
+        else None
+    )
+    return before, all_stopped, pending_reason is None, pending_reason
 
 
 def _freeze_local_auth_process_group(
@@ -1181,20 +1276,25 @@ def _freeze_local_auth_process_group(
             raise KimiLocalAuthRuntimeError("LOCAL_AUTH_FREEZE_FAILED")
         try:
             members = _process_group_members(pid)
-            stopped = all(_process_state(member) in {"T", "t"} for member in members)
+            if members != (pid,):
+                raise KimiLocalAuthRuntimeError("LOCAL_AUTH_FREEZE_FAILED")
+            (
+                task_ids,
+                stopped,
+                pending_signals_clear,
+                pending_reason_code,
+            ) = _read_stable_task_signal_provenance(
+                pid,
+                failure_code="LOCAL_AUTH_FREEZE_FAILED",
+            )
         except KimiLocalAuthRuntimeError:
             raise
         if stopped:
-            pending_signals_clear, pending_reason_code = (
-                _read_pending_signal_provenance(
-                    pid,
-                    failure_code="LOCAL_AUTH_FREEZE_FAILED",
-                )
-            )
             return LocalAuthFreezeProvenance(
                 leader_pid=pid,
                 process_group_id=process_group,
                 member_pids=members,
+                task_ids=task_ids,
                 controller_stop_sent=True,
                 all_members_stopped=True,
                 pending_signals_clear=pending_signals_clear,
@@ -1230,27 +1330,24 @@ def _drain_local_auth_process_group(
     controller_signal_sent = False
     if frozen is not None:
         try:
+            (
+                task_ids,
+                all_tasks_stopped,
+                pending_signals_clear_before_kill,
+                pending_reason_code,
+            ) = _read_stable_task_signal_provenance(
+                pid,
+                failure_code="LOCAL_AUTH_CLEANUP_FAILED",
+            )
             frozen_state_observed = (
                 process.poll() is None
                 and os.getpgid(pid) == frozen.process_group_id
                 and _process_group_members(pid) == frozen.member_pids
-                and all(
-                    _process_state(member) in {"T", "t"}
-                    for member in frozen.member_pids
-                )
+                and task_ids == frozen.task_ids
+                and all_tasks_stopped
             )
         except (OSError, KimiLocalAuthRuntimeError):
             frozen_state_observed = False
-    if frozen_state_observed:
-        try:
-            (
-                pending_signals_clear_before_kill,
-                pending_reason_code,
-            ) = _read_pending_signal_provenance(
-                pid,
-                failure_code="LOCAL_AUTH_CLEANUP_FAILED",
-            )
-        except KimiLocalAuthRuntimeError:
             pending_signals_clear_before_kill = False
             pending_reason_code = "LOCAL_AUTH_CLEANUP_FAILED"
     try:
@@ -1294,6 +1391,11 @@ def _validate_freeze_provenance(
         or frozen.leader_pid != pid
         or frozen.process_group_id != pid
         or frozen.member_pids != (pid,)
+        or type(frozen.task_ids) is not tuple
+        or not frozen.task_ids
+        or frozen.task_ids != tuple(sorted(set(frozen.task_ids)))
+        or any(type(task_id) is not int or task_id <= 0 for task_id in frozen.task_ids)
+        or pid not in frozen.task_ids
         or frozen.controller_stop_sent is not True
         or frozen.all_members_stopped is not True
         or type(frozen.pending_signals_clear) is not bool
@@ -1438,10 +1540,12 @@ def _count_sandbox_artifacts(sandbox_root: Path) -> int:
 
     try:
         workspace = sandbox_root / "workspace"
-        kimi_home = sandbox_root / "home" / "aos" / "kimi"
+        aos_home = sandbox_root / "home" / "aos"
+        kimi_home = aos_home / "kimi"
         temporary = sandbox_root / "tmp"
         workspace_names = directory_names(workspace)
         temporary_names = directory_names(temporary)
+        aos_home_names = directory_names(aos_home)
         kimi_names = directory_names(kimi_home)
         expected_kimi_names = {"agents", "config.toml", "credentials"}
         if not expected_kimi_names.issubset(kimi_names):
@@ -1462,6 +1566,7 @@ def _count_sandbox_artifacts(sandbox_root: Path) -> int:
     return (
         len(workspace_names)
         + len(temporary_names)
+        + len(aos_home_names - {"kimi"})
         + len(kimi_names - expected_kimi_names)
         + len(agent_names - {"agent.md"})
         + len(credential_names - {"kimi-code.json"})
@@ -1571,11 +1676,12 @@ class _LocalAuthCapture:
         self._stderr_eof = False
         self._error_code: str | None = None
 
-    def _set_error(self, code: str) -> None:
+    def _latch_failure(self, code: str) -> _LocalAuthRunFailure:
         if self._error_code is None:
             self._error_code = code
-            self._stdout_buffer.clear()
-            self._frames.clear()
+        self._stdout_buffer.clear()
+        self._frames.clear()
+        return _LocalAuthRunFailure(self._error_code)
 
     def _consume_stdout(self, chunk: bytes) -> None:
         if self._error_code is not None:
@@ -1587,17 +1693,17 @@ class _LocalAuthCapture:
                 break
             frame_length = newline + 1
             if frame_length > LOCAL_AUTH_MAX_FRAME_BYTES:
-                self._set_error("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
+                self._latch_failure("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
                 return
             frame = bytes(self._stdout_buffer[:frame_length])
             del self._stdout_buffer[:frame_length]
             self._frame_count += 1
             if self._frame_count > LOCAL_AUTH_MAX_FRAMES:
-                self._set_error("LOCAL_AUTH_STDOUT_FRAME_COUNT")
+                self._latch_failure("LOCAL_AUTH_STDOUT_FRAME_COUNT")
                 return
             self._frames.append(frame)
         if len(self._stdout_buffer) > LOCAL_AUTH_MAX_FRAME_BYTES:
-            self._set_error("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
+            self._latch_failure("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
 
     def _read_ready(
         self,
@@ -1608,7 +1714,7 @@ class _LocalAuthCapture:
         self._raise_error()
         remaining = deadline - monotonic()
         if remaining <= 0:
-            raise _LocalAuthRunFailure("LOCAL_AUTH_TIMEOUT")
+            raise self._latch_failure("LOCAL_AUTH_TIMEOUT")
         descriptors = []
         if not self._stdout_eof:
             descriptors.append(self._stdout_fd)
@@ -1624,10 +1730,12 @@ class _LocalAuthCapture:
                 min(max(0.0, timeout_seconds), remaining),
             )
         except (OSError, ValueError) as exc:
-            raise _LocalAuthRunFailure("LOCAL_AUTH_CAPTURE_READER_FAILED") from exc
+            raise self._latch_failure(
+                "LOCAL_AUTH_CAPTURE_READER_FAILED"
+            ) from exc
         self._raise_error()
         if monotonic() >= deadline:
-            raise _LocalAuthRunFailure("LOCAL_AUTH_TIMEOUT")
+            raise self._latch_failure("LOCAL_AUTH_TIMEOUT")
         if not readable:
             return False
         progressed = False
@@ -1639,17 +1747,19 @@ class _LocalAuthCapture:
                     if descriptor not in descriptors
                     else "LOCAL_AUTH_TIMEOUT"
                 )
-                raise _LocalAuthRunFailure(code)
+                raise self._latch_failure(code)
             try:
                 chunk = os.read(descriptor, 8_192)
             except BlockingIOError:
+                if monotonic() >= deadline:
+                    raise self._latch_failure("LOCAL_AUTH_TIMEOUT")
                 continue
             except OSError as exc:
-                raise _LocalAuthRunFailure(
+                raise self._latch_failure(
                     "LOCAL_AUTH_CAPTURE_READER_FAILED"
                 ) from exc
             if monotonic() >= deadline:
-                raise _LocalAuthRunFailure("LOCAL_AUTH_TIMEOUT")
+                raise self._latch_failure("LOCAL_AUTH_TIMEOUT")
             progressed = True
             if descriptor == self._stdout_fd:
                 if chunk:
@@ -1659,7 +1769,7 @@ class _LocalAuthCapture:
             elif chunk:
                 self._stderr_bytes += len(chunk)
                 if self._stderr_bytes > LOCAL_AUTH_MAX_STDERR_BYTES:
-                    self._set_error("LOCAL_AUTH_STDERR_LIMIT")
+                    self._latch_failure("LOCAL_AUTH_STDERR_LIMIT")
             else:
                 self._stderr_eof = True
             self._raise_error()
@@ -1667,7 +1777,7 @@ class _LocalAuthCapture:
 
     def _raise_error(self) -> None:
         if self._error_code is not None:
-            raise _LocalAuthRunFailure(self._error_code)
+            raise self._latch_failure(self._error_code)
 
     def next_frame(
         self,
@@ -1678,12 +1788,12 @@ class _LocalAuthCapture:
         while True:
             self._raise_error()
             if monotonic() >= deadline:
-                raise _LocalAuthRunFailure("LOCAL_AUTH_TIMEOUT")
+                raise self._latch_failure("LOCAL_AUTH_TIMEOUT")
             if self._frames:
                 return self._frames.popleft()
             if self._stdout_eof:
                 if self._stdout_buffer:
-                    raise _LocalAuthRunFailure("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
+                    raise self._latch_failure("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
                 if getattr(process, "poll")() is not None:
                     raise _LocalAuthRunFailure(_process_exit_code(process))
                 raise _LocalAuthRunFailure("LOCAL_AUTH_STDOUT_CLOSED")
@@ -1695,7 +1805,7 @@ class _LocalAuthCapture:
                 deadline,
                 monotonic,
             ):
-                raise _LocalAuthRunFailure("LOCAL_AUTH_TIMEOUT")
+                raise self._latch_failure("LOCAL_AUTH_TIMEOUT")
 
     def drain_available(
         self,
@@ -1706,7 +1816,7 @@ class _LocalAuthCapture:
             pass
         self._raise_error()
         if self._stdout_buffer:
-            raise _LocalAuthRunFailure("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
+            raise self._latch_failure("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
         frames = tuple(self._frames)
         self._frames.clear()
         return frames
@@ -1718,7 +1828,7 @@ class _LocalAuthCapture:
     ) -> tuple[bool, tuple[bytes, ...]]:
         while not self._stdout_eof or not self._stderr_eof:
             if monotonic() >= deadline:
-                return False, ()
+                raise self._latch_failure("LOCAL_AUTH_TIMEOUT")
             try:
                 if self._read_ready(0.0, deadline, monotonic):
                     continue
@@ -1728,7 +1838,7 @@ class _LocalAuthCapture:
                 raise
             remaining = deadline - monotonic()
             if remaining <= 0:
-                return False, ()
+                raise self._latch_failure("LOCAL_AUTH_TIMEOUT")
             try:
                 if not self._read_ready(remaining, deadline, monotonic):
                     return False, ()
@@ -1738,7 +1848,7 @@ class _LocalAuthCapture:
                 raise
         self._raise_error()
         if self._stdout_buffer:
-            raise _LocalAuthRunFailure("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
+            raise self._latch_failure("LOCAL_AUTH_STDOUT_FRAME_LIMIT")
         frames = tuple(self._frames)
         self._frames.clear()
         return True, frames

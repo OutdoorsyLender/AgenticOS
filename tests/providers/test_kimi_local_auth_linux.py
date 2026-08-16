@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+import ctypes
 import errno
 import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import socket
 import subprocess
@@ -121,6 +123,63 @@ def _load_launcher_script(
         """
     )
     return loader + textwrap.dedent(body)
+
+
+def _start_multithreaded_worker() -> tuple[subprocess.Popen[bytes], int]:
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import threading
+                import time
+
+                def worker() -> None:
+                    print(threading.get_native_id(), flush=True)
+                    while True:
+                        time.sleep(60)
+
+                thread = threading.Thread(target=worker)
+                thread.start()
+                thread.join()
+                """
+            ),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={},
+        close_fds=True,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    readable, _writable, _exceptional = select.select(
+        [process.stdout],
+        [],
+        [],
+        2.0,
+    )
+    if not readable:
+        process.kill()
+        process.wait(timeout=2)
+        pytest.fail("multithreaded worker did not publish its native task ID")
+    worker_tid = int(process.stdout.readline().decode("ascii").strip())
+    return process, worker_tid
+
+
+def _tgkill(process_id: int, task_id: int, signal_number: int) -> None:
+    linux_x86_64_tgkill = 234
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.syscall(
+        linux_x86_64_tgkill,
+        process_id,
+        task_id,
+        signal_number,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
 
 
 def test_native_mount_is_exact_inode_read_only_and_consumes_credential_fd(
@@ -333,6 +392,83 @@ def test_controller_freezes_then_kills_exact_process_group_with_typed_provenance
         assert provenance.controller_signal_sent is True
         assert provenance.group_disappeared is True
         assert provenance.final_returncode == -signal.SIGKILL
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+
+
+def test_controller_freezes_and_drains_one_clean_multithreaded_process() -> None:
+    process, worker_tid = _start_multithreaded_worker()
+    try:
+        frozen = local_auth_runtime._freeze_local_auth_process_group(
+            process,
+            local_auth_runtime.time.monotonic() + 1.0,
+            local_auth_runtime.time.monotonic,
+        )
+
+        assert frozen.member_pids == (process.pid,)
+        assert frozen.task_ids == tuple(sorted((process.pid, worker_tid)))
+        assert frozen.all_members_stopped is True
+        assert frozen.pending_signals_clear is True
+
+        provenance = local_auth_runtime._drain_local_auth_process_group(
+            process,
+            frozen,
+        )
+
+        assert provenance.frozen_state_observed is True
+        assert provenance.pending_signals_clear_before_kill is True
+        assert provenance.pending_reason_code is None
+        assert provenance.final_returncode == -signal.SIGKILL
+        assert local_auth_runtime._controller_drain_succeeded(
+            frozen,
+            provenance,
+        ) is True
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("queued_signal", "expected_reason"),
+    [
+        (signal.SIGTERM, "LOCAL_AUTH_PROCESS_CRASH"),
+        (signal.SIGSYS, "LOCAL_AUTH_NETWORK_POLICY_VIOLATION"),
+    ],
+)
+def test_frozen_worker_tgkill_cannot_be_masked_by_controller_sigkill(
+    queued_signal: int,
+    expected_reason: str,
+) -> None:
+    process, worker_tid = _start_multithreaded_worker()
+    try:
+        frozen = local_auth_runtime._freeze_local_auth_process_group(
+            process,
+            local_auth_runtime.time.monotonic() + 1.0,
+            local_auth_runtime.time.monotonic,
+        )
+        assert frozen.member_pids == (process.pid,)
+        assert frozen.task_ids == tuple(sorted((process.pid, worker_tid)))
+        _tgkill(process.pid, worker_tid, queued_signal)
+
+        provenance = local_auth_runtime._drain_local_auth_process_group(
+            process,
+            frozen,
+        )
+
+        assert provenance.frozen_state_observed is True
+        assert provenance.pending_signals_clear_before_kill is False
+        assert provenance.pending_reason_code == expected_reason
+        assert provenance.controller_signal == signal.SIGKILL
+        assert provenance.controller_signal_sent is True
+        assert provenance.group_disappeared is True
+        assert provenance.final_returncode == -signal.SIGKILL
+        assert local_auth_runtime._controller_drain_succeeded(
+            frozen,
+            provenance,
+        ) is False
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
