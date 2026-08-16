@@ -93,6 +93,9 @@ QUALIFIED_BUNDLE = ROOT / "qualification" / "kimi-code" / "0.36.1"
 CANONICAL_LOCAL_AUTH_LAUNCHER = (
     ROOT / "src" / "agenticos" / "providers" / "kimi_local_auth_namespace.py"
 )
+PINNED_LOCAL_AUTH_LAUNCHER_SHA256 = (
+    "861c5fecbf9599e158000fb732c661e51c9592c20be55e0eef458d1d663e60db"
+)
 
 
 def make_structurally_valid_synthetic_state(state_root: Path) -> Path:
@@ -262,7 +265,15 @@ def test_la_c10_validated_credential_leaf_is_opath_not_read_authority(
     assert leaf.read_bytes() == before == SYNTHETIC_CREDENTIAL_BYTES
 
 
-def _local_auth_spec(tmp_path: Path) -> KimiLocalAuthSpec:
+def _local_auth_spec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> KimiLocalAuthSpec:
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_BUNDLE",
+        QUALIFIED_BUNDLE,
+    )
     state_root = make_structurally_valid_synthetic_state(tmp_path / "state")
     evidence_root = make_private_evidence_root(tmp_path / "evidence")
     return KimiLocalAuthSpec(
@@ -276,8 +287,9 @@ def _local_auth_spec(tmp_path: Path) -> KimiLocalAuthSpec:
 
 def test_la_c12_bwrap_mounts_exactly_one_credential_leaf_by_descriptor(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     leaf = spec.state_root / "credentials" / "kimi-code.json"
     credential = open_validated_credential_leaf(
         spec.state_root,
@@ -304,8 +316,9 @@ def test_la_c12_bwrap_mounts_exactly_one_credential_leaf_by_descriptor(
 
 def test_la_c13_credential_parent_is_created_then_remounted_read_only(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     credential = open_validated_credential_leaf(
         spec.state_root,
         trusted_state_root=spec.state_root,
@@ -335,8 +348,9 @@ def test_la_c13_credential_parent_is_created_then_remounted_read_only(
 
 def test_la_n01_namespace_is_route_less_without_host_network_files(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     credential = open_validated_credential_leaf(
         spec.state_root,
         trusted_state_root=spec.state_root,
@@ -388,7 +402,7 @@ def test_la_n02_argv_environment_is_exact_and_has_no_proxy(
     monkeypatch.setenv("HTTPS_PROXY", "http://ambient-proxy.invalid")
     monkeypatch.setenv("ALL_PROXY", "socks5://ambient-proxy.invalid")
     monkeypatch.setenv("KIMI_API_KEY", "ambient-secret")
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     credential = open_validated_credential_leaf(
         spec.state_root,
         trusted_state_root=spec.state_root,
@@ -422,8 +436,9 @@ def test_la_n02_argv_environment_is_exact_and_has_no_proxy(
 
 def test_la_n03_argv_launcher_receives_only_device_and_inode_metadata(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     credential = open_validated_credential_leaf(
         spec.state_root,
         trusted_state_root=spec.state_root,
@@ -470,8 +485,9 @@ def test_la_n04_default_argv_spec_names_fixed_qualified_and_external_roots() -> 
 
 def test_la_c14_launch_vector_directly_revalidates_qualified_artifacts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     credential = open_validated_credential_leaf(
         spec.state_root,
         trusted_state_root=spec.state_root,
@@ -503,17 +519,23 @@ def test_la_c14_launch_vector_directly_revalidates_qualified_artifacts(
 )
 def test_la_c14_pin_revalidation_rejects_every_qualified_bundle_drift(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     relative: str,
     expected: str,
     replacement: str,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     drifted_bundle = tmp_path / "drifted-qualification"
     shutil.copytree(QUALIFIED_BUNDLE, drifted_bundle)
     target = drifted_bundle / relative
     source = target.read_text(encoding="utf-8")
     assert expected in source
     target.write_text(source.replace(expected, replacement, 1), encoding="utf-8")
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_BUNDLE",
+        drifted_bundle,
+    )
     drifted = replace(spec, bundle=drifted_bundle)
     credential = open_validated_credential_leaf(
         spec.state_root,
@@ -531,10 +553,16 @@ def test_la_c14_pin_revalidation_rejects_every_qualified_bundle_drift(
 
 def test_la_c14_pin_revalidation_runs_for_every_vector_construction(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     mutable_bundle = tmp_path / "mutable-qualification"
     shutil.copytree(QUALIFIED_BUNDLE, mutable_bundle)
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_BUNDLE",
+        mutable_bundle,
+    )
     candidate = replace(spec, bundle=mutable_bundle)
     credential = open_validated_credential_leaf(
         spec.state_root,
@@ -561,9 +589,10 @@ def test_la_c14_pin_revalidation_runs_for_every_vector_construction(
 @pytest.mark.parametrize("substitution", ["file", "symlink"])
 def test_la_c14_pin_revalidation_rejects_executable_substitution(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     substitution: str,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     executable = tmp_path / "substituted-kimi"
     if substitution == "symlink":
         executable.symlink_to(PINNED_RUNTIME)
@@ -585,8 +614,11 @@ def test_la_c14_pin_revalidation_rejects_executable_substitution(
         credential.close()
 
 
-def test_la_c14_pin_revalidation_rejects_bundle_symlink(tmp_path: Path) -> None:
-    spec = _local_auth_spec(tmp_path)
+def test_la_c14_pin_revalidation_rejects_bundle_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     bundle_link = tmp_path / "qualification-link"
     bundle_link.symlink_to(QUALIFIED_BUNDLE, target_is_directory=True)
     candidate = replace(spec, bundle=bundle_link)
@@ -608,7 +640,7 @@ def test_la_c14_pin_revalidation_rejects_bwrap_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     drifted_bwrap = tmp_path / "bwrap"
     drifted_bwrap.write_bytes(b"synthetic bwrap never invoked")
     drifted_bwrap.chmod(0o755)
@@ -627,12 +659,114 @@ def test_la_c14_pin_revalidation_rejects_bwrap_drift(
         credential.close()
 
 
+def test_la_c14_byte_valid_copied_executable_is_not_canonical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path, monkeypatch)
+    executable_copy = tmp_path / "kimi-copy"
+    shutil.copyfile(PINNED_RUNTIME, executable_copy)
+    executable_copy.chmod(0o555)
+    passively_verified = kimi_runtime.build_runtime_spec(
+        executable_copy,
+        spec.bundle,
+    )
+    assert passively_verified.executable == executable_copy
+    candidate = replace(spec, executable=executable_copy)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError,
+            match="LOCAL_AUTH_ARTIFACT_SUBSTITUTION",
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+def test_la_c14_byte_valid_copied_bundle_is_not_canonical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path, monkeypatch)
+    bundle_copy = tmp_path / "qualification-copy"
+    shutil.copytree(QUALIFIED_BUNDLE, bundle_copy)
+    passively_verified = kimi_runtime.build_runtime_spec(
+        spec.executable,
+        bundle_copy,
+    )
+    assert passively_verified.bundle == bundle_copy
+    candidate = replace(spec, bundle=bundle_copy)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError,
+            match="LOCAL_AUTH_ARTIFACT_SUBSTITUTION",
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+def test_la_c14_vector_consumes_passive_verifier_returned_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path, monkeypatch)
+    verified_bundle = tmp_path / "verifier-returned-qualification"
+    shutil.copytree(QUALIFIED_BUNDLE, verified_bundle)
+    verified = kimi_runtime.KimiRuntimeSpec(
+        executable=PINNED_RUNTIME,
+        bundle=verified_bundle,
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_BUNDLE",
+        verified_bundle,
+    )
+    def return_verified_runtime(
+        executable: Path,
+        bundle: Path,
+    ) -> kimi_runtime.KimiRuntimeSpec:
+        assert executable == PINNED_RUNTIME
+        assert bundle == QUALIFIED_BUNDLE
+        return verified
+
+    monkeypatch.setattr(
+        kimi_runtime,
+        "build_runtime_spec",
+        return_verified_runtime,
+    )
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        argv = build_local_auth_bwrap_argv(spec, credential)
+    finally:
+        credential.close()
+    assert str(verified_bundle / "config.toml") in argv
+    assert str(verified_bundle / "agents") in argv
+    assert str(QUALIFIED_BUNDLE / "config.toml") not in argv
+    assert str(QUALIFIED_BUNDLE / "agents") not in argv
+
+
 @pytest.mark.parametrize("substitution", ["file", "symlink"])
 def test_la_c14_launcher_path_substitution_is_forbidden(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     substitution: str,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     launcher = tmp_path / "substituted-launcher.py"
     if substitution == "symlink":
         launcher.symlink_to(CANONICAL_LOCAL_AUTH_LAUNCHER)
@@ -654,13 +788,190 @@ def test_la_c14_launcher_path_substitution_is_forbidden(
         credential.close()
 
 
+def test_la_c14_canonical_launcher_symlink_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path, monkeypatch)
+    target = tmp_path / "launcher-target.py"
+    shutil.copyfile(CANONICAL_LOCAL_AUTH_LAUNCHER, target)
+    target.chmod(0o644)
+    launcher = tmp_path / "canonical-launcher.py"
+    launcher.symlink_to(target)
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_LAUNCHER",
+        launcher,
+    )
+    candidate = replace(spec, namespace_launcher=launcher)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError,
+            match="LOCAL_AUTH_LAUNCHER_IDENTITY",
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+def test_la_c14_canonical_launcher_must_use_normalized_lexical_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path, monkeypatch)
+    launcher = tmp_path / "canonical-launcher.py"
+    shutil.copyfile(CANONICAL_LOCAL_AUTH_LAUNCHER, launcher)
+    launcher.chmod(0o644)
+    unused_directory = tmp_path / "unused"
+    unused_directory.mkdir()
+    nonnormalized = unused_directory / ".." / launcher.name
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_LAUNCHER",
+        nonnormalized,
+    )
+    candidate = replace(spec, namespace_launcher=nonnormalized)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError,
+            match="LOCAL_AUTH_LAUNCHER_IDENTITY",
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+def test_la_c14_canonical_launcher_hard_link_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path, monkeypatch)
+    launcher = tmp_path / "canonical-launcher.py"
+    shutil.copyfile(CANONICAL_LOCAL_AUTH_LAUNCHER, launcher)
+    launcher.chmod(0o644)
+    os.link(launcher, tmp_path / "launcher-hard-link.py")
+    assert launcher.lstat().st_nlink == 2
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_LAUNCHER",
+        launcher,
+    )
+    candidate = replace(spec, namespace_launcher=launcher)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError,
+            match="LOCAL_AUTH_LAUNCHER_IDENTITY",
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+def test_la_c14_canonical_launcher_nonregular_type_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path, monkeypatch)
+    launcher = tmp_path / "canonical-launcher.py"
+    os.mkfifo(launcher, mode=0o644)
+    assert stat.S_ISFIFO(launcher.lstat().st_mode)
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_LAUNCHER",
+        launcher,
+    )
+    def return_pinned_digest(path: Path) -> str:
+        assert path == launcher
+        return PINNED_LOCAL_AUTH_LAUNCHER_SHA256
+
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "sha256_file",
+        return_pinned_digest,
+    )
+    candidate = replace(spec, namespace_launcher=launcher)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError,
+            match="LOCAL_AUTH_LAUNCHER_IDENTITY",
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+def test_la_c14_canonical_launcher_identity_must_remain_stable_while_hashed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path, monkeypatch)
+    launcher = tmp_path / "canonical-launcher.py"
+    shutil.copyfile(CANONICAL_LOCAL_AUTH_LAUNCHER, launcher)
+    launcher.chmod(0o644)
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_LAUNCHER",
+        launcher,
+    )
+    real_sha256_file = local_auth_runtime.sha256_file
+
+    def change_identity_after_hash(path: Path) -> str:
+        digest = real_sha256_file(path)
+        info = path.stat()
+        os.utime(
+            path,
+            ns=(info.st_atime_ns, info.st_mtime_ns + 1),
+        )
+        return digest
+
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "sha256_file",
+        change_identity_after_hash,
+    )
+    candidate = replace(spec, namespace_launcher=launcher)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError,
+            match="LOCAL_AUTH_LAUNCHER_IDENTITY",
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
 @pytest.mark.parametrize("drift", ["content", "mode"])
 def test_la_c14_canonical_launcher_identity_drift_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     drift: str,
 ) -> None:
-    spec = _local_auth_spec(tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
     launcher = tmp_path / "canonical-launcher.py"
     shutil.copyfile(CANONICAL_LOCAL_AUTH_LAUNCHER, launcher)
     launcher.chmod(0o644)

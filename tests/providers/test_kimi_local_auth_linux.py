@@ -17,6 +17,7 @@ import textwrap
 
 import pytest
 
+import agenticos.providers.kimi_local_auth_runtime as local_auth_runtime
 from agenticos.providers.kimi_local_auth_namespace import (
     NamespaceLauncherError,
     _no_inet_filter_instructions,
@@ -48,6 +49,17 @@ pytestmark = pytest.mark.skipif(
     os.name != "posix" or not BWRAP.exists(),
     reason="native Linux Bubblewrap required",
 )
+
+
+@pytest.fixture(autouse=True)
+def _admit_checked_out_qualified_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_BUNDLE",
+        QUALIFIED_BUNDLE,
+    )
 
 
 def _spec(tmp_path: Path) -> KimiLocalAuthSpec:

@@ -35,6 +35,13 @@ REAL_EVIDENCE_ROOT: Final = Path(
 )
 SANDBOX_WORKSPACE_ROOT: Final = Path("/workspace")
 REPO_ROOT: Final = Path("/home/brand/src/AgenticOS")
+_CANONICAL_LOCAL_AUTH_EXECUTABLE: Final = Path(
+    "/home/brand/.local/share/agenticos/provider-qualification/"
+    "kimi-code/0.36.1/runtime/bin/kimi"
+)
+_CANONICAL_LOCAL_AUTH_BUNDLE: Final = (
+    REPO_ROOT / "qualification" / "kimi-code" / "0.36.1"
+)
 SANDBOX_LOCAL_AUTH_LAUNCHER: Final = (
     "/opt/agenticos/kimi/local_auth_namespace.py"
 )
@@ -361,12 +368,20 @@ def _verify_canonical_launcher(path: Path) -> None:
         raise KimiLocalAuthRuntimeError("LOCAL_AUTH_LAUNCHER_IDENTITY")
 
 
-def _verify_local_auth_launch_artifacts(spec: KimiLocalAuthSpec) -> None:
+def _verify_local_auth_launch_artifacts(
+    spec: KimiLocalAuthSpec,
+) -> kimi_runtime.KimiRuntimeSpec:
     try:
-        kimi_runtime.build_runtime_spec(spec.executable, spec.bundle)
+        verified = kimi_runtime.build_runtime_spec(spec.executable, spec.bundle)
     except kimi_runtime.KimiRuntimeError as exc:
         raise KimiLocalAuthRuntimeError("LOCAL_AUTH_PIN_RECHECK_FAILED") from exc
+    if (
+        verified.executable != _CANONICAL_LOCAL_AUTH_EXECUTABLE
+        or verified.bundle != _CANONICAL_LOCAL_AUTH_BUNDLE
+    ):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_ARTIFACT_SUBSTITUTION")
     _verify_canonical_launcher(spec.namespace_launcher)
+    return verified
 
 
 def build_local_auth_bwrap_argv(
@@ -377,7 +392,7 @@ def build_local_auth_bwrap_argv(
 
     if not isinstance(spec, KimiLocalAuthSpec):
         raise KimiLocalAuthRuntimeError("LOCAL_AUTH_RUNTIME_ARGUMENT")
-    _verify_local_auth_launch_artifacts(spec)
+    verified = _verify_local_auth_launch_artifacts(spec)
     _assert_launchable_credential(credential)
     argv = [
         str(kimi_runtime.BWRAP),
@@ -417,7 +432,7 @@ def build_local_auth_bwrap_argv(
         "--dir",
         "/opt/agenticos/kimi/bin",
         "--ro-bind",
-        str(spec.executable),
+        str(verified.executable),
         kimi_runtime.SANDBOX_EXECUTABLE,
         "--ro-bind",
         str(spec.namespace_launcher),
@@ -429,10 +444,10 @@ def build_local_auth_bwrap_argv(
         "--tmpfs",
         "/home/aos/kimi",
         "--ro-bind",
-        str(spec.bundle / "config.toml"),
+        str(verified.bundle / "config.toml"),
         "/home/aos/kimi/config.toml",
         "--ro-bind",
-        str(spec.bundle / "agents"),
+        str(verified.bundle / "agents"),
         "/home/aos/kimi/agents",
         "--tmpfs",
         SANDBOX_CREDENTIAL_ROOT,
@@ -466,11 +481,8 @@ def build_local_auth_bwrap_argv(
 
 def default_local_auth_spec() -> KimiLocalAuthSpec:
     return KimiLocalAuthSpec(
-        executable=Path(
-            "/home/brand/.local/share/agenticos/provider-qualification/"
-            "kimi-code/0.36.1/runtime/bin/kimi"
-        ),
-        bundle=REPO_ROOT / "qualification" / "kimi-code" / "0.36.1",
+        executable=_CANONICAL_LOCAL_AUTH_EXECUTABLE,
+        bundle=_CANONICAL_LOCAL_AUTH_BUNDLE,
         namespace_launcher=(
             REPO_ROOT
             / "src"
