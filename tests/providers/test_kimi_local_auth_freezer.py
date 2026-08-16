@@ -38,6 +38,9 @@ from agenticos.providers.kimi_local_auth_freezer import (
 from agenticos.providers import kimi_local_auth_runtime as runtime
 from agenticos.providers.kimi_local_auth_runtime import local_auth_systemd_command
 
+if os.name != "posix":  # pragma: no cover - Windows collection guard
+    pytest.skip("POSIX cgroup-freezer boundary tests", allow_module_level=True)
+
 
 pytestmark = pytest.mark.skipif(
     os.name != "posix",

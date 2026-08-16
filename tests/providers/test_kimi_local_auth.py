@@ -42,6 +42,9 @@ from agenticos.providers.kimi_local_auth_runtime import (
     persist_typed_result,
 )
 
+if os.name != "posix":  # pragma: no cover - Windows collection guard
+    pytest.skip("POSIX local-auth boundary tests", allow_module_level=True)
+
 
 pytestmark = pytest.mark.skipif(
     os.name != "posix",
