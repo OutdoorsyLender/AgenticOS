@@ -104,6 +104,15 @@ class KimiLocalAuthSession:
             credential_state = LocalCredentialState.LOADABLE
         else:
             raise KimiLocalAuthError("MALFORMED_RESPONSE")
-        self._outcome = LocalAuthProtocolOutcome(QualificationState.COMPLETE, credential_state)
+        reason_code = (
+            "ACP_LOCAL_AUTH_REJECTED"
+            if credential_state is LocalCredentialState.REJECTED
+            else "ACP_LOCAL_AUTH_SUCCESS"
+        )
+        self._outcome = LocalAuthProtocolOutcome(
+            QualificationState.COMPLETE,
+            credential_state,
+            reason_code=reason_code,
+        )
         self._terminal = True
         self._state = "FINISHED"

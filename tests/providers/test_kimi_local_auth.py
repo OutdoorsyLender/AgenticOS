@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
+import stat
+from pathlib import Path
 
 import pytest
 
+import agenticos.providers.kimi_local_auth_runtime as local_auth_runtime
 from agenticos.providers.kimi_local_auth import (
     KimiLocalAuthError,
     KimiLocalAuthSession,
+    LocalAuthProtocolOutcome,
     LocalCredentialState,
     QualificationState,
 )
+from agenticos.providers.kimi_local_auth_runtime import (
+    KimiLocalAuthRuntimeError,
+    claim_real_attempt,
+    open_validated_credential_leaf,
+    persist_typed_result,
+)
+from agenticos.providers.kimi_policy import PINNED_EXECUTABLE_SHA256
 
 
 def _line(value: object) -> bytes:
@@ -55,6 +68,36 @@ INITIALIZE_SUCCESS = _line(
         },
     }
 )
+
+CANDIDATE_COMMIT = "1111111111111111111111111111111111111111"
+SYNTHETIC_CREDENTIAL_BYTES = b'{"access_token":"synthetic-test-canary"}\n'
+
+
+def make_structurally_valid_synthetic_state(state_root: Path) -> Path:
+    credential_root = state_root / "credentials"
+    credential_root.mkdir(parents=True, mode=0o700)
+    state_root.chmod(0o700)
+    credential_root.chmod(0o700)
+    leaf = credential_root / "kimi-code.json"
+    leaf.write_bytes(SYNTHETIC_CREDENTIAL_BYTES)
+    leaf.chmod(0o600)
+    return state_root
+
+
+def make_private_evidence_root(evidence_root: Path) -> Path:
+    evidence_root.mkdir(parents=True, mode=0o700)
+    evidence_root.chmod(0o700)
+    return evidence_root
+
+
+def isolate_real_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path, Path]:
+    real_provider = tmp_path / "reserved-real-provider"
+    real_evidence = tmp_path / "reserved-real-evidence"
+    workspace = tmp_path / "reserved-workspace"
+    monkeypatch.setattr(local_auth_runtime, "REAL_PROVIDER_STATE_ROOT", real_provider)
+    monkeypatch.setattr(local_auth_runtime, "REAL_EVIDENCE_ROOT", real_evidence)
+    monkeypatch.setattr(local_auth_runtime, "SANDBOX_WORKSPACE_ROOT", workspace)
+    return real_provider, real_evidence, workspace
 
 
 def _initialized_session() -> KimiLocalAuthSession:
@@ -158,3 +201,461 @@ def test_la_p10_initialize_only_transcript_is_incomplete() -> None:
     session = _initialized_session()
     with pytest.raises(KimiLocalAuthError, match="INCOMPLETE_TRANSCRIPT"):
         session.finish()
+
+
+def test_la_c10_validated_credential_leaf_is_opath_not_read_authority(
+    tmp_path: Path,
+) -> None:
+    state_root = make_structurally_valid_synthetic_state(tmp_path / "state")
+    leaf = state_root / "credentials" / "kimi-code.json"
+    before = leaf.read_bytes()
+
+    handle = open_validated_credential_leaf(
+        state_root,
+        trusted_state_root=state_root,
+        expected_uid=os.getuid(),
+    )
+    descriptor = handle.descriptor
+    try:
+        with pytest.raises(OSError) as rejected:
+            os.read(descriptor, 1)
+        assert rejected.value.errno == errno.EBADF
+        leaf_info = leaf.lstat()
+        assert (handle.device, handle.inode) == (leaf_info.st_dev, leaf_info.st_ino)
+        assert handle.uid == os.getuid()
+        assert handle.mode == 0o600
+        assert handle.link_count == 1
+        assert not hasattr(handle, "path")
+        assert not hasattr(handle, "size")
+        assert "kimi-code.json" not in repr(handle)
+    finally:
+        handle.close()
+
+    with pytest.raises(OSError) as closed:
+        os.fstat(descriptor)
+    assert closed.value.errno == errno.EBADF
+    handle.close()
+    assert leaf.read_bytes() == before == SYNTHETIC_CREDENTIAL_BYTES
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_code"),
+    [
+        ("wrong-name", "CREDENTIAL_ENTRY_NAME"),
+        ("unknown-sibling", "CREDENTIAL_ENTRY_NAME"),
+        ("temp-sibling", "CREDENTIAL_TRANSIENT_PRESENT"),
+        ("symlink", "CREDENTIAL_ENTRY_TYPE"),
+        ("directory", "CREDENTIAL_ENTRY_TYPE"),
+        ("fifo", "CREDENTIAL_ENTRY_TYPE"),
+        ("mode", "CREDENTIAL_FILE_MODE"),
+        ("uid", "CREDENTIAL_DIRECTORY_OWNER"),
+        ("link-count", "CREDENTIAL_FILE_LINK_COUNT"),
+    ],
+)
+def test_la_c06_through_c09_invalid_credential_metadata_blocks_before_open(
+    tmp_path: Path,
+    scenario: str,
+    expected_code: str,
+) -> None:
+    state_root = make_structurally_valid_synthetic_state(tmp_path / "state")
+    credential_root = state_root / "credentials"
+    leaf = credential_root / "kimi-code.json"
+    expected_uid = os.getuid()
+
+    if scenario == "wrong-name":
+        leaf.rename(credential_root / "unexpected.json")
+    elif scenario == "unknown-sibling":
+        sibling = credential_root / "other.json"
+        sibling.write_bytes(b"synthetic sibling")
+        sibling.chmod(0o600)
+    elif scenario == "temp-sibling":
+        sibling = credential_root / "kimi-code.json.tmp.1.deadbeef"
+        sibling.write_bytes(b"synthetic transient")
+        sibling.chmod(0o600)
+    elif scenario == "symlink":
+        target = tmp_path / "synthetic-target"
+        target.write_bytes(b"synthetic target")
+        leaf.unlink()
+        leaf.symlink_to(target)
+    elif scenario == "directory":
+        leaf.unlink()
+        leaf.mkdir()
+    elif scenario == "fifo":
+        leaf.unlink()
+        os.mkfifo(leaf, mode=0o600)
+    elif scenario == "mode":
+        leaf.chmod(0o640)
+    elif scenario == "uid":
+        expected_uid += 1
+    elif scenario == "link-count":
+        os.link(leaf, tmp_path / "credential-hardlink")
+    else:  # pragma: no cover - parametrization is closed above
+        raise AssertionError(scenario)
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        open_validated_credential_leaf(
+            state_root,
+            trusted_state_root=state_root,
+            expected_uid=expected_uid,
+        )
+    assert rejected.value.code == expected_code
+
+
+def test_la_c07_symlinked_credential_ancestry_blocks(tmp_path: Path) -> None:
+    state_root = make_structurally_valid_synthetic_state(tmp_path / "real-state")
+    alias = tmp_path / "state-alias"
+    alias.symlink_to(state_root, target_is_directory=True)
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        open_validated_credential_leaf(
+            alias,
+            trusted_state_root=alias,
+            expected_uid=os.getuid(),
+        )
+    assert rejected.value.code == "CREDENTIAL_DIRECTORY_PATH"
+
+
+def test_la_c09_group_writable_owned_credential_ancestry_blocks(
+    tmp_path: Path,
+) -> None:
+    state_root = make_structurally_valid_synthetic_state(tmp_path / "state")
+    state_root.chmod(0o770)
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        open_validated_credential_leaf(
+            state_root,
+            trusted_state_root=state_root,
+            expected_uid=os.getuid(),
+        )
+    assert rejected.value.code == "CREDENTIAL_DIRECTORY_MODE"
+
+
+def test_la_c11_credential_path_replacement_after_open_blocks_and_closes_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = make_structurally_valid_synthetic_state(tmp_path / "state")
+    leaf = state_root / "credentials" / "kimi-code.json"
+    real_open = os.open
+    opened_descriptors: list[int] = []
+
+    def swap_after_open(path: os.PathLike[str] | str, flags: int, mode: int = 0o777) -> int:
+        descriptor = real_open(path, flags, mode)
+        if Path(path) == leaf:
+            opened_descriptors.append(descriptor)
+            leaf.rename(tmp_path / "opened-original")
+            leaf.write_bytes(b"replacement synthetic credential\n")
+            leaf.chmod(0o600)
+        return descriptor
+
+    monkeypatch.setattr(local_auth_runtime.os, "open", swap_after_open)
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        open_validated_credential_leaf(
+            state_root,
+            trusted_state_root=state_root,
+            expected_uid=os.getuid(),
+        )
+    assert rejected.value.code == "CREDENTIAL_INODE_CHANGED"
+    assert len(opened_descriptors) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(opened_descriptors[0])
+    assert closed.value.errno == errno.EBADF
+
+
+def test_la_e04_real_credential_root_is_allowed_but_crossovers_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_provider, real_evidence, workspace = isolate_real_roots(monkeypatch, tmp_path)
+    make_private_evidence_root(real_evidence)
+    make_private_evidence_root(workspace)
+
+    exact_real_state = make_structurally_valid_synthetic_state(real_provider)
+    handle = open_validated_credential_leaf(
+        exact_real_state,
+        trusted_state_root=exact_real_state,
+        expected_uid=os.getuid(),
+    )
+    handle.close()
+
+    crossover_roots = [
+        make_structurally_valid_synthetic_state(real_provider / "nested"),
+        make_structurally_valid_synthetic_state(real_evidence / "state"),
+        make_structurally_valid_synthetic_state(workspace / "state"),
+    ]
+    for state_root in crossover_roots:
+        with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+            open_validated_credential_leaf(
+                state_root,
+                trusted_state_root=state_root,
+                expected_uid=os.getuid(),
+            )
+        assert rejected.value.code == "SYNTHETIC_REAL_CROSSOVER"
+
+
+def test_la_e01_claim_marker_is_canonical_private_and_immutable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolate_real_roots(monkeypatch, tmp_path)
+    evidence_root = make_private_evidence_root(tmp_path / "evidence")
+
+    claim_real_attempt(
+        evidence_root,
+        candidate_commit=CANDIDATE_COMMIT,
+        expected_uid=os.getuid(),
+    )
+
+    marker = evidence_root / "attempt.json"
+    assert marker.read_bytes() == (
+        b'{"attempt":1,"candidate_commit":"1111111111111111111111111111111111111111",'
+        b'"lifecycle":"CLAIMED_BEFORE_LAUNCH","pinned_executable_sha256":'
+        b'"78c07b255e0bdc8dfe90d0cbd3204a3d862957394a08ca99c6e31144732451c7",'
+        b'"schema":"AOS_KIMI_LEVEL1_ATTEMPT/1"}\n'
+    )
+    marker_info = marker.lstat()
+    assert stat.S_ISREG(marker_info.st_mode)
+    assert stat.S_IMODE(marker_info.st_mode) == 0o600
+    assert marker_info.st_uid == os.getuid()
+    assert marker_info.st_nlink == 1
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as second:
+        claim_real_attempt(
+            evidence_root,
+            candidate_commit=CANDIDATE_COMMIT,
+            expected_uid=os.getuid(),
+        )
+    assert second.value.code == "ATTEMPT_ALREADY_CLAIMED"
+    assert marker.read_bytes().endswith(b'"schema":"AOS_KIMI_LEVEL1_ATTEMPT/1"}\n')
+
+
+def test_la_e01_group_writable_owned_evidence_ancestry_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolate_real_roots(monkeypatch, tmp_path)
+    unsafe_parent = tmp_path / "unsafe-parent"
+    evidence_root = make_private_evidence_root(unsafe_parent / "evidence")
+    unsafe_parent.chmod(0o770)
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        claim_real_attempt(
+            evidence_root,
+            candidate_commit=CANDIDATE_COMMIT,
+            expected_uid=os.getuid(),
+        )
+    assert rejected.value.code == "EVIDENCE_ROOT_MODE"
+    assert not (evidence_root / "attempt.json").exists()
+
+
+@pytest.mark.parametrize("existing_kind", ["symlink", "malformed"])
+def test_la_e01_existing_symlink_or_malformed_marker_blocks_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_kind: str,
+) -> None:
+    isolate_real_roots(monkeypatch, tmp_path)
+    evidence_root = make_private_evidence_root(tmp_path / "evidence")
+    marker = evidence_root / "attempt.json"
+    if existing_kind == "symlink":
+        target = tmp_path / "outside-marker"
+        target.write_bytes(b"outside")
+        marker.symlink_to(target)
+    else:
+        marker.write_bytes(b"{malformed")
+        marker.chmod(0o600)
+
+    before = marker.lstat()
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        claim_real_attempt(
+            evidence_root,
+            candidate_commit=CANDIDATE_COMMIT,
+            expected_uid=os.getuid(),
+        )
+    assert rejected.value.code == "ATTEMPT_ALREADY_CLAIMED"
+    after = marker.lstat()
+    assert (after.st_dev, after.st_ino, after.st_size) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+    )
+
+
+def test_la_e03_typed_evidence_contains_only_literal_allowlisted_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolate_real_roots(monkeypatch, tmp_path)
+    evidence_root = make_private_evidence_root(tmp_path / "evidence")
+    claim_real_attempt(
+        evidence_root,
+        candidate_commit=CANDIDATE_COMMIT,
+        expected_uid=os.getuid(),
+    )
+    protocol = LocalAuthProtocolOutcome(
+        qualification=QualificationState.COMPLETE,
+        credential_state=LocalCredentialState.LOADABLE,
+    )
+
+    persist_typed_result(
+        evidence_root,
+        protocol,
+        {
+            "process_count": 1,
+            "descendant_count": 0,
+            "external_endpoint_count": 0,
+            "session_artifact_count": 0,
+            "cleanup_complete": True,
+        },
+        candidate_commit=CANDIDATE_COMMIT,
+        expected_uid=os.getuid(),
+    )
+
+    result_path = evidence_root / "result.json"
+    assert json.loads(result_path.read_bytes()) == {
+        "schema": "AOS_KIMI_LEVEL1_RESULT/1",
+        "candidate_commit": "1111111111111111111111111111111111111111",
+        "pinned_executable_sha256": PINNED_EXECUTABLE_SHA256,
+        "F1_KIMI_LEVEL1_LOCAL_AUTH_QUALIFICATION": "COMPLETE",
+        "F1_KIMI_LOCAL_CREDENTIAL_STATE": "LOADABLE",
+        "F1_KIMI_AUTH_STATE": "LOCAL_ONLY",
+        "F1_KIMI_LEVEL2_NON_INFERENCE_STATUS": (
+            "BLOCKED_NO_SAFE_QUALIFIED_OFFICIAL_ENTRYPOINT"
+        ),
+        "reason_code": "ACP_LOCAL_AUTH_SUCCESS",
+        "census_counts": {
+            "process_count": 1,
+            "descendant_count": 0,
+            "external_endpoint_count": 0,
+            "session_artifact_count": 0,
+            "cleanup_complete": True,
+        },
+    }
+    result_info = result_path.lstat()
+    assert stat.S_IMODE(result_info.st_mode) == 0o600
+    assert result_info.st_uid == os.getuid()
+    assert result_info.st_nlink == 1
+    assert SYNTHETIC_CREDENTIAL_BYTES not in result_path.read_bytes()
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as second:
+        persist_typed_result(
+            evidence_root,
+            protocol,
+            {"process_count": 1, "cleanup_complete": True},
+            candidate_commit=CANDIDATE_COMMIT,
+            expected_uid=os.getuid(),
+        )
+    assert second.value.code == "RESULT_ALREADY_PERSISTED"
+
+
+@pytest.mark.parametrize(
+    "census_counts",
+    [
+        {"credential_size": 40},
+        {"credential_path": 1},
+        {"unknown_count": 0},
+        {"process_count": -1},
+        {"process_count": True},
+        {"cleanup_complete": 1},
+    ],
+)
+def test_la_e03_typed_evidence_rejects_nonallowlisted_or_untyped_census(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    census_counts: dict[str, int | bool],
+) -> None:
+    isolate_real_roots(monkeypatch, tmp_path)
+    evidence_root = make_private_evidence_root(tmp_path / "evidence")
+    claim_real_attempt(
+        evidence_root,
+        candidate_commit=CANDIDATE_COMMIT,
+        expected_uid=os.getuid(),
+    )
+    protocol = LocalAuthProtocolOutcome(
+        qualification=QualificationState.COMPLETE,
+        credential_state=LocalCredentialState.LOADABLE,
+    )
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        persist_typed_result(
+            evidence_root,
+            protocol,
+            census_counts,
+            candidate_commit=CANDIDATE_COMMIT,
+            expected_uid=os.getuid(),
+        )
+    assert rejected.value.code == "RESULT_CENSUS_FIELDS"
+    assert not (evidence_root / "result.json").exists()
+
+
+def test_la_e03_rejected_typed_evidence_has_a_rejection_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolate_real_roots(monkeypatch, tmp_path)
+    evidence_root = make_private_evidence_root(tmp_path / "evidence")
+    claim_real_attempt(
+        evidence_root,
+        candidate_commit=CANDIDATE_COMMIT,
+        expected_uid=os.getuid(),
+    )
+    session = _initialized_session()
+    session.authenticate_request()
+    session.accept(
+        _line(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {"code": -32000, "message": "synthetic rejection"},
+            }
+        )
+    )
+
+    persist_typed_result(
+        evidence_root,
+        session.finish(),
+        {"process_count": 1, "cleanup_complete": True},
+        candidate_commit=CANDIDATE_COMMIT,
+        expected_uid=os.getuid(),
+    )
+    persisted = json.loads((evidence_root / "result.json").read_bytes())
+    assert persisted["F1_KIMI_LOCAL_CREDENTIAL_STATE"] == "REJECTED"
+    assert persisted["reason_code"] == "ACP_LOCAL_AUTH_REJECTED"
+
+
+def test_la_e02_e04_evidence_root_crossovers_block_without_touching_real_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_provider, real_evidence, workspace = isolate_real_roots(monkeypatch, tmp_path)
+    make_private_evidence_root(real_provider)
+    make_private_evidence_root(real_evidence)
+    make_private_evidence_root(workspace)
+
+    claim_real_attempt(
+        real_evidence,
+        candidate_commit=CANDIDATE_COMMIT,
+        expected_uid=os.getuid(),
+    )
+    assert (real_evidence / "attempt.json").is_file()
+
+    crossover_roots = [
+        real_provider,
+        make_private_evidence_root(real_provider / "nested-evidence"),
+        make_private_evidence_root(real_evidence / "nested-evidence"),
+        workspace,
+        make_private_evidence_root(workspace / "nested-evidence"),
+    ]
+    provider_alias = tmp_path / "provider-alias"
+    provider_alias.symlink_to(real_provider, target_is_directory=True)
+    crossover_roots.append(provider_alias)
+
+    for evidence_root in crossover_roots:
+        with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+            claim_real_attempt(
+                evidence_root,
+                candidate_commit=CANDIDATE_COMMIT,
+                expected_uid=os.getuid(),
+            )
+        assert rejected.value.code == "SYNTHETIC_REAL_CROSSOVER"
