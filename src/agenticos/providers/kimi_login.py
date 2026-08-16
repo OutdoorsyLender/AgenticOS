@@ -50,6 +50,11 @@ from .kimi_login_namespace import HANDOFF_MARKER
 AUTH_HOST: Final = "auth.kimi.com"
 AUTH_PORT: Final = 443
 AUTH_PROXY: Final = "http://127.0.0.1:18080"
+QUALIFIED_RELAY_CONCURRENCY: Final = 1
+PROVIDER_OBSERVED_AUTHORIZATION_WINDOW_SECONDS: Final = 1800.0
+RELAY_IDLE_TIMEOUT_SECONDS: Final = 1800.0
+OVERALL_CEREMONY_TIMEOUT_SECONDS: Final = 1920.0
+CEREMONY_CLEANUP_RESERVE_SECONDS: Final = 12.0
 MEASURED_LOGIN_TASK_PEAK: Final = 17
 LOGIN_TASK_HEADROOM: Final = 4
 QUALIFIED_LOGIN_TASKS_MAX: Final = MEASURED_LOGIN_TASK_PEAK + LOGIN_TASK_HEADROOM
@@ -59,7 +64,6 @@ MAX_CONNECT_HEAD_BYTES: Final = 16_384
 MAX_CONNECT_HEADERS: Final = 32
 MAX_TLS_RECORD_BYTES: Final = 16_384
 MAX_RELAY_BYTES: Final = 16 * 1024 * 1024
-RELAY_TIMEOUT_SECONDS: Final = 900.0
 STAGE_TIMEOUT_SECONDS: Final = 5.0
 CONNECT_OK: Final = b"HTTP/1.1 200 Connection Established\r\n\r\n"
 CONNECT_DENIED: Final = (
@@ -86,11 +90,31 @@ class KimiLoginError(RuntimeError):
 class CredentialRootState(str, Enum):
     EMPTY = "EMPTY"
     PRESENT = "PRESENT"
+    INVALID = "INVALID"
 
 
 class AuthRelayResult(str, Enum):
     COMPLETED = "COMPLETED"
     DENIED = "DENIED"
+    FAILED = "FAILED"
+
+
+class PrimaryLoginResult(str, Enum):
+    COMPLETED = "COMPLETED"
+    LOGIN_COMMAND_FAILED = "LOGIN_COMMAND_FAILED"
+    AUTH_RELAY_FAILED = "AUTH_RELAY_FAILED"
+    OVERALL_CEREMONY_TIMEOUT = "OVERALL_CEREMONY_TIMEOUT"
+    OWNER_LOGIN_CANCELLED = "OWNER_LOGIN_CANCELLED"
+
+
+class LoginRelayResult(str, Enum):
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    INCOMPLETE = "INCOMPLETE"
+
+
+class LoginCleanupResult(str, Enum):
+    COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
 
@@ -102,6 +126,49 @@ class AuthRelayObservation:
     client_to_origin_bytes: int
     origin_to_client_bytes: int
     reason_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class LoginCleanupObservation:
+    result: LoginCleanupResult
+    reason_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LoginRunOutcome:
+    primary_login_result: PrimaryLoginResult
+    primary_reason_code: str
+    relay_result: LoginRelayResult
+    relay_reason_code: str
+    cleanup_result: LoginCleanupResult
+    cleanup_reason_codes: tuple[str, ...]
+    credential_structure_result: CredentialRootState
+    observations: tuple[AuthRelayObservation, ...]
+    blocked_hostname: str | None = None
+
+    @property
+    def top_level_error(self) -> str | None:
+        if self.primary_login_result is not PrimaryLoginResult.COMPLETED:
+            return self.primary_reason_code
+        if self.relay_result is LoginRelayResult.FAILED:
+            return "AUTH_RELAY_FAILED"
+        if self.relay_result is LoginRelayResult.INCOMPLETE:
+            return "AUTH_RELAY_INCOMPLETE"
+        if self.cleanup_result is LoginCleanupResult.FAILED:
+            return self.cleanup_reason_codes[0]
+        if self.credential_structure_result is CredentialRootState.INVALID:
+            return "CREDENTIAL_STRUCTURE_INVALID"
+        if self.credential_structure_result is CredentialRootState.EMPTY:
+            return "CREDENTIAL_STATE_ABSENT_AFTER_SUCCESS"
+        return None
+
+
+@dataclass(slots=True, eq=False)
+class _RelayConnection:
+    identifier: int
+    client: socket.socket
+    worker: threading.Thread | None = None
+    origin: socket.socket | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +346,17 @@ def validate_credential_root(
         if (credential_root / "kimi-code.json").exists()
         else CredentialRootState.EMPTY
     )
+
+
+def classify_credential_structure(
+    state_root: Path, *, expected_uid: int
+) -> CredentialRootState:
+    """Collapse every structural rejection to a content-free INVALID state."""
+
+    try:
+        return validate_credential_root(state_root, expected_uid=expected_uid)
+    except KimiLoginError:
+        return CredentialRootState.INVALID
 
 
 def open_validated_credential_root(state_root: Path, *, expected_uid: int) -> int:
@@ -843,19 +921,36 @@ def _default_origin_socket() -> socket.socket:
 def _relay_opaque(
     worker: socket.socket,
     origin: socket.socket,
+    *,
+    stop_event: threading.Event | None = None,
 ) -> tuple[int, int]:
     selector = selectors.DefaultSelector()
-    selector.register(worker, selectors.EVENT_READ, (worker, origin, "client"))
-    selector.register(origin, selectors.EVENT_READ, (origin, worker, "origin"))
     guard = OpaqueClientTlsGuard()
     client_bytes = 0
     origin_bytes = 0
-    deadline = time.monotonic() + RELAY_TIMEOUT_SECONDS
+    idle_deadline = time.monotonic() + RELAY_IDLE_TIMEOUT_SECONDS
     try:
+        if stop_event is not None and stop_event.is_set():
+            raise KimiLoginError("AUTH_RELAY_STOPPED")
+        try:
+            selector.register(worker, selectors.EVENT_READ, (worker, origin, "client"))
+            selector.register(origin, selectors.EVENT_READ, (origin, worker, "origin"))
+        except (OSError, ValueError) as exc:
+            code = (
+                "AUTH_RELAY_STOPPED"
+                if stop_event is not None and stop_event.is_set()
+                else "AUTH_RELAY_SOCKET_ERROR"
+            )
+            raise KimiLoginError(code) from exc
         while selector.get_map():
-            if time.monotonic() >= deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise KimiLoginError("AUTH_RELAY_STOPPED")
+            now = time.monotonic()
+            if now >= idle_deadline:
                 raise KimiLoginError("AUTH_RELAY_TIMEOUT")
-            events = selector.select(timeout=0.25)
+            events = selector.select(timeout=min(0.25, idle_deadline - now))
+            if stop_event is not None and stop_event.is_set():
+                raise KimiLoginError("AUTH_RELAY_STOPPED")
             for key, _ in events:
                 source, destination, direction = key.data
                 try:
@@ -881,6 +976,7 @@ def _relay_opaque(
                     raise KimiLoginError("AUTH_RELAY_BYTE_LIMIT")
                 if admitted:
                     destination.sendall(admitted)
+                    idle_deadline = time.monotonic() + RELAY_IDLE_TIMEOUT_SECONDS
     finally:
         selector.close()
     return client_bytes, origin_bytes
@@ -890,6 +986,7 @@ def handle_opaque_auth_connection(
     worker: socket.socket,
     *,
     origin_socket_factory: Callable[[], socket.socket] = _default_origin_socket,
+    stop_event: threading.Event | None = None,
 ) -> AuthRelayObservation:
     """Gate and relay one TLS connection without inspecting encrypted OAuth bytes."""
 
@@ -925,7 +1022,9 @@ def handle_opaque_auth_connection(
         validate_tls13_server_hello(server_hello)
         worker.sendall(server_hello)
         origin_bytes += len(server_hello)
-        extra_client, extra_origin = _relay_opaque(worker, origin)
+        extra_client, extra_origin = _relay_opaque(
+            worker, origin, stop_event=stop_event
+        )
         client_bytes += extra_client
         origin_bytes += extra_origin
         return AuthRelayObservation(
@@ -985,8 +1084,7 @@ class KimiAuthRelay:
         self._connection_limit = connection_limit
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._connections: set[socket.socket] = set()
-        self._workers: set[threading.Thread] = set()
+        self._connections: dict[int, _RelayConnection] = {}
         self._lock = threading.Lock()
         self.observations: list[AuthRelayObservation] = []
 
@@ -1030,17 +1128,31 @@ class KimiAuthRelay:
                 raise
             raise KimiLoginError("TASK_BUDGET_EXHAUSTED") from exc
 
-    def _serve_connection(self, connection: socket.socket) -> None:
+    def _serve_connection(self, record: _RelayConnection) -> None:
+        def tracked_origin_socket() -> socket.socket:
+            origin = self._origin_socket_factory()
+            with self._lock:
+                if self._stop.is_set():
+                    try:
+                        origin.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    origin.close()
+                    raise KimiLoginError("AUTH_RELAY_STOPPED")
+                record.origin = origin
+            return origin
+
         try:
             observation = handle_opaque_auth_connection(
-                connection, origin_socket_factory=self._origin_socket_factory
+                record.client,
+                origin_socket_factory=tracked_origin_socket,
+                stop_event=self._stop,
             )
             with self._lock:
                 self.observations.append(observation)
         finally:
             with self._lock:
-                self._connections.discard(connection)
-                self._workers.discard(threading.current_thread())
+                self._connections.pop(record.identifier, None)
 
     def _serve(self) -> None:
         accepted = 0
@@ -1057,7 +1169,10 @@ class KimiAuthRelay:
                     return
                 accepted += 1
                 with self._lock:
-                    if self._connections:
+                    if self._stop.is_set():
+                        connection.close()
+                        return
+                    if len(self._connections) >= QUALIFIED_RELAY_CONCURRENCY:
                         connection.close()
                         self.observations.append(
                             AuthRelayObservation(
@@ -1070,21 +1185,21 @@ class KimiAuthRelay:
                             )
                         )
                         continue
-                    self._connections.add(connection)
+                    record = _RelayConnection(accepted, connection)
                     worker = threading.Thread(
                         target=self._serve_connection,
-                        args=(connection,),
+                        args=(record,),
                         name=f"aos-kimi-auth-connection-{accepted}",
                         daemon=True,
                     )
-                    self._workers.add(worker)
+                    record.worker = worker
+                    self._connections[record.identifier] = record
                 try:
                     worker.start()
                 except RuntimeError as exc:
                     connection.close()
                     with self._lock:
-                        self._connections.discard(connection)
-                        self._workers.discard(worker)
+                        self._connections.pop(record.identifier, None)
                         if str(exc) == "can't start new thread":
                             self.observations.append(
                                 AuthRelayObservation(
@@ -1110,31 +1225,42 @@ class KimiAuthRelay:
             self._listener.close()
         except OSError:
             pass
+
+        def interrupt(stream: socket.socket | None) -> None:
+            if stream is None:
+                return
+            try:
+                stream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+        with self._lock:
+            records = tuple(self._connections.values())
+        for record in records:
+            interrupt(record.client)
+            interrupt(record.origin)
+
+        deadline = time.monotonic() + 2.0
         if self._thread is not None:
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
-            connections = tuple(self._connections)
-            workers = tuple(self._workers)
-        for connection in connections:
-            try:
-                connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                connection.close()
-            except OSError:
-                pass
-        for worker in workers:
-            worker.join(timeout=2)
+            records = tuple(self._connections.values())
+        for record in records:
+            interrupt(record.client)
+            interrupt(record.origin)
+        for record in records:
+            if record.worker is not None:
+                record.worker.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
-            remaining_workers = tuple(self._workers)
-            remaining_connections = tuple(self._connections)
-        if (
-            self.running
-            or any(worker.is_alive() for worker in workers)
-            or remaining_workers
-            or remaining_connections
-        ):
+            remaining = tuple(self._connections.values())
+        if self.running or any(
+            record.worker is not None and record.worker.is_alive()
+            for record in remaining
+        ) or remaining:
             raise KimiLoginError("AUTH_RELAY_DRAIN_FAILED")
 
 
@@ -1245,22 +1371,126 @@ def default_login_spec() -> KimiLoginSpec:
     )
 
 
-def cleanup_login_runtime(relay: object, process: subprocess.Popen[bytes]) -> None:
-    """Drain the credential-bearing process even when relay cleanup fails."""
+def cleanup_login_runtime(
+    relay: object, process: subprocess.Popen[bytes]
+) -> LoginCleanupObservation:
+    """Drain relay and process while preserving every content-free failure code."""
 
+    reason_codes: list[str] = []
     try:
         stop = getattr(relay, "stop")
         stop()
-    finally:
+    except KimiLoginError as exc:
+        reason_codes.append(exc.code)
+    except Exception:
+        reason_codes.append("AUTH_RELAY_CLEANUP_FAILED")
+    try:
         terminate_and_drain_process(process)
+    except KimiLoginError as exc:
+        reason_codes.append(exc.code)
+    except Exception:
+        reason_codes.append("PROCESS_DRAIN_UNEXPECTED")
+    return LoginCleanupObservation(
+        LoginCleanupResult.FAILED if reason_codes else LoginCleanupResult.COMPLETED,
+        tuple(reason_codes),
+    )
 
 
-def run_owner_login(spec: KimiLoginSpec) -> tuple[AuthRelayObservation, ...]:
+def finalize_login_outcome(
+    *,
+    primary_login_result: PrimaryLoginResult,
+    primary_reason_code: str,
+    observations: tuple[AuthRelayObservation, ...],
+    cleanup: LoginCleanupObservation,
+    credential_structure_result: CredentialRootState,
+    blocked_hostname: str | None = None,
+) -> LoginRunOutcome:
+    """Combine independent primary, relay, cleanup, and storage facts."""
+
+    if any(observation.result is not AuthRelayResult.COMPLETED for observation in observations):
+        relay_result = LoginRelayResult.FAILED
+        relay_reason_code = next(
+            observation.reason_code
+            for observation in observations
+            if observation.result is not AuthRelayResult.COMPLETED
+        )
+    elif observations and all(
+        observation.hostname == AUTH_HOST
+        and observation.destination_class == "AUTH"
+        for observation in observations
+    ):
+        relay_result = LoginRelayResult.COMPLETED
+        relay_reason_code = "COMPLETED"
+    else:
+        relay_result = LoginRelayResult.INCOMPLETE
+        relay_reason_code = "AUTH_RELAY_INCOMPLETE"
+    if blocked_hostname is None:
+        blocked_hostname = next(
+            (
+                observation.hostname
+                for observation in observations
+                if observation.hostname not in (None, AUTH_HOST)
+            ),
+            None,
+        )
+    return LoginRunOutcome(
+        primary_login_result=primary_login_result,
+        primary_reason_code=primary_reason_code,
+        relay_result=relay_result,
+        relay_reason_code=relay_reason_code,
+        cleanup_result=cleanup.result,
+        cleanup_reason_codes=cleanup.reason_codes,
+        credential_structure_result=credential_structure_result,
+        observations=observations,
+        blocked_hostname=blocked_hostname,
+    )
+
+
+def monitor_login_process(
+    process: object,
+    relay: object,
+    *,
+    overall_deadline: float,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], object] = time.sleep,
+) -> tuple[PrimaryLoginResult, str, str | None]:
+    """Observe one fixed ceremony deadline without resetting it on polling."""
+
+    while getattr(process, "poll")() is None:
+        fatal = getattr(relay, "fatal_observation")
+        if fatal is not None:
+            if fatal.hostname not in (None, AUTH_HOST):
+                return (
+                    PrimaryLoginResult.AUTH_RELAY_FAILED,
+                    "UNAUTHORIZED_HOSTNAME",
+                    fatal.hostname,
+                )
+            return PrimaryLoginResult.AUTH_RELAY_FAILED, "AUTH_RELAY_FAILED", None
+        if monotonic() >= overall_deadline:
+            return (
+                PrimaryLoginResult.OVERALL_CEREMONY_TIMEOUT,
+                "OVERALL_CEREMONY_TIMEOUT",
+                None,
+            )
+        sleep(0.1)
+    returncode = getattr(process, "returncode")
+    if returncode != 0:
+        return PrimaryLoginResult.LOGIN_COMMAND_FAILED, "LOGIN_COMMAND_FAILED", None
+    return PrimaryLoginResult.COMPLETED, "COMPLETED", None
+
+
+def run_owner_login(spec: KimiLoginSpec) -> LoginRunOutcome:
     """Run the official login with direct terminal I/O and no transcript capture."""
 
+    overall_deadline = time.monotonic() + OVERALL_CEREMONY_TIMEOUT_SECONDS
+    primary_deadline = overall_deadline - CEREMONY_CLEANUP_RESERVE_SECONDS
     parent_channel, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     process: subprocess.Popen[bytes] | None = None
     relay: KimiAuthRelay | None = None
+    cleanup = LoginCleanupObservation(LoginCleanupResult.COMPLETED, ())
+    primary_result = PrimaryLoginResult.LOGIN_COMMAND_FAILED
+    primary_reason = "LOGIN_COMMAND_FAILED"
+    blocked_hostname: str | None = None
     credential_fd = open_validated_credential_root(spec.state_root, expected_uid=os.getuid())
     try:
         argv = build_login_bwrap_argv(
@@ -1279,23 +1509,21 @@ def run_owner_login(spec: KimiLoginSpec) -> tuple[AuthRelayObservation, ...]:
             start_new_session=True,
         )
         child_channel.close()
-        parent_channel.settimeout(10)
+        parent_channel.settimeout(STAGE_TIMEOUT_SECONDS)
         try:
             listener = receive_listener_fd(parent_channel)
         except (OSError, socket.timeout) as exc:
             raise KimiLoginError("LISTENER_HANDOFF_FAILED") from exc
         relay = KimiAuthRelay(listener)
         relay.start()
-        while process.poll() is None:
-            fatal = relay.fatal_observation
-            if fatal is not None:
-                if fatal.hostname not in (None, AUTH_HOST):
-                    raise KimiLoginError("UNAUTHORIZED_HOSTNAME", fatal.hostname)
-                raise KimiLoginError("AUTH_RELAY_FAILED", fatal.reason_code)
-            time.sleep(0.1)
-        returncode = process.returncode
-    except KeyboardInterrupt as exc:
-        raise KimiLoginError("OWNER_LOGIN_CANCELLED") from exc
+        primary_result, primary_reason, blocked_hostname = monitor_login_process(
+            process,
+            relay,
+            overall_deadline=primary_deadline,
+        )
+    except KeyboardInterrupt:
+        primary_result = PrimaryLoginResult.OWNER_LOGIN_CANCELLED
+        primary_reason = "OWNER_LOGIN_CANCELLED"
     finally:
         try:
             os.close(credential_fd)
@@ -1310,22 +1538,32 @@ def run_owner_login(spec: KimiLoginSpec) -> tuple[AuthRelayObservation, ...]:
         except OSError:
             pass
         if relay is not None and process is not None:
-            cleanup_login_runtime(relay, process)
+            cleanup = cleanup_login_runtime(relay, process)
         elif process is not None:
-            terminate_and_drain_process(process)
+            reason_codes: list[str] = []
+            try:
+                terminate_and_drain_process(process)
+            except KimiLoginError as exc:
+                reason_codes.append(exc.code)
+            cleanup = LoginCleanupObservation(
+                LoginCleanupResult.FAILED
+                if reason_codes
+                else LoginCleanupResult.COMPLETED,
+                tuple(reason_codes),
+            )
     assert relay is not None
     observations = tuple(relay.observations)
-    if returncode != 0:
-        raise KimiLoginError("LOGIN_COMMAND_FAILED")
-    if not observations or any(
-        observation.result is not AuthRelayResult.COMPLETED
-        or observation.hostname != AUTH_HOST
-        or observation.destination_class != "AUTH"
-        for observation in observations
-    ):
-        raise KimiLoginError("AUTH_RELAY_INCOMPLETE")
-    validate_credential_root(spec.state_root, expected_uid=os.getuid())
-    return observations
+    credential_state = classify_credential_structure(
+        spec.state_root, expected_uid=os.getuid()
+    )
+    return finalize_login_outcome(
+        primary_login_result=primary_result,
+        primary_reason_code=primary_reason,
+        observations=observations,
+        cleanup=cleanup,
+        credential_structure_result=credential_state,
+        blocked_hostname=blocked_hostname,
+    )
 
 
 def cli_main(
@@ -1348,7 +1586,20 @@ def cli_main(
         spec = default_login_spec()
         validate_login_spec(spec, expected_uid=os.getuid())
         output("F1_KIMI_LOGIN_CEREMONY=STARTING")
-        run_owner_login(spec)
+        outcome = run_owner_login(spec)
+        output(f"PRIMARY_LOGIN_RESULT={outcome.primary_login_result.value}")
+        output(f"RELAY_RESULT={outcome.relay_result.value}:{outcome.relay_reason_code}")
+        cleanup_codes = ",".join(outcome.cleanup_reason_codes) or "COMPLETED"
+        output(f"CLEANUP_RESULT={outcome.cleanup_result.value}:{cleanup_codes}")
+        output(
+            "CREDENTIAL_STRUCTURE_RESULT="
+            f"{outcome.credential_structure_result.value}"
+        )
+        if outcome.blocked_hostname is not None:
+            output(f"F1_KIMI_LOGIN_BLOCKED_HOSTNAME={outcome.blocked_hostname}")
+        if outcome.top_level_error is not None:
+            output(f"F1_KIMI_LOGIN_CEREMONY_ERROR={outcome.top_level_error}")
+            return 2
         output("OWNER_LOGIN_COMMAND_FINISHED=YES")
         return 0
     except KimiLoginError as exc:
@@ -1364,11 +1615,22 @@ def cli_main(
 __all__ = [
     "AUTH_HOST",
     "AUTH_PORT",
+    "CEREMONY_CLEANUP_RESERVE_SECONDS",
+    "OVERALL_CEREMONY_TIMEOUT_SECONDS",
+    "PROVIDER_OBSERVED_AUTHORIZATION_WINDOW_SECONDS",
+    "QUALIFIED_RELAY_CONCURRENCY",
+    "RELAY_IDLE_TIMEOUT_SECONDS",
+    "STAGE_TIMEOUT_SECONDS",
     "LOGIN_TASK_HEADROOM",
     "MEASURED_LOGIN_TASK_PEAK",
     "QUALIFIED_LOGIN_TASKS_MAX",
     "AuthRelayResult",
     "CredentialRootState",
+    "LoginCleanupObservation",
+    "LoginCleanupResult",
+    "LoginRelayResult",
+    "LoginRunOutcome",
+    "PrimaryLoginResult",
     "KimiLoginError",
     "KimiAuthRelay",
     "KimiLoginSpec",
@@ -1376,13 +1638,16 @@ __all__ = [
     "authorize_connect_head",
     "build_login_bwrap_argv",
     "build_login_environment",
+    "classify_credential_structure",
     "cli_main",
     "cleanup_login_runtime",
     "default_login_spec",
+    "finalize_login_outcome",
     "handle_opaque_auth_connection",
     "open_validated_credential_root",
     "owner_systemd_command",
     "receive_listener_fd",
+    "monitor_login_process",
     "run_owner_login",
     "terminate_and_drain_process",
     "provision_empty_credential_root",

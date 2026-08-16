@@ -278,6 +278,121 @@ def test_relay_stop_closes_active_connection_and_drains_threads() -> None:
     peer.close()
 
 
+def test_relay_stop_interrupts_both_sides_of_opaque_connection() -> None:
+    """The incident regression must close the origin before joining its worker."""
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    origin_peers: list[socket.socket] = []
+    origin_ready = threading.Event()
+
+    def origin_factory() -> socket.socket:
+        origin, peer = socket.socketpair()
+        origin_peers.append(peer)
+        origin_ready.set()
+        return origin
+
+    relay = KimiAuthRelay(listener, origin_socket_factory=origin_factory)
+    relay.start()
+    client = socket.create_connection(listener.getsockname(), timeout=1)
+    client.sendall(_connect_head("auth.kimi.com:443"))
+    assert client.recv(128) == b"HTTP/1.1 200 Connection Established\r\n\r\n"
+    hello = chgen.make_client_hello(b"auth.kimi.com", tls13=True)
+    client.sendall(hello)
+    assert origin_ready.wait(timeout=2)
+    origin_peer = origin_peers[0]
+    assert origin_peer.recv(len(hello)) == hello
+    server_hello = _server_hello()
+    origin_peer.sendall(server_hello)
+    assert client.recv(len(server_hello)) == server_hello
+
+    relay.stop()
+
+    assert relay.running is False
+    assert relay.active_connection_count == 0
+    assert origin_peer.recv(1) == b""
+    client.close()
+    origin_peer.close()
+
+
+def test_relay_idle_deadline_resets_only_after_admitted_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Useful TLS records may extend idle time beyond the old absolute deadline."""
+
+    monkeypatch.setattr(
+        kimi_login_module, "RELAY_TIMEOUT_SECONDS", 0.15, raising=False
+    )
+    monkeypatch.setattr(
+        kimi_login_module, "RELAY_IDLE_TIMEOUT_SECONDS", 0.15, raising=False
+    )
+    worker, client = socket.socketpair()
+    origin, provider = socket.socketpair()
+    outcome: list[object] = []
+    relay_thread = threading.Thread(
+        target=lambda: outcome.append(kimi_login_module._relay_opaque(worker, origin)),
+        daemon=True,
+    )
+    relay_thread.start()
+    first = _tls_record(23, b"first")
+    second = _tls_record(23, b"second")
+    client.sendall(first)
+    assert provider.recv(len(first)) == first
+    time.sleep(0.1)
+    provider.sendall(first)
+    assert client.recv(len(first)) == first
+    time.sleep(0.1)
+    client.sendall(second)
+    assert provider.recv(len(second)) == second
+    client.shutdown(socket.SHUT_WR)
+    provider.shutdown(socket.SHUT_WR)
+    relay_thread.join(timeout=2)
+    assert outcome == [(len(first) + len(second), len(first))]
+    client.close()
+    provider.close()
+
+
+def test_relay_idle_deadline_fails_closed_without_admitted_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A silent post-handshake peer must hit the finite relay idle deadline."""
+
+    monkeypatch.setattr(kimi_login_module, "RELAY_IDLE_TIMEOUT_SECONDS", 0.05)
+    worker, client = socket.socketpair()
+    origin, provider = socket.socketpair()
+    outcome: list[object] = []
+
+    def run() -> None:
+        try:
+            kimi_login_module._relay_opaque(worker, origin)
+        except KimiLoginError as exc:
+            outcome.append(exc.code)
+
+    relay_thread = threading.Thread(target=run, daemon=True)
+    relay_thread.start()
+    relay_thread.join(timeout=1)
+    assert outcome == ["AUTH_RELAY_TIMEOUT"]
+    client.close()
+    provider.close()
+
+
+def test_approved_login_timeout_model_is_exact_and_finite() -> None:
+    """Transport timing must cover the observed provider window without infinity."""
+
+    assert kimi_login_module.STAGE_TIMEOUT_SECONDS == 5.0
+    assert kimi_login_module.PROVIDER_OBSERVED_AUTHORIZATION_WINDOW_SECONDS == 1800.0
+    assert kimi_login_module.RELAY_IDLE_TIMEOUT_SECONDS == 1800.0
+    assert kimi_login_module.OVERALL_CEREMONY_TIMEOUT_SECONDS == 1920.0
+    assert kimi_login_module.CEREMONY_CLEANUP_RESERVE_SECONDS == 12.0
+    assert (
+        kimi_login_module.OVERALL_CEREMONY_TIMEOUT_SECONDS
+        - kimi_login_module.CEREMONY_CLEANUP_RESERVE_SECONDS
+        >= kimi_login_module.PROVIDER_OBSERVED_AUTHORIZATION_WINDOW_SECONDS
+    )
+
+
 def test_resolver_thread_exhaustion_becomes_typed_relay_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -349,6 +464,115 @@ def test_relay_connection_thread_exhaustion_is_observed_and_drained(
     finally:
         peer.close()
         relay.stop()
+
+
+def test_relay_concurrency_remains_exactly_one_and_overlap_is_denied() -> None:
+    """A second active auth connection must remain outside qualified authority."""
+
+    assert kimi_login_module.QUALIFIED_RELAY_CONCURRENCY == 1
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    relay = KimiAuthRelay(listener)
+    relay.start()
+    first = socket.create_connection(listener.getsockname(), timeout=1)
+    first.sendall(b"CONNECT auth.kimi.com:443 HTTP/1.1\r\n")
+    deadline = time.monotonic() + 2
+    while relay.active_connection_count != 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    second = socket.create_connection(listener.getsockname(), timeout=1)
+    second.sendall(_connect_head("auth.kimi.com:443"))
+    try:
+        denied_bytes = second.recv(128)
+    except (ConnectionResetError, BrokenPipeError):
+        denied_bytes = b""
+    assert denied_bytes == b""
+    deadline = time.monotonic() + 2
+    while relay.fatal_observation is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert relay.fatal_observation is not None
+    assert relay.fatal_observation.reason_code == "CONCURRENT_CONNECTION_DENIED"
+    first.close()
+    second.close()
+    relay.stop()
+
+
+def test_relay_allows_two_fully_closed_connections_only_sequentially() -> None:
+    """Fresh polling connections may follow completion, never overlap it."""
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    origin_peers: list[socket.socket] = []
+
+    def origin_factory() -> socket.socket:
+        origin, peer = socket.socketpair()
+        origin_peers.append(peer)
+        return origin
+
+    relay = KimiAuthRelay(listener, origin_socket_factory=origin_factory)
+    relay.start()
+    for sequence in range(2):
+        client = socket.create_connection(listener.getsockname(), timeout=1)
+        client.sendall(_connect_head("auth.kimi.com:443"))
+        assert client.recv(128).startswith(b"HTTP/1.1 200")
+        hello = chgen.make_client_hello(b"auth.kimi.com", tls13=True)
+        client.sendall(hello)
+        deadline = time.monotonic() + 2
+        while len(origin_peers) <= sequence and time.monotonic() < deadline:
+            time.sleep(0.01)
+        provider = origin_peers[sequence]
+        assert provider.recv(len(hello)) == hello
+        server_hello = _server_hello()
+        provider.sendall(server_hello)
+        assert client.recv(len(server_hello)) == server_hello
+        poll = _tls_record(23, f"poll-{sequence}".encode("ascii"))
+        client.sendall(poll)
+        assert provider.recv(len(poll)) == poll
+        provider.sendall(poll)
+        assert client.recv(len(poll)) == poll
+        client.shutdown(socket.SHUT_WR)
+        provider.shutdown(socket.SHUT_WR)
+        deadline = time.monotonic() + 2
+        while len(relay.observations) <= sequence and time.monotonic() < deadline:
+            time.sleep(0.01)
+        client.close()
+        provider.close()
+        assert relay.active_connection_count == 0
+    assert [item.result for item in relay.observations] == [
+        AuthRelayResult.COMPLETED,
+        AuthRelayResult.COMPLETED,
+    ]
+    relay.stop()
+
+
+def test_opaque_relay_preserves_client_and_server_half_close() -> None:
+    """One side may finish sending while receiving the other side's final record."""
+
+    worker, client = socket.socketpair()
+    origin, provider = socket.socketpair()
+    outcome: list[object] = []
+    relay_thread = threading.Thread(
+        target=lambda: outcome.append(kimi_login_module._relay_opaque(worker, origin)),
+        daemon=True,
+    )
+    relay_thread.start()
+    request = _tls_record(23, b"final-poll")
+    response = _tls_record(23, b"final-response")
+    client.sendall(request)
+    client.shutdown(socket.SHUT_WR)
+    assert provider.recv(len(request)) == request
+    assert provider.recv(1) == b""
+    provider.sendall(response)
+    provider.shutdown(socket.SHUT_WR)
+    assert client.recv(len(response)) == response
+    assert client.recv(1) == b""
+    relay_thread.join(timeout=2)
+    assert outcome == [(len(request), len(response))]
+    client.close()
+    provider.close()
 
 
 @pytest.mark.parametrize(
@@ -909,12 +1133,292 @@ def test_cleanup_drains_process_even_when_relay_cleanup_reports_failure() -> Non
         stderr=subprocess.DEVNULL,
         close_fds=True,
     )
-    with pytest.raises(KimiLoginError) as rejected:
-        cleanup_login_runtime(BrokenRelay(), process)
-    assert rejected.value.code == "SYNTHETIC_RELAY_STOP_FAILURE"
+    cleanup = cleanup_login_runtime(BrokenRelay(), process)
+    assert cleanup.result is kimi_login_module.LoginCleanupResult.FAILED
+    assert cleanup.reason_codes == ("SYNTHETIC_RELAY_STOP_FAILURE",)
     assert process.poll() is not None
     with pytest.raises(ProcessLookupError):
         os.killpg(process.pid, 0)
+
+
+def test_cleanup_preserves_relay_and_process_drain_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both independent cleanup failures must survive in stable order."""
+
+    class BrokenRelay:
+        def stop(self) -> None:
+            raise KimiLoginError("SYNTHETIC_RELAY_STOP_FAILURE")
+
+    monkeypatch.setattr(
+        kimi_login_module,
+        "terminate_and_drain_process",
+        lambda _process: (_ for _ in ()).throw(
+            KimiLoginError("SYNTHETIC_PROCESS_DRAIN_FAILURE")
+        ),
+    )
+    cleanup = cleanup_login_runtime(BrokenRelay(), object())  # type: ignore[arg-type]
+    assert cleanup.result is kimi_login_module.LoginCleanupResult.FAILED
+    assert cleanup.reason_codes == (
+        "SYNTHETIC_RELAY_STOP_FAILURE",
+        "SYNTHETIC_PROCESS_DRAIN_FAILURE",
+    )
+
+
+def test_primary_failure_survives_relay_and_cleanup_failures() -> None:
+    """Cleanup evidence must accompany, never replace, the provider failure."""
+
+    observation = kimi_login_module.AuthRelayObservation(
+        AuthRelayResult.FAILED,
+        AUTH_HOST,
+        "AUTH",
+        11,
+        13,
+        "AUTH_CONNECTION_INTERRUPTED",
+    )
+    cleanup = kimi_login_module.LoginCleanupObservation(
+        kimi_login_module.LoginCleanupResult.FAILED,
+        ("AUTH_RELAY_DRAIN_FAILED",),
+    )
+    outcome = kimi_login_module.finalize_login_outcome(
+        primary_login_result=kimi_login_module.PrimaryLoginResult.LOGIN_COMMAND_FAILED,
+        primary_reason_code="LOGIN_COMMAND_FAILED",
+        observations=(observation,),
+        cleanup=cleanup,
+        credential_structure_result=CredentialRootState.PRESENT,
+    )
+    assert outcome.primary_login_result is kimi_login_module.PrimaryLoginResult.LOGIN_COMMAND_FAILED
+    assert outcome.primary_reason_code == "LOGIN_COMMAND_FAILED"
+    assert outcome.relay_result is kimi_login_module.LoginRelayResult.FAILED
+    assert outcome.relay_reason_code == "AUTH_CONNECTION_INTERRUPTED"
+    assert outcome.cleanup_result is kimi_login_module.LoginCleanupResult.FAILED
+    assert outcome.cleanup_reason_codes == ("AUTH_RELAY_DRAIN_FAILED",)
+    assert outcome.credential_structure_result is CredentialRootState.PRESENT
+    assert outcome.top_level_error == "LOGIN_COMMAND_FAILED"
+
+
+def test_late_alternate_hostname_is_still_reported_after_process_exit() -> None:
+    """A process-exit race cannot erase the content-free blocked hostname."""
+
+    observation = kimi_login_module.AuthRelayObservation(
+        AuthRelayResult.DENIED,
+        "redirect.example",
+        "UNKNOWN",
+        0,
+        0,
+        "CONNECT_HOST_DENIED",
+    )
+    outcome = kimi_login_module.finalize_login_outcome(
+        primary_login_result=kimi_login_module.PrimaryLoginResult.COMPLETED,
+        primary_reason_code="COMPLETED",
+        observations=(observation,),
+        cleanup=kimi_login_module.LoginCleanupObservation(
+            kimi_login_module.LoginCleanupResult.COMPLETED, ()
+        ),
+        credential_structure_result=CredentialRootState.PRESENT,
+    )
+    assert outcome.blocked_hostname == "redirect.example"
+    assert outcome.top_level_error == "AUTH_RELAY_FAILED"
+
+
+@pytest.mark.parametrize("breakage", ["transient", "unknown"])
+def test_post_run_credential_structure_classifies_malformed_state_as_invalid(
+    tmp_path: Path, breakage: str
+) -> None:
+    """Post-run reporting stays content-free for lingering or unknown leaves."""
+
+    state_root = tmp_path / "state"
+    provision_empty_credential_root(state_root, expected_uid=os.getuid())
+    credential_root = state_root / "credentials"
+    name = (
+        "kimi-code.json.tmp.123.abcdef12"
+        if breakage == "transient"
+        else "unknown.json"
+    )
+    path = credential_root / name
+    path.write_bytes(b"synthetic only")
+    path.chmod(0o600)
+    assert (
+        kimi_login_module.classify_credential_structure(
+            state_root, expected_uid=os.getuid()
+        )
+        is CredentialRootState.INVALID
+    )
+
+
+@pytest.mark.parametrize(
+    ("credential_state", "cleanup_result", "cleanup_codes", "expected_error"),
+    [
+        (
+            CredentialRootState.PRESENT,
+            "FAILED",
+            ("AUTH_RELAY_DRAIN_FAILED",),
+            "AUTH_RELAY_DRAIN_FAILED",
+        ),
+        (CredentialRootState.EMPTY, "COMPLETED", (), "CREDENTIAL_STATE_ABSENT_AFTER_SUCCESS"),
+        (CredentialRootState.INVALID, "COMPLETED", (), "CREDENTIAL_STRUCTURE_INVALID"),
+    ],
+)
+def test_success_never_hides_cleanup_or_credential_failure(
+    credential_state: CredentialRootState,
+    cleanup_result: str,
+    cleanup_codes: tuple[str, ...],
+    expected_error: str,
+) -> None:
+    """Primary success is qualified only with relay, cleanup, and storage success."""
+
+    observation = kimi_login_module.AuthRelayObservation(
+        AuthRelayResult.COMPLETED,
+        AUTH_HOST,
+        "AUTH",
+        17,
+        19,
+        "COMPLETED",
+    )
+    cleanup = kimi_login_module.LoginCleanupObservation(
+        kimi_login_module.LoginCleanupResult(cleanup_result),
+        cleanup_codes,
+    )
+    outcome = kimi_login_module.finalize_login_outcome(
+        primary_login_result=kimi_login_module.PrimaryLoginResult.COMPLETED,
+        primary_reason_code="COMPLETED",
+        observations=(observation,),
+        cleanup=cleanup,
+        credential_structure_result=credential_state,
+    )
+    assert outcome.top_level_error == expected_error
+
+
+def test_monitor_uses_one_nonresetting_overall_ceremony_deadline() -> None:
+    """Polling and monitoring activity must never move the 1920-second boundary."""
+
+    class PendingProcess:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    class HealthyRelay:
+        fatal_observation = None
+
+    observed_times = iter((100.0, 2019.9, 2020.0))
+    sleeps: list[float] = []
+    result, reason, hostname = kimi_login_module.monitor_login_process(
+        PendingProcess(),
+        HealthyRelay(),
+        overall_deadline=2020.0,
+        monotonic=lambda: next(observed_times),
+        sleep=sleeps.append,
+    )
+    assert result is kimi_login_module.PrimaryLoginResult.OVERALL_CEREMONY_TIMEOUT
+    assert reason == "OVERALL_CEREMONY_TIMEOUT"
+    assert hostname is None
+    assert sleeps == [0.1, 0.1]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "fatal_reason", "expected_result", "expected_reason"),
+    [
+        (
+            None,
+            "NETWORK_SOCKET_ERROR",
+            "AUTH_RELAY_FAILED",
+            "AUTH_RELAY_FAILED",
+        ),
+        (7, None, "LOGIN_COMMAND_FAILED", "LOGIN_COMMAND_FAILED"),
+    ],
+)
+def test_monitor_classifies_transport_failure_and_provider_nonzero_exit(
+    returncode: int | None,
+    fatal_reason: str | None,
+    expected_result: str,
+    expected_reason: str,
+) -> None:
+    """Primary transport and provider process failures remain distinguishable."""
+
+    class Process:
+        def __init__(self, code: int | None) -> None:
+            self.returncode = code
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    fatal = (
+        kimi_login_module.AuthRelayObservation(
+            AuthRelayResult.FAILED,
+            AUTH_HOST,
+            "AUTH",
+            0,
+            0,
+            fatal_reason,
+        )
+        if fatal_reason is not None
+        else None
+    )
+
+    class Relay:
+        fatal_observation = fatal
+
+    result, reason, hostname = kimi_login_module.monitor_login_process(
+        Process(returncode),
+        Relay(),
+        overall_deadline=2.0,
+        monotonic=lambda: 1.0,
+        sleep=lambda _seconds: None,
+    )
+    assert result.value == expected_result
+    assert reason == expected_reason
+    assert hostname is None
+
+
+def test_cli_reports_all_failure_dimensions_without_masking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner output must retain primary, relay, cleanup, and credential facts."""
+
+    observation = kimi_login_module.AuthRelayObservation(
+        AuthRelayResult.FAILED,
+        AUTH_HOST,
+        "AUTH",
+        23,
+        29,
+        "AUTH_CONNECTION_INTERRUPTED",
+    )
+    outcome = kimi_login_module.LoginRunOutcome(
+        primary_login_result=kimi_login_module.PrimaryLoginResult.LOGIN_COMMAND_FAILED,
+        primary_reason_code="LOGIN_COMMAND_FAILED",
+        relay_result=kimi_login_module.LoginRelayResult.FAILED,
+        relay_reason_code="AUTH_CONNECTION_INTERRUPTED",
+        cleanup_result=kimi_login_module.LoginCleanupResult.FAILED,
+        cleanup_reason_codes=("AUTH_RELAY_DRAIN_FAILED",),
+        credential_structure_result=CredentialRootState.PRESENT,
+        observations=(observation,),
+    )
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda self, **_kwargs: "0::/user.slice/aos-kimi-owner-login.scope\n",
+    )
+    monkeypatch.setattr(kimi_login_module, "validate_scope_membership", lambda *_: None)
+    monkeypatch.setattr(kimi_login_module, "validate_login_task_budget", lambda *_: None)
+    monkeypatch.setattr(kimi_login_module, "validate_repository_identity", lambda *_: None)
+    monkeypatch.setattr(kimi_login_module, "validate_login_spec", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(kimi_login_module, "run_owner_login", lambda *_: outcome)
+    output: list[str] = []
+    result = cli_main(
+        ["--expected-commit", "a" * 40],
+        isatty=lambda _fd: True,
+        output=output.append,
+    )
+    assert result == 2
+    assert output == [
+        "F1_KIMI_LOGIN_CEREMONY=STARTING",
+        "PRIMARY_LOGIN_RESULT=LOGIN_COMMAND_FAILED",
+        "RELAY_RESULT=FAILED:AUTH_CONNECTION_INTERRUPTED",
+        "CLEANUP_RESULT=FAILED:AUTH_RELAY_DRAIN_FAILED",
+        "CREDENTIAL_STRUCTURE_RESULT=PRESENT",
+        "F1_KIMI_LOGIN_CEREMONY_ERROR=LOGIN_COMMAND_FAILED",
+    ]
 
 
 def test_login_sandbox_runs_only_official_login_and_mounts_no_checkout(tmp_path: Path) -> None:

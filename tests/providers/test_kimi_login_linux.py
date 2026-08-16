@@ -32,6 +32,12 @@ RUNTIME = Path(
 TASK_BUDGET_FIXTURE = (
     Path(__file__).parent / "fixtures" / "kimi_task_budget_fixture.py"
 ).resolve()
+POST_AUTH_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "kimi_post_auth_fixture.py"
+).resolve()
+POST_AUTH_NAMESPACE_FIXTURE = POST_AUTH_FIXTURE.with_name(
+    "kimi_post_auth_namespace_fixture.py"
+)
 _UNIT_SEQUENCE = itertools.count(1)
 
 
@@ -238,3 +244,85 @@ def test_tasksmax_21_remains_a_hard_ceiling_for_task_explosion() -> None:
     assert report["peak_tasks"] == 21
     assert report["pids_events_max"] >= 1
     assert report["after_cleanup"]["pids_current"] == 1
+
+
+def test_synthetic_post_auth_device_flow_completes_and_drains() -> None:
+    """The full fake flow must write only synthetic state and leave zero residue."""
+
+    assert POST_AUTH_FIXTURE.is_file(), "synthetic post-auth fixture is missing"
+    sources = (
+        POST_AUTH_FIXTURE.read_text(encoding="utf-8"),
+        POST_AUTH_NAMESPACE_FIXTURE.read_text(encoding="utf-8"),
+    )
+    assert all(
+        "/home/brand/.local/share/agenticos/provider-state" not in source
+        for source in sources
+    )
+    unit = f"aos-kimi-post-auth-test-{os.getpid()}-{next(_UNIT_SEQUENCE)}"
+    completed = subprocess.run(
+        [
+            "/usr/bin/systemd-run",
+            "--user",
+            "--scope",
+            "--collect",
+            "--quiet",
+            f"--unit={unit}",
+            "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=5s",
+            "--property=TasksMax=21",
+            "--property=MemoryMax=1G",
+            "/usr/bin/python3",
+            str(POST_AUTH_FIXTURE),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=30,
+    )
+    report = json.loads(completed.stdout)
+    assert completed.stderr == ""
+    assert report == {
+        "after_cleanup_tasks": 1,
+        "cleanup_result": "COMPLETED",
+        "credential_state": "PRESENT",
+        "device_authorization": "COMPLETED",
+        "external_network_attempted": False,
+        "owner_approval_transition": "COMPLETED",
+        "pending_poll_count": 2,
+        "primary_login_result": "COMPLETED",
+        "process_returncode": 0,
+        "real_credential_root_referenced": False,
+        "relay_active_connections": 0,
+        "relay_result": "COMPLETED",
+        "schema": "AOS_KIMI_POST_AUTH_FIXTURE/1",
+        "synthetic_atomic_credential_write": "COMPLETED",
+        "synthetic_token_response": "COMPLETED",
+        "top_level_error": None,
+    }
+    deadline = time.monotonic() + 3
+    unit_state = ""
+    while time.monotonic() < deadline:
+        observed = subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "show",
+                f"{unit}.scope",
+                "--property=LoadState",
+                "--property=ControlGroup",
+                "--no-pager",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=2,
+        )
+        unit_state = observed.stdout
+        if "LoadState=not-found" in unit_state and "ControlGroup=\n" in unit_state:
+            break
+        time.sleep(0.05)
+    assert "LoadState=not-found" in unit_state
+    assert "ControlGroup=\n" in unit_state
