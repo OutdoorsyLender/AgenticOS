@@ -16,6 +16,7 @@ import pytest
 if os.name != "posix":
     pytest.skip("Kimi owner-login security boundary is Linux-only", allow_module_level=True)
 
+from agenticos.providers import kimi_login as kimi_login_module
 from agenticos.providers.kimi_login import (
     AUTH_HOST,
     AUTH_PORT,
@@ -275,6 +276,79 @@ def test_relay_stop_closes_active_connection_and_drains_threads() -> None:
     assert relay.active_connection_count == 0
     assert relay.running is False
     peer.close()
+
+
+def test_resolver_thread_exhaustion_becomes_typed_relay_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A denied resolver task must not escape as an unhandled thread traceback."""
+
+    from agenticos.sandbox import network_resolution
+
+    monkeypatch.setattr(
+        network_resolution,
+        "resolve_all_once",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("can't start new thread")
+        ),
+    )
+    with pytest.raises(KimiLoginError) as rejected:
+        kimi_login_module._default_origin_socket()
+    assert rejected.value.code == "TASK_BUDGET_EXHAUSTED"
+
+
+def test_relay_service_thread_exhaustion_closes_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure to create the relay service task must leave no accepting socket."""
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    relay = KimiAuthRelay(listener)
+    monkeypatch.setattr(
+        threading.Thread,
+        "start",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("can't start new thread")),
+    )
+    with pytest.raises(KimiLoginError) as rejected:
+        relay.start()
+    assert rejected.value.code == "TASK_BUDGET_EXHAUSTED"
+    assert listener.fileno() == -1
+
+
+def test_relay_connection_thread_exhaustion_is_observed_and_drained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The accepted connection must close if its bounded worker cannot start."""
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    address = listener.getsockname()
+    relay = KimiAuthRelay(listener)
+    relay.start()
+    original_start = threading.Thread.start
+
+    def fail_connection_worker(thread: threading.Thread) -> None:
+        if thread.name.startswith("aos-kimi-auth-connection-"):
+            raise RuntimeError("can't start new thread")
+        original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_connection_worker)
+    peer = socket.create_connection(address, timeout=1)
+    try:
+        deadline = time.monotonic() + 2
+        while relay.fatal_observation is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        fatal = relay.fatal_observation
+        assert fatal is not None
+        assert fatal.reason_code == "TASK_BUDGET_EXHAUSTED"
+        assert relay.active_connection_count == 0
+    finally:
+        peer.close()
+        relay.stop()
 
 
 @pytest.mark.parametrize(
@@ -561,7 +635,7 @@ def test_owner_command_is_exact_systemd_scope_without_shell_or_capture() -> None
         "--unit=aos-kimi-owner-login",
         "--property=KillMode=control-group",
         "--property=TimeoutStopSec=5s",
-        "--property=TasksMax=16",
+        "--property=TasksMax=21",
         "--property=MemoryMax=1G",
         "/usr/bin/python3",
         "/home/brand/src/AgenticOS/scripts/run_kimi_owner_login.py",
@@ -572,7 +646,127 @@ def test_owner_command_is_exact_systemd_scope_without_shell_or_capture() -> None
     assert "script" not in command
     assert "--prompt" not in command
     assert "-p" not in command
+    assert "--property=TasksMax=16" not in command
     assert all("api.kimi.com" not in token for token in command)
+
+
+def _write_task_budget_fixture(
+    root: Path,
+    *,
+    maximum: str = "21",
+    current: str = "1",
+    events: str = "max 0",
+) -> str:
+    relative = Path("user.slice") / "aos-kimi-owner-login.scope"
+    scope = root / relative
+    scope.mkdir(parents=True)
+    (scope / "pids.max").write_text(maximum + "\n", encoding="ascii")
+    (scope / "pids.current").write_text(current + "\n", encoding="ascii")
+    (scope / "pids.events").write_text(events + "\n", encoding="ascii")
+    return "0::/" + relative.as_posix() + "\n"
+
+
+def test_login_task_budget_accepts_only_the_measured_finite_scope(tmp_path: Path) -> None:
+    """Changing the exact 17+4 budget must fail before the provider can start."""
+
+    cgroup_text = _write_task_budget_fixture(tmp_path)
+    assert (
+        kimi_login_module.validate_login_task_budget(
+            cgroup_text, cgroup_root=tmp_path
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("maximum", "current", "events", "expected_code"),
+    [
+        ("16", "1", "max 0", "LOGIN_TASK_BUDGET_INSUFFICIENT"),
+        ("22", "1", "max 0", "LOGIN_TASK_BUDGET_UNQUALIFIED"),
+        ("max", "1", "max 0", "LOGIN_TASK_BUDGET_UNQUALIFIED"),
+        ("not-an-integer", "1", "max 0", "LOGIN_TASK_BUDGET_INVALID"),
+        ("21", "2", "max 0", "LOGIN_TASK_SCOPE_NOT_EMPTY"),
+        ("21", "1", "max 1", "LOGIN_TASK_SCOPE_PREVIOUSLY_EXHAUSTED"),
+    ],
+)
+def test_login_task_budget_rejects_unqualified_or_consumed_scope(
+    tmp_path: Path,
+    maximum: str,
+    current: str,
+    events: str,
+    expected_code: str,
+) -> None:
+    """A widened, exhausted, malformed, or already-populated scope is unqualified."""
+
+    cgroup_text = _write_task_budget_fixture(
+        tmp_path,
+        maximum=maximum,
+        current=current,
+        events=events,
+    )
+    with pytest.raises(KimiLoginError) as rejected:
+        kimi_login_module.validate_login_task_budget(
+            cgroup_text, cgroup_root=tmp_path
+        )
+    assert rejected.value.code == expected_code
+
+
+def test_cli_task_budget_preflight_blocks_every_later_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Insufficient pids capacity must fail before pin probes or login traffic."""
+
+    reached: list[str] = []
+
+    def budget_rejected(_cgroup_text: str) -> None:
+        raise KimiLoginError("LOGIN_TASK_BUDGET_INSUFFICIENT")
+
+    def late_stage(name: str):
+        def reject(*_args: object, **_kwargs: object) -> None:
+            reached.append(name)
+            raise KimiLoginError("LATE_STAGE_REACHED")
+
+        return reject
+
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda self, **_kwargs: "0::/user.slice/aos-kimi-owner-login.scope\n"
+        if self == Path("/proc/self/cgroup")
+        else (_ for _ in ()).throw(AssertionError(f"unexpected read: {self}")),
+    )
+    monkeypatch.setattr(
+        kimi_login_module,
+        "validate_login_task_budget",
+        budget_rejected,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kimi_login_module,
+        "validate_repository_identity",
+        late_stage("repository"),
+    )
+    monkeypatch.setattr(
+        kimi_login_module,
+        "validate_login_spec",
+        late_stage("runtime"),
+    )
+    monkeypatch.setattr(
+        kimi_login_module,
+        "run_owner_login",
+        late_stage("login"),
+    )
+    output: list[str] = []
+    result = cli_main(
+        ["--expected-commit", "a" * 40],
+        isatty=lambda _fd: True,
+        output=output.append,
+    )
+    assert result == 2
+    assert output == [
+        "F1_KIMI_LOGIN_CEREMONY_ERROR=LOGIN_TASK_BUDGET_INSUFFICIENT"
+    ]
+    assert reached == []
 
 
 def test_default_login_spec_names_only_qualified_external_and_bundle_paths() -> None:

@@ -50,6 +50,9 @@ from .kimi_login_namespace import HANDOFF_MARKER
 AUTH_HOST: Final = "auth.kimi.com"
 AUTH_PORT: Final = 443
 AUTH_PROXY: Final = "http://127.0.0.1:18080"
+MEASURED_LOGIN_TASK_PEAK: Final = 17
+LOGIN_TASK_HEADROOM: Final = 4
+QUALIFIED_LOGIN_TASKS_MAX: Final = MEASURED_LOGIN_TASK_PEAK + LOGIN_TASK_HEADROOM
 SANDBOX_LOGIN_LAUNCHER: Final = "/opt/agenticos/kimi/login_namespace.py"
 SANDBOX_CREDENTIAL_ROOT: Final = "/home/aos/kimi/credentials"
 MAX_CONNECT_HEAD_BYTES: Final = 16_384
@@ -327,6 +330,47 @@ def validate_scope_membership(cgroup_text: str) -> None:
         raise KimiLoginError("LOGIN_SCOPE_REQUIRED")
 
 
+def validate_login_task_budget(
+    cgroup_text: str,
+    *,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> None:
+    """Require the exact measured finite pids-controller budget before launch."""
+
+    validate_scope_membership(cgroup_text)
+    if not isinstance(cgroup_root, Path) or not cgroup_root.is_absolute():
+        raise KimiLoginError("LOGIN_TASK_BUDGET_INVALID")
+    relative = cgroup_text.strip()[3:]
+    parts = Path(relative).parts
+    if not relative.startswith("/") or ".." in parts:
+        raise KimiLoginError("LOGIN_TASK_BUDGET_INVALID")
+    scope_root = cgroup_root.joinpath(*parts[1:])
+    try:
+        maximum_text = (scope_root / "pids.max").read_text(encoding="ascii").strip()
+        current_text = (scope_root / "pids.current").read_text(encoding="ascii").strip()
+        events_text = (scope_root / "pids.events").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise KimiLoginError("LOGIN_TASK_BUDGET_INVALID") from exc
+    if maximum_text == "max":
+        raise KimiLoginError("LOGIN_TASK_BUDGET_UNQUALIFIED")
+    if not maximum_text.isdecimal():
+        raise KimiLoginError("LOGIN_TASK_BUDGET_INVALID")
+    maximum = int(maximum_text)
+    if maximum < QUALIFIED_LOGIN_TASKS_MAX:
+        raise KimiLoginError("LOGIN_TASK_BUDGET_INSUFFICIENT")
+    if maximum != QUALIFIED_LOGIN_TASKS_MAX:
+        raise KimiLoginError("LOGIN_TASK_BUDGET_UNQUALIFIED")
+    if not current_text.isdecimal() or int(current_text) < 1:
+        raise KimiLoginError("LOGIN_TASK_BUDGET_INVALID")
+    if int(current_text) != 1:
+        raise KimiLoginError("LOGIN_TASK_SCOPE_NOT_EMPTY")
+    event_parts = events_text.split()
+    if len(event_parts) != 2 or event_parts[0] != "max" or not event_parts[1].isdecimal():
+        raise KimiLoginError("LOGIN_TASK_BUDGET_INVALID")
+    if int(event_parts[1]) != 0:
+        raise KimiLoginError("LOGIN_TASK_SCOPE_PREVIOUSLY_EXHAUSTED")
+
+
 def _run_repository_git(repo_root: Path, *arguments: str) -> str:
     environment = {
         "HOME": "/nonexistent",
@@ -387,7 +431,7 @@ def owner_systemd_command(expected_commit: str) -> list[str]:
         "--unit=aos-kimi-owner-login",
         "--property=KillMode=control-group",
         "--property=TimeoutStopSec=5s",
-        "--property=TasksMax=16",
+        f"--property=TasksMax={QUALIFIED_LOGIN_TASKS_MAX}",
         "--property=MemoryMax=1G",
         "/usr/bin/python3",
         str(OWNER_SCRIPT),
@@ -782,7 +826,12 @@ def _default_origin_socket() -> socket.socket:
     from agenticos.sandbox.network_origin import connect_validated_sockaddr
     from agenticos.sandbox.network_resolution import ResolutionCode, resolve_all_once
 
-    resolved = resolve_all_once(AUTH_HOST)
+    try:
+        resolved = resolve_all_once(AUTH_HOST)
+    except RuntimeError as exc:
+        if str(exc) != "can't start new thread":
+            raise
+        raise KimiLoginError("TASK_BUDGET_EXHAUSTED") from exc
     if resolved.code is not ResolutionCode.RESOLVED:
         raise KimiLoginError("AUTH_DNS_DENIED", resolved.code.value)
     connected = connect_validated_sockaddr(resolved.addresses)
@@ -966,12 +1015,20 @@ class KimiAuthRelay:
         if self._thread is not None:
             raise KimiLoginError("AUTH_RELAY_ALREADY_STARTED")
         self._listener.settimeout(0.25)
-        self._thread = threading.Thread(
+        thread = threading.Thread(
             target=self._serve,
             name="aos-kimi-auth-relay",
             daemon=True,
         )
-        self._thread.start()
+        self._thread = thread
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            self._thread = None
+            self._listener.close()
+            if str(exc) != "can't start new thread":
+                raise
+            raise KimiLoginError("TASK_BUDGET_EXHAUSTED") from exc
 
     def _serve_connection(self, connection: socket.socket) -> None:
         try:
@@ -1021,7 +1078,26 @@ class KimiAuthRelay:
                         daemon=True,
                     )
                     self._workers.add(worker)
-                worker.start()
+                try:
+                    worker.start()
+                except RuntimeError as exc:
+                    connection.close()
+                    with self._lock:
+                        self._connections.discard(connection)
+                        self._workers.discard(worker)
+                        if str(exc) == "can't start new thread":
+                            self.observations.append(
+                                AuthRelayObservation(
+                                    AuthRelayResult.FAILED,
+                                    None,
+                                    "UNKNOWN",
+                                    0,
+                                    0,
+                                    "TASK_BUDGET_EXHAUSTED",
+                                )
+                            )
+                            return
+                    raise
         finally:
             try:
                 self._listener.close()
@@ -1265,7 +1341,9 @@ def cli_main(
     try:
         arguments = parser.parse_args(argv)
         validate_interactive_terminal(isatty)
-        validate_scope_membership(Path("/proc/self/cgroup").read_text(encoding="ascii"))
+        cgroup_text = Path("/proc/self/cgroup").read_text(encoding="ascii")
+        validate_scope_membership(cgroup_text)
+        validate_login_task_budget(cgroup_text)
         validate_repository_identity(REPO_ROOT, arguments.expected_commit)
         spec = default_login_spec()
         validate_login_spec(spec, expected_uid=os.getuid())
@@ -1286,6 +1364,9 @@ def cli_main(
 __all__ = [
     "AUTH_HOST",
     "AUTH_PORT",
+    "LOGIN_TASK_HEADROOM",
+    "MEASURED_LOGIN_TASK_PEAK",
+    "QUALIFIED_LOGIN_TASKS_MAX",
     "AuthRelayResult",
     "CredentialRootState",
     "KimiLoginError",
@@ -1310,6 +1391,7 @@ __all__ = [
     "validate_credential_parent_chain",
     "validate_credential_root",
     "validate_interactive_terminal",
+    "validate_login_task_budget",
     "validate_login_spec",
     "validate_repository_identity",
     "validate_scope_membership",
