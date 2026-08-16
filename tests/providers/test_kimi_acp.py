@@ -23,6 +23,8 @@ from agenticos.providers.kimi_acp import (
     KimiPassiveAdapter,
     RealProviderDisabledError,
     decode_acp_line,
+    encode_acp_request,
+    validate_kimi_initialize_result,
 )
 
 
@@ -159,6 +161,28 @@ def test_decode_acp_line_rejects_duplicate_keys_invalid_utf8_bounds_and_truncati
         decode_acp_line(b'{"jsonrpc":"2.0"}')
     with pytest.raises(KimiAcpError, match="MALFORMED_JSON_RPC"):
         decode_acp_line(b"[]\n")
+
+
+def test_shared_outbound_encoder_rejects_wrong_method_construction() -> None:
+    with pytest.raises(KimiAcpError, match="OUTBOUND_REQUEST_SHAPE"):
+        encode_acp_request("initialize", True, {})
+    with pytest.raises(KimiAcpError, match="OUTBOUND_REQUEST_SHAPE"):
+        encode_acp_request("initialize", 1, [])  # type: ignore[arg-type]
+    assert decode_acp_line(encode_acp_request("authenticate", 2, {"methodId": "login"})) == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "authenticate",
+        "params": {"methodId": "login"},
+    }
+
+
+def test_shared_initialize_validator_preserves_pinned_identity_checks() -> None:
+    result = decode_acp_line(_initialize_result())["result"]
+    assert validate_kimi_initialize_result(result) == result
+    wrong_identity = dict(result)
+    wrong_identity["agentInfo"] = {"name": "Kimi Code CLI", "version": "0.36.2"}
+    with pytest.raises(KimiAcpError, match="WRONG_AGENT_IDENTITY"):
+        validate_kimi_initialize_result(wrong_identity)
 
 
 def test_outbound_surface_is_exact_and_contains_no_checkout_or_auth_material() -> None:
