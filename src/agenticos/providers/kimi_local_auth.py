@@ -30,6 +30,12 @@ class QualificationState(str, Enum):
     BLOCKED = "BLOCKED"
 
 
+class ACPProtocolState(str, Enum):
+    ACTIVE = "ACTIVE"
+    TERMINAL_RESPONSE_ACCEPTED = "TERMINAL_RESPONSE_ACCEPTED"
+    CLOSED = "CLOSED"
+
+
 @dataclass(frozen=True, slots=True)
 class LocalAuthProtocolOutcome:
     qualification: QualificationState
@@ -46,14 +52,30 @@ class KimiLocalAuthSession:
         self._state = "NEW"
         self._terminal = False
         self._outcome: LocalAuthProtocolOutcome | None = None
+        self._protocol_state = ACPProtocolState.ACTIVE
+
+    @property
+    def protocol_state(self) -> ACPProtocolState:
+        return self._protocol_state
+
+    def close(self) -> None:
+        if self._protocol_state is ACPProtocolState.CLOSED:
+            raise KimiLocalAuthError("ACP_PROTOCOL_CLOSED")
+        self._protocol_state = ACPProtocolState.CLOSED
+
+    def _require_protocol_active(self) -> None:
+        if self._protocol_state is not ACPProtocolState.ACTIVE:
+            raise KimiLocalAuthError("ACP_PROTOCOL_TERMINAL")
 
     def initialize_request(self) -> bytes:
+        self._require_protocol_active()
         if self._state != "NEW":
             raise KimiLocalAuthError("INITIALIZE_ORDER")
         self._state = "INITIALIZING"
         return encode_acp_request("initialize", 1, {"protocolVersion": 1, "clientCapabilities": {}})
 
     def authenticate_request(self) -> bytes:
+        self._require_protocol_active()
         if self._state != "INITIALIZED":
             raise KimiLocalAuthError("AUTHENTICATE_ORDER")
         self._state = "AUTHENTICATING"
@@ -120,3 +142,4 @@ class KimiLocalAuthSession:
         )
         self._terminal = True
         self._state = "FINISHED"
+        self._protocol_state = ACPProtocolState.TERMINAL_RESPONSE_ACCEPTED
