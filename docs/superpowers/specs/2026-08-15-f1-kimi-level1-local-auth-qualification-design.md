@@ -14,11 +14,15 @@ REAL_LOGIN_AUTHORIZED=NO
 SERVER_AUTH_VALIDATION_AUTHORIZED=NO
 MODEL_INFERENCE_AUTHORIZED=NO
 F2_AUTHORIZED=NO
-FREEZER_AMENDMENT_STATUS=READY_FOR_REVIEW
+FREEZER_AMENDMENT_STATUS=REMEDIATED_READY_FOR_REVIEW
 FREEZER_AMENDMENT_IMPLEMENTATION_AUTHORIZED=NO
+FREEZER_AMENDMENT_REMEDIATION_IMPLEMENTATION_AUTHORIZED=NO
 TASK4_RESUME_AUTHORIZED=NO
 PTRACE_AUTHORIZED=NO
+CONTROLLER_THREAD_IDENTITY_MODEL=SINGLE_THREADED_PROCESS_LEADER_PIDFD
+PIDFD_THREAD_REQUIRED=NO
 PUBLISHED_PRE_AMENDMENT_BASELINE=c75d2af3ec9d31a770a2be24f24009ea4bb31acc
+REVIEWED_AMENDMENT_BASELINE=69465364734462a2eac47e64a47c0f7e4fa1987f
 PRESERVED_UNPUBLISHED_TASK4_BASELINE=3eca6bffc019df91142e668bbf5d7c3700cd7dde
 ```
 
@@ -286,13 +290,54 @@ cgroup, recreation at the same name, a changed mount, or any control-file
 replacement blocks the run. A new path object can never inherit authority
 from the old record.
 
-The controller's PID and every controller TID are bound through pidfds and
-stable `/proc` metadata to the validated unit-root identity. They must remain
-outside the workload child for the entire lifecycle. Stable, duplicate-free
-`cgroup.procs` and `cgroup.threads` snapshots prove the admitted workload
-topology is wholly inside the workload child; the controller set must be
-disjoint. Path spelling alone is never proof. Controller migration, task-set
-churn across a required stable snapshot, or an unclassifiable PID/TID blocks.
+The external controller is single-threaded for the complete freezer-critical
+interval, defined as immediately before `clone3(CLONE_INTO_CGROUP)` workload
+creation through final workload drain and identity-bound cgroup removal. A
+stable, duplicate-free `/proc/self/task` enumeration must contain exactly the
+controller process leader at interval entry and at every spawn, freeze,
+capture, thaw, kill, drain, and removal checkpoint. Unexpected controller
+thread creation is a terminal security failure.
+
+The controller process leader is bound once with an ordinary process pidfd
+and stable `/proc` metadata to the validated unit-root identity. The design
+does not call `pidfd_open(tid, 0)` for nonleader TIDs and has no implicit
+thread-pidfd fallback. `PIDFD_THREAD` is therefore not required by this chosen
+model. If implementation later proves that trusted controller threads are
+unavoidable, work must stop for a new specification review: the exact host
+must support `pidfd_open(tid, PIDFD_THREAD)`, every expected TID must receive
+a thread-specific pidfd, and absence of that support must block. That
+multithreaded alternative is not authorized by this amendment.
+
+The controller leader must remain outside the workload child for the entire
+critical interval. Stable, duplicate-free `cgroup.procs` and
+`cgroup.threads` snapshots prove the admitted workload topology is wholly
+inside the workload child and disjoint from the single controller identity.
+Path spelling alone is never proof. Controller migration, controller thread
+creation, task-set churn across a required stable snapshot, or an
+unclassifiable PID/TID blocks.
+
+### ACP terminality with inert open input
+
+The protocol lifecycle is independent of the stdin descriptor lifecycle:
+
+```text
+ACP_PROTOCOL_STATE = ACTIVE | TERMINAL_RESPONSE_ACCEPTED | CLOSED
+```
+
+`ACTIVE -> TERMINAL_RESPONSE_ACCEPTED` occurs only after the exact correlated
+terminal `authenticate(methodId="login")` response is validated. That
+transition permanently disables the request encoder and every protocol write
+surface before the freezer sequence starts. The controller retains the stdin
+descriptor open but inert solely to prevent EOF from initiating premature
+provider/supervisor shutdown. An open FD does not preserve ACP authority.
+
+In `TERMINAL_RESPONSE_ACCEPTED`, `session/new`, `session/prompt`, every
+notification, retry, repeated authentication, other request, and protocol
+write are structurally impossible. The descriptor may transition to `CLOSED`
+only after capture is `CONSUMED` and normal thaw is confirmed, or as
+failure-path lifecycle cleanup after capture has become `REVOKED`. Closing it
+must not call or re-enable capture. No EOF-triggered protocol action is
+permitted before the frozen evidence window completes.
 
 ### Freezer protocol and positive frozen-state proof
 
@@ -300,26 +345,39 @@ The cgroup freezer is the only quiescence authority. SIGSTOP and SIGCONT are
 forbidden for capture quiescence. Ordinary already-qualified fatal signals
 may still be used for bounded termination, but never as frozen-state proof.
 
-After the exact terminal ACP authentication response has been processed, the
-controller closes protocol input and performs this sequence under the one
-non-resetting monotonic run deadline:
+The controller performs this sequence under the one non-resetting monotonic
+run deadline:
 
-1. Revalidate workload-cgroup identity, controller exclusion, stable exact
-   workload process/thread membership, expected role topology, resource
-   limits, and absence of prior failure.
-2. Write exactly `1\n` through the pre-opened `cgroup.freeze` control.
-3. Mark `freeze_requested=true`; do not infer that tasks are frozen.
-4. Poll the pre-opened `cgroup.events` under a bounded monotonic deadline
-   until a strict total parse observes both `populated 1` and `frozen 1`.
-5. Revalidate the same cgroup identity, controller exclusion, no child
-   cgroup, exact stable membership, expected live roles, and zero escape.
-6. Only then grant the single bounded post-terminal evidence capture.
-7. After that capture is consumed, write exactly `0\n` to `cgroup.freeze`
-   and wait for a strict `frozen 0` observation when normal continuation is
-   still possible.
-8. Continue to the already-authorized termination/drain state. If thaw cannot
-   be confirmed, do not continue the provider; kill the frozen workload and
-   prove recursive emptiness.
+1. Receive and validate the exact terminal
+   `authenticate(methodId="login")` response.
+2. Transition ACP protocol state to `TERMINAL_RESPONSE_ACCEPTED`.
+3. Permanently disable all further protocol writes, requests, notifications,
+   authentication repeats, and retries.
+4. Keep provider stdin open but inert. Do not send another byte and do not
+   close it yet.
+5. Revalidate workload-cgroup identity, the single-threaded controller and
+   its exclusion, stable exact workload process/thread membership, expected
+   live-role topology, resource limits, and absence of prior failure.
+6. Write exactly `1\n` through the pre-opened `cgroup.freeze` control.
+7. Mark `freeze_requested=true`; do not infer that tasks are frozen. Poll the
+   pre-opened `cgroup.events` under the bounded monotonic deadline until a
+   strict total parse observes both `populated 1` and `frozen 1`.
+8. Revalidate the same cgroup identity, exact stable membership, expected
+   live roles, single-controller exclusion, no child cgroup, no escape, and
+   no prior failure.
+9. Only then grant and consume the single bounded post-terminal evidence
+   capture.
+10. Write exactly `0\n` to `cgroup.freeze` and wait for a strict `frozen 0`
+    observation when normal continuation is still possible.
+11. Revalidate controller/workload identity and required live roles after
+    thaw; no capture authority is regranted.
+12. Only after capture is `CONSUMED` and thaw is confirmed, close provider
+    stdin and transition ACP protocol state to `CLOSED`.
+13. Continue to the already-authorized bounded provider termination/drain
+    state. If thaw cannot be confirmed, do not close stdin as normal protocol
+    progression or continue the provider. Capture remains terminally
+    `CONSUMED`, qualification blocks, the controller kills the frozen
+    workload, closes stdin only as cleanup, and proves recursive emptiness.
 
 `frozen 1` is necessary but not sufficient: the post-freeze identity,
 membership, topology, controller-exclusion, and prior-failure checks must all
@@ -327,7 +385,8 @@ pass. Failure to establish any element yields `BLOCKED` and authorizes no
 evidence capture. The design relies on the kernel guarantee that freezing a
 cgroup freezes its descendants and that `cgroup.events` reports `frozen 1`
 only after the transition completes; it does not assume an instantaneous
-write.
+write. Intentional protocol EOF is never allowed to race freeze convergence
+or expected-live-role validation on the successful path.
 
 ### Capture-authority state machine
 
@@ -352,15 +411,19 @@ the same failure latch owns both surfaces: the first terminal protocol,
 process, timeout, cgroup, census, or capture failure scrubs transient raw
 buffers, revokes capture authority, and disables all subsequent capture
 reads/writes. After a terminal authentication response, the only raw-pipe I/O
-that can remain is the single GRANTED evidence-capture operation.
+that can remain before EOF is the single GRANTED evidence-capture operation;
+the stdin descriptor remains open but cannot be written.
 
 Once revoked, `finally`, context-manager exit, cleanup callbacks, evidence
 serialization, error reporting, drain, and recovery paths may perform only
 already-authorized lifecycle cleanup and content-free metadata checks. They
 must not call capture `read`, `write`, `select`, `finish`, retry, or an alias
-that can reach them. Failure precedence is explicit: the first pre-capture
-failure dominates later cleanup results, while a cleanup failure may make the
-overall result more conservative but never regrant capture authority.
+that can reach them. Cleanup may close inert provider stdin and transition
+ACP protocol state to `CLOSED`, then kill/drain, but that close is a lifecycle
+operation only and cannot trigger a capture or protocol callback. Failure
+precedence is explicit: the first pre-capture failure dominates later cleanup
+results, while a cleanup failure may make the overall result more conservative
+but never regrant capture or protocol-write authority.
 
 ### Freeze races and fail-closed lifecycle
 
@@ -429,7 +492,11 @@ The normative kernel basis is the Linux cgroup-v2 definition of hierarchical
 `cgroup.freeze`, recursive `cgroup.events`, delegation containment, and
 `cgroup.kill`, plus `clone3(CLONE_INTO_CGROUP)` direct placement:
 [kernel cgroup-v2 documentation](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
-and [clone3 manual](https://man7.org/linux/man-pages/man2/clone.2.html).
+and [clone3 manual](https://man7.org/linux/man-pages/man2/clone.2.html). The
+controller identity rule follows the Linux pidfd distinction: without
+`PIDFD_THREAD`, `pidfd_open` binds a process leader rather than an arbitrary
+thread; see the
+[pidfd_open manual](https://man7.org/linux/man-pages/man2/pidfd_open.2.html).
 
 ## Synthetic qualification
 
@@ -473,6 +540,8 @@ may mount the real credential or launch real Kimi authentication.
 | Group | Case | Required observation |
 | --- | --- | --- |
 | A | Controller exclusion | Controller PID/TIDs remain in the service root while outer supervisor, inner supervisor, provider, every thread, and every descendant are in the identity-bound workload cgroup. |
+| A | Single controller TID | `/proc/self/task` contains exactly the process leader before direct placement and at every security checkpoint through drain/removal; injected thread creation blocks. |
+| A | Controller pidfd | One ordinary pidfd binds the single controller leader; instrumentation rejects `pidfd_open(nonleader_tid, 0)` and proves no thread-pidfd fallback exists. |
 | A | Direct placement | Outer supervisor is born with `CLONE_INTO_CGROUP`; instrumentation proves no pre-exec membership in the controller cgroup. |
 | A | Inheritance | Synthetic children and threads remain in the workload cgroup without migration. |
 | A | Escape/entry | Escaped, externally entered, migrated, missing, duplicate, or unclassifiable PID/TID blocks before capture. |
@@ -480,6 +549,10 @@ may mount the real credential or launch real Kimi authentication.
 | B | Freeze request | Exact `1\n` write occurs through the validated control FD; capture remains `NOT_YET_GRANTED` while `frozen 0`. |
 | B | Positive freeze | Strict `cgroup.events frozen 1` plus stable identity/membership grants capture once; a synthetic counter ceases advancing. |
 | B | Thaw | Exact `0\n` write and strict `frozen 0` allow normal termination; workload execution resumes only after confirmation. |
+| B | EOF-before-freeze fixture | A provider that exits immediately on stdin EOF remains live because stdin stays open through `frozen 1`, capture consumption, and confirmed thaw. |
+| B | Live-role stability | Outer supervisor, inner supervisor, and provider remain live and identity-stable for the complete frozen capture window. |
+| B | No post-terminal writes | After `TERMINAL_RESPONSE_ACCEPTED`, a bomb writer proves no ACP request, notification, retry, authentication repeat, or other byte is written while stdin remains open. |
+| B | Thaw-before-EOF ordering | Native trace proves exactly: terminal response, freeze request, `frozen 1`, capture consumed, thaw request, `frozen 0`, stdin EOF, bounded drain. |
 | C | Fork during freeze | Child inherits the workload boundary and is included in the kernel freeze; unexpected topology revokes capture. |
 | C | Exit/crash during freeze | Expected-role loss, pidfd exit, or `populated 0` revokes capture and drains. |
 | C | Freeze timeout | One absolute deadline expires, capture is never called, and recursive emptiness is proven. |
@@ -493,6 +566,7 @@ may mount the real credential or launch real Kimi authentication.
 | E | Cgroup authority bound | Controller can operate only within its delegated service subtree; host root, siblings, ancestors, and unrelated units are denied. |
 | F | Capture transitions | Exhaustively cover the four states and every admitted edge; all invalid/repeated edges fail closed. |
 | F | Revocation instrumentation | Each protocol, process, timeout, freezer, membership, census, evidence, and cleanup pre-capture failure latches `REVOKED`; bomb functions prove no later select/read/write/finish/retry path. |
+| F | Failure cleanup | A pre-capture failure revokes capture; cleanup may close inert stdin and kill/drain, while instrumentation proves no later capture or protocol I/O. |
 | F | Failure precedence | `finally`, context-manager exit, drain, serialization, and recovery cannot re-enter capture or replace the first typed failure with success. |
 | F | Controller crash | Native service test kills the controller while workload is frozen and proves bounded systemd kill, recursive `populated 0`, unit collection, and no orphan. |
 
@@ -534,6 +608,10 @@ Critical and Important finding concerning:
 - controller membership in the workload cgroup or workload escape from it;
 - cgroup identity accepted from path text, stale identity, or recreation;
 - capture before positive `frozen 1`, after revocation, or more than once;
+- provider stdin closed before capture consumption and confirmed thaw;
+- any protocol write after `TERMINAL_RESPONSE_ACCEPTED`;
+- controller thread creation during the freezer-critical interval or a
+  nonleader TID treated as process-pidfd identity;
 - signal-based or ptrace-based quiescence reintroduced by alias or fallback;
 - controller crash leaving a frozen or credential-bearing orphan; and
 - freezer authority broadening to unrelated host cgroups.
