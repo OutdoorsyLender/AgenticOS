@@ -23,6 +23,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Windows collection guard
     fcntl = None  # type: ignore[assignment]
 
+if os.name != "posix":  # pragma: no cover - Windows collection guard
+    pytest.skip("native Linux Bubblewrap required", allow_module_level=True)
+
 import agenticos.providers.kimi_local_auth_runtime as local_auth_runtime
 from agenticos.providers.kimi_local_auth_namespace import (
     NamespaceLauncherError,
