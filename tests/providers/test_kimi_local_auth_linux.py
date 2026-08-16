@@ -6,7 +6,6 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 import ctypes
 import errno
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -18,6 +17,11 @@ import sys
 import textwrap
 
 import pytest
+
+try:
+    import fcntl
+except ModuleNotFoundError:  # pragma: no cover - Windows collection guard
+    fcntl = None  # type: ignore[assignment]
 
 import agenticos.providers.kimi_local_auth_runtime as local_auth_runtime
 from agenticos.providers.kimi_local_auth_namespace import (

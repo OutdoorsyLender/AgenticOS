@@ -4,13 +4,17 @@ import io
 import json
 import os
 from pathlib import Path
-import fcntl
 import signal
 import subprocess
 import sys
 import types
 
 import pytest
+
+try:
+    import fcntl
+except ModuleNotFoundError:  # pragma: no cover - Windows collection guard
+    fcntl = None  # type: ignore[assignment]
 
 from agenticos.providers import kimi_local_auth_freezer as freezer
 from agenticos.providers.kimi_local_auth import (
@@ -33,6 +37,12 @@ from agenticos.providers.kimi_local_auth_freezer import (
 )
 from agenticos.providers import kimi_local_auth_runtime as runtime
 from agenticos.providers.kimi_local_auth_runtime import local_auth_systemd_command
+
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix",
+    reason="POSIX cgroup-freezer boundary tests",
+)
 
 
 INITIALIZE_SUCCESS = (

@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 import errno
-import fcntl
 import io
 import json
 import os
@@ -18,6 +17,11 @@ import threading
 import time
 
 import pytest
+
+try:
+    import fcntl
+except ModuleNotFoundError:  # pragma: no cover - Windows collection guard
+    fcntl = None  # type: ignore[assignment]
 
 import agenticos.providers.kimi_runtime as kimi_runtime
 import agenticos.providers.kimi_local_auth_runtime as local_auth_runtime
@@ -36,6 +40,12 @@ from agenticos.providers.kimi_local_auth_runtime import (
     default_local_auth_spec,
     open_validated_credential_leaf,
     persist_typed_result,
+)
+
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix",
+    reason="POSIX local-auth boundary tests",
 )
 
 
