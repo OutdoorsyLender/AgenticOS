@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import errno
 import fcntl
 import json
 import os
+import shutil
 import stat
 from pathlib import Path
 
 import pytest
 
+import agenticos.providers.kimi_runtime as kimi_runtime
 import agenticos.providers.kimi_local_auth_runtime as local_auth_runtime
 from agenticos.providers.kimi_local_auth import (
     KimiLocalAuthError,
@@ -80,6 +83,15 @@ EXPECTED_ATTEMPT_BYTES = (
     b'"lifecycle":"CLAIMED_BEFORE_LAUNCH","pinned_executable_sha256":'
     b'"78c07b255e0bdc8dfe90d0cbd3204a3d862957394a08ca99c6e31144732451c7",'
     b'"schema":"AOS_KIMI_LEVEL1_ATTEMPT/1"}\n'
+)
+ROOT = Path(__file__).resolve().parents[2]
+PINNED_RUNTIME = Path(
+    "/home/brand/.local/share/agenticos/provider-qualification/"
+    "kimi-code/0.36.1/runtime/bin/kimi"
+)
+QUALIFIED_BUNDLE = ROOT / "qualification" / "kimi-code" / "0.36.1"
+CANONICAL_LOCAL_AUTH_LAUNCHER = (
+    ROOT / "src" / "agenticos" / "providers" / "kimi_local_auth_namespace.py"
 )
 
 
@@ -251,22 +263,12 @@ def test_la_c10_validated_credential_leaf_is_opath_not_read_authority(
 
 
 def _local_auth_spec(tmp_path: Path) -> KimiLocalAuthSpec:
-    executable = tmp_path / "runtime" / "bin" / "kimi"
-    executable.parent.mkdir(parents=True)
-    executable.write_bytes(b"synthetic executable never invoked")
-    executable.chmod(0o555)
-    bundle = tmp_path / "qualification"
-    (bundle / "agents").mkdir(parents=True)
-    (bundle / "config.toml").write_text("synthetic\n", encoding="utf-8")
-    (bundle / "agents" / "agent.md").write_text("synthetic\n", encoding="utf-8")
     state_root = make_structurally_valid_synthetic_state(tmp_path / "state")
     evidence_root = make_private_evidence_root(tmp_path / "evidence")
-    launcher = tmp_path / "kimi_local_auth_namespace.py"
-    launcher.write_text("# synthetic launcher never invoked\n", encoding="utf-8")
     return KimiLocalAuthSpec(
-        executable=executable.resolve(),
-        bundle=bundle.resolve(),
-        namespace_launcher=launcher.resolve(),
+        executable=PINNED_RUNTIME,
+        bundle=QUALIFIED_BUNDLE,
+        namespace_launcher=CANONICAL_LOCAL_AUTH_LAUNCHER,
         state_root=state_root.resolve(),
         evidence_root=evidence_root.resolve(),
     )
@@ -464,6 +466,227 @@ def test_la_n04_default_argv_spec_names_fixed_qualified_and_external_roots() -> 
             "kimi-code/0.36.1/level1-local-auth"
         ),
     )
+
+
+def test_la_c14_launch_vector_directly_revalidates_qualified_artifacts(
+    tmp_path: Path,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        argv = build_local_auth_bwrap_argv(spec, credential)
+    finally:
+        credential.close()
+    assert str(kimi_runtime.BWRAP) == argv[0]
+    assert str(PINNED_RUNTIME) in argv
+    assert str(QUALIFIED_BUNDLE / "config.toml") in argv
+    assert str(QUALIFIED_BUNDLE / "agents") in argv
+    assert str(CANONICAL_LOCAL_AUTH_LAUNCHER) in argv
+
+
+@pytest.mark.parametrize(
+    ("relative", "expected", "replacement"),
+    [
+        ("artifact.json", '"version": "0.36.1"', '"version": "0.36.2"'),
+        ("config.toml", "default_plan_mode = true", "default_plan_mode = false"),
+        ("agents/agent.md", "tools: []", "tools: [AgenticOSPlannerNoToolSentinel]"),
+        (
+            "data-root-policy.json",
+            '"workspace_authority": "NONE"',
+            '"workspace_authority": "READ_WRITE"',
+        ),
+    ],
+)
+def test_la_c14_pin_revalidation_rejects_every_qualified_bundle_drift(
+    tmp_path: Path,
+    relative: str,
+    expected: str,
+    replacement: str,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    drifted_bundle = tmp_path / "drifted-qualification"
+    shutil.copytree(QUALIFIED_BUNDLE, drifted_bundle)
+    target = drifted_bundle / relative
+    source = target.read_text(encoding="utf-8")
+    assert expected in source
+    target.write_text(source.replace(expected, replacement, 1), encoding="utf-8")
+    drifted = replace(spec, bundle=drifted_bundle)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError, match="LOCAL_AUTH_PIN_RECHECK_FAILED"
+        ):
+            build_local_auth_bwrap_argv(drifted, credential)
+    finally:
+        credential.close()
+
+
+def test_la_c14_pin_revalidation_runs_for_every_vector_construction(
+    tmp_path: Path,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    mutable_bundle = tmp_path / "mutable-qualification"
+    shutil.copytree(QUALIFIED_BUNDLE, mutable_bundle)
+    candidate = replace(spec, bundle=mutable_bundle)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        build_local_auth_bwrap_argv(candidate, credential)
+        config = mutable_bundle / "config.toml"
+        source = config.read_text(encoding="utf-8")
+        assert "default_plan_mode = true" in source
+        config.write_text(
+            source.replace("default_plan_mode = true", "default_plan_mode = false", 1),
+            encoding="utf-8",
+        )
+        with pytest.raises(
+            KimiLocalAuthRuntimeError, match="LOCAL_AUTH_PIN_RECHECK_FAILED"
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+@pytest.mark.parametrize("substitution", ["file", "symlink"])
+def test_la_c14_pin_revalidation_rejects_executable_substitution(
+    tmp_path: Path,
+    substitution: str,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    executable = tmp_path / "substituted-kimi"
+    if substitution == "symlink":
+        executable.symlink_to(PINNED_RUNTIME)
+    else:
+        executable.write_bytes(b"synthetic executable never invoked")
+        executable.chmod(0o555)
+    candidate = replace(spec, executable=executable)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError, match="LOCAL_AUTH_PIN_RECHECK_FAILED"
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+def test_la_c14_pin_revalidation_rejects_bundle_symlink(tmp_path: Path) -> None:
+    spec = _local_auth_spec(tmp_path)
+    bundle_link = tmp_path / "qualification-link"
+    bundle_link.symlink_to(QUALIFIED_BUNDLE, target_is_directory=True)
+    candidate = replace(spec, bundle=bundle_link)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError, match="LOCAL_AUTH_PIN_RECHECK_FAILED"
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+def test_la_c14_pin_revalidation_rejects_bwrap_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    drifted_bwrap = tmp_path / "bwrap"
+    drifted_bwrap.write_bytes(b"synthetic bwrap never invoked")
+    drifted_bwrap.chmod(0o755)
+    monkeypatch.setattr(kimi_runtime, "BWRAP", drifted_bwrap)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError, match="LOCAL_AUTH_PIN_RECHECK_FAILED"
+        ):
+            build_local_auth_bwrap_argv(spec, credential)
+    finally:
+        credential.close()
+
+
+@pytest.mark.parametrize("substitution", ["file", "symlink"])
+def test_la_c14_launcher_path_substitution_is_forbidden(
+    tmp_path: Path,
+    substitution: str,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    launcher = tmp_path / "substituted-launcher.py"
+    if substitution == "symlink":
+        launcher.symlink_to(CANONICAL_LOCAL_AUTH_LAUNCHER)
+    else:
+        shutil.copyfile(CANONICAL_LOCAL_AUTH_LAUNCHER, launcher)
+        launcher.chmod(0o644)
+    candidate = replace(spec, namespace_launcher=launcher)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError, match="LOCAL_AUTH_LAUNCHER_SUBSTITUTION"
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
+
+
+@pytest.mark.parametrize("drift", ["content", "mode"])
+def test_la_c14_canonical_launcher_identity_drift_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    launcher = tmp_path / "canonical-launcher.py"
+    shutil.copyfile(CANONICAL_LOCAL_AUTH_LAUNCHER, launcher)
+    launcher.chmod(0o644)
+    if drift == "content":
+        launcher.write_bytes(launcher.read_bytes() + b"# identity drift\n")
+    else:
+        launcher.chmod(0o664)
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_CANONICAL_LOCAL_AUTH_LAUNCHER",
+        launcher,
+        raising=False,
+    )
+    candidate = replace(spec, namespace_launcher=launcher)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        with pytest.raises(
+            KimiLocalAuthRuntimeError, match="LOCAL_AUTH_LAUNCHER_IDENTITY"
+        ):
+            build_local_auth_bwrap_argv(candidate, credential)
+    finally:
+        credential.close()
 
 
 @pytest.mark.parametrize(

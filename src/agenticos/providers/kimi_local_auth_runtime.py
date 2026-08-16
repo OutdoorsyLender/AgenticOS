@@ -21,9 +21,10 @@ from agenticos.providers.kimi_policy import (
     PINNED_EXECUTABLE_SHA256,
     KimiPolicyError,
     build_kimi_environment,
+    sha256_file,
     validate_future_credential_directory,
 )
-from agenticos.providers.kimi_runtime import BWRAP, SANDBOX_EXECUTABLE
+import agenticos.providers.kimi_runtime as kimi_runtime
 
 
 REAL_PROVIDER_STATE_ROOT: Final = Path(
@@ -40,6 +41,12 @@ SANDBOX_LOCAL_AUTH_LAUNCHER: Final = (
 SANDBOX_CREDENTIAL_ROOT: Final = "/home/aos/kimi/credentials"
 SANDBOX_CREDENTIAL_LEAF: Final = (
     "/home/aos/kimi/credentials/kimi-code.json"
+)
+_CANONICAL_LOCAL_AUTH_LAUNCHER: Final = Path(__file__).with_name(
+    "kimi_local_auth_namespace.py"
+)
+_PINNED_LOCAL_AUTH_LAUNCHER_SHA256: Final = (
+    "861c5fecbf9599e158000fb732c661e51c9592c20be55e0eef458d1d663e60db"
 )
 
 _ATTEMPT_FILE: Final = "attempt.json"
@@ -312,6 +319,56 @@ def _assert_launchable_credential(credential: CredentialLeafHandle) -> None:
         raise KimiLocalAuthRuntimeError("CREDENTIAL_HANDLE_INVALID")
 
 
+def _launcher_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_uid,
+        info.st_gid,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _verify_canonical_launcher(path: Path) -> None:
+    if path != _CANONICAL_LOCAL_AUTH_LAUNCHER:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_LAUNCHER_SUBSTITUTION")
+    try:
+        before = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_LAUNCHER_IDENTITY") from exc
+    if (
+        resolved != path
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or stat.S_IMODE(before.st_mode) != 0o644
+        or before.st_nlink != 1
+    ):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_LAUNCHER_IDENTITY")
+    try:
+        digest = sha256_file(path)
+        after = path.lstat()
+    except OSError as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_LAUNCHER_IDENTITY") from exc
+    if (
+        digest != _PINNED_LOCAL_AUTH_LAUNCHER_SHA256
+        or _launcher_identity(before) != _launcher_identity(after)
+    ):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_LAUNCHER_IDENTITY")
+
+
+def _verify_local_auth_launch_artifacts(spec: KimiLocalAuthSpec) -> None:
+    try:
+        kimi_runtime.build_runtime_spec(spec.executable, spec.bundle)
+    except kimi_runtime.KimiRuntimeError as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_PIN_RECHECK_FAILED") from exc
+    _verify_canonical_launcher(spec.namespace_launcher)
+
+
 def build_local_auth_bwrap_argv(
     spec: KimiLocalAuthSpec,
     credential: CredentialLeafHandle,
@@ -320,9 +377,10 @@ def build_local_auth_bwrap_argv(
 
     if not isinstance(spec, KimiLocalAuthSpec):
         raise KimiLocalAuthRuntimeError("LOCAL_AUTH_RUNTIME_ARGUMENT")
+    _verify_local_auth_launch_artifacts(spec)
     _assert_launchable_credential(credential)
     argv = [
-        str(BWRAP),
+        str(kimi_runtime.BWRAP),
         "--unshare-user",
         "--unshare-pid",
         "--unshare-net",
@@ -360,7 +418,7 @@ def build_local_auth_bwrap_argv(
         "/opt/agenticos/kimi/bin",
         "--ro-bind",
         str(spec.executable),
-        SANDBOX_EXECUTABLE,
+        kimi_runtime.SANDBOX_EXECUTABLE,
         "--ro-bind",
         str(spec.namespace_launcher),
         SANDBOX_LOCAL_AUTH_LAUNCHER,

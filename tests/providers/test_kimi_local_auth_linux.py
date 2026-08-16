@@ -34,6 +34,11 @@ from agenticos.providers.kimi_local_auth_runtime import (
 
 ROOT = Path(__file__).resolve().parents[2]
 BWRAP = Path("/usr/bin/bwrap")
+PINNED_RUNTIME = Path(
+    "/home/brand/.local/share/agenticos/provider-qualification/"
+    "kimi-code/0.36.1/runtime/bin/kimi"
+)
+QUALIFIED_BUNDLE = ROOT / "qualification" / "kimi-code" / "0.36.1"
 LAUNCHER = ROOT / "src" / "agenticos" / "providers" / "kimi_local_auth_namespace.py"
 SANDBOX_LAUNCHER = "/opt/agenticos/kimi/local_auth_namespace.py"
 SYNTHETIC_CREDENTIAL_BYTES = b'{"access_token":"synthetic-kernel-canary"}\n'
@@ -46,14 +51,6 @@ pytestmark = pytest.mark.skipif(
 
 
 def _spec(tmp_path: Path) -> KimiLocalAuthSpec:
-    executable = tmp_path / "runtime" / "bin" / "kimi"
-    executable.parent.mkdir(parents=True)
-    executable.write_bytes(b"synthetic executable never invoked")
-    executable.chmod(0o555)
-    bundle = tmp_path / "qualification"
-    (bundle / "agents").mkdir(parents=True)
-    (bundle / "config.toml").write_text("synthetic\n", encoding="utf-8")
-    (bundle / "agents" / "agent.md").write_text("synthetic\n", encoding="utf-8")
     state_root = tmp_path / "state"
     credential_root = state_root / "credentials"
     credential_root.mkdir(parents=True, mode=0o700)
@@ -65,8 +62,8 @@ def _spec(tmp_path: Path) -> KimiLocalAuthSpec:
     evidence_root = tmp_path / "evidence"
     evidence_root.mkdir(mode=0o700)
     return KimiLocalAuthSpec(
-        executable=executable.resolve(),
-        bundle=bundle.resolve(),
+        executable=PINNED_RUNTIME,
+        bundle=QUALIFIED_BUNDLE,
         namespace_launcher=LAUNCHER,
         state_root=state_root.resolve(),
         evidence_root=evidence_root.resolve(),
