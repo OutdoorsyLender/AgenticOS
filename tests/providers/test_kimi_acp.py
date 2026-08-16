@@ -165,6 +165,8 @@ def test_decode_acp_line_rejects_duplicate_keys_invalid_utf8_bounds_and_truncati
 
 def test_shared_outbound_encoder_rejects_wrong_method_construction() -> None:
     with pytest.raises(KimiAcpError, match="OUTBOUND_REQUEST_SHAPE"):
+        encode_acp_request(None, 1, {})  # type: ignore[arg-type]
+    with pytest.raises(KimiAcpError, match="OUTBOUND_REQUEST_SHAPE"):
         encode_acp_request("initialize", True, {})
     with pytest.raises(KimiAcpError, match="OUTBOUND_REQUEST_SHAPE"):
         encode_acp_request("initialize", 1, [])  # type: ignore[arg-type]
