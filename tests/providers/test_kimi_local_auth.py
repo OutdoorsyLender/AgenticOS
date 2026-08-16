@@ -3,11 +3,15 @@ from __future__ import annotations
 from dataclasses import replace
 import errno
 import fcntl
+import io
 import json
 import os
 import shutil
 import stat
 from pathlib import Path
+import signal
+import subprocess
+import threading
 
 import pytest
 
@@ -1842,3 +1846,926 @@ def test_la_e04_evidence_root_ancestor_overlap_blocks(
         )
     assert rejected.value.code == "SYNTHETIC_REAL_CROSSOVER"
     assert not (evidence_root / "attempt.json").exists()
+
+
+AUTHENTICATE_SUCCESS = _line(
+    {"jsonrpc": "2.0", "id": 2, "result": None}
+)
+AUTHENTICATE_REJECTION = _line(
+    {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "error": {"code": -32000, "message": "synthetic rejection"},
+    }
+)
+EXPECTED_INITIALIZE_REQUEST = (
+    b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":'
+    b'{"protocolVersion":1,"clientCapabilities":{}}}\n'
+)
+EXPECTED_AUTHENTICATE_REQUEST = (
+    b'{"jsonrpc":"2.0","id":2,"method":"authenticate",'
+    b'"params":{"methodId":"login"}}\n'
+)
+
+
+class _RecordingInput:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+        self.flush_count = 0
+        self.closed = False
+
+    def write(self, value: bytes) -> int:
+        assert not self.closed
+        self.writes.append(value)
+        return len(value)
+
+    def flush(self) -> None:
+        assert not self.closed
+        self.flush_count += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _ScriptedProcess:
+    def __init__(
+        self,
+        stdout: object,
+        *,
+        stderr: object | None = None,
+        returncode: int | None = None,
+    ) -> None:
+        self.pid = 4242
+        self.stdin = _RecordingInput()
+        self.stdout = stdout
+        self.stderr = io.BytesIO() if stderr is None else stderr
+        self.returncode = returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+class _LinesThenBlock:
+    def __init__(self, lines: bytes) -> None:
+        self._lines = io.BytesIO(lines)
+        self._released = threading.Event()
+
+    def readline(self, limit: int = -1) -> bytes:
+        line = self._lines.readline(limit)
+        if line:
+            return line
+        self._released.wait(5)
+        return b""
+
+    def close(self) -> None:
+        pass
+
+    def release(self) -> None:
+        self._released.set()
+
+
+class _DelayedLines:
+    def __init__(self, lines: bytes, delay_seconds: float) -> None:
+        self._lines = io.BytesIO(lines)
+        self._delay_seconds = delay_seconds
+
+    def readline(self, limit: int = -1) -> bytes:
+        line = self._lines.readline(limit)
+        if line:
+            threading.Event().wait(self._delay_seconds)
+        return line
+
+    def close(self) -> None:
+        self._lines.close()
+
+
+class _CloseSensitiveDelayedOverflow:
+    def __init__(self) -> None:
+        self._closed = False
+        self._returned = False
+
+    def read(self, _limit: int = -1) -> bytes:
+        if self._returned:
+            return b""
+        threading.Event().wait(0.1)
+        if self._closed:
+            raise ValueError("closed before bounded drain")
+        self._returned = True
+        return b"e" * 65_537
+
+    def close(self) -> None:
+        self._closed = True
+
+
+def _valid_runner_census(*, descendant_count: int = 0):
+    return local_auth_runtime.LocalAuthCensus(
+        process_count=1 + descendant_count,
+        descendant_count=descendant_count,
+        environment_names=(
+            "HOME",
+            "KIMI_CODE_HOME",
+            "KIMI_CODE_NO_AUTO_UPDATE",
+            "KIMI_DISABLE_CRON",
+            "KIMI_DISABLE_TELEMETRY",
+            "LANG",
+            "LC_ALL",
+            "PATH",
+            "PWD",
+            "TMPDIR",
+        ),
+        fd_classes=("pipe",),
+        network_namespace="net:[4242]",
+        external_endpoint_count=0,
+        session_artifact_count=0,
+        cleanup_complete=False,
+    )
+
+
+def _runner_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[KimiLocalAuthSpec, object]:
+    isolate_real_roots(monkeypatch, tmp_path)
+    spec = _local_auth_spec(tmp_path, monkeypatch)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "build_local_auth_bwrap_argv",
+        lambda observed_spec, observed_credential: [
+            "/usr/bin/bwrap",
+            "--unshare-net",
+            "--",
+            "/usr/bin/python3",
+            "/opt/agenticos/kimi/local_auth_namespace.py",
+            str(observed_credential.device),
+            str(observed_credential.inode),
+        ]
+        if observed_spec is spec
+        else pytest.fail("runner changed the fixed spec"),
+    )
+    return spec, credential
+
+
+def _run_scripted_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process: _ScriptedProcess,
+    *,
+    census: object | None = None,
+    drain_error: bool = False,
+    timeout_seconds: float = 0.5,
+):
+    spec, credential = _runner_inputs(tmp_path, monkeypatch)
+    launches: list[tuple[list[str], dict[str, object]]] = []
+    drains: list[int] = []
+
+    def process_factory(argv: list[str], **kwargs: object) -> _ScriptedProcess:
+        launches.append((argv, kwargs))
+        return process
+
+    def drain(observed: object) -> None:
+        assert observed is process
+        drains.append(process.pid)
+        if drain_error:
+            raise RuntimeError("synthetic content-free drain failure")
+        if process.returncode is None:
+            process.returncode = -signal.SIGTERM
+
+    outcome = local_auth_runtime.run_local_auth(
+        spec,
+        credential,
+        process_factory=process_factory,
+        census_sampler=lambda observed, argv: (
+            _valid_runner_census() if census is None else census
+        ),
+        drain_process=drain,
+        timeout_seconds=timeout_seconds,
+    )
+    return outcome, credential, launches, drains
+
+
+@pytest.mark.parametrize(
+    ("terminal", "credential_state", "reason_code"),
+    [
+        (
+            AUTHENTICATE_SUCCESS,
+            LocalCredentialState.LOADABLE,
+            "ACP_LOCAL_AUTH_SUCCESS",
+        ),
+        (
+            AUTHENTICATE_REJECTION,
+            LocalCredentialState.REJECTED,
+            "ACP_LOCAL_AUTH_REJECTED",
+        ),
+    ],
+)
+def test_la_r01_runner_sends_only_initialize_then_authenticate_and_drains_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: bytes,
+    credential_state: LocalCredentialState,
+    reason_code: str,
+) -> None:
+    process = _ScriptedProcess(io.BytesIO(INITIALIZE_SUCCESS + terminal))
+    outcome, credential, launches, drains = _run_scripted_process(
+        tmp_path, monkeypatch, process
+    )
+
+    assert outcome.protocol.credential_state is credential_state
+    assert outcome.protocol.auth_state == "LOCAL_ONLY"
+    assert outcome.protocol.level2_status == (
+        "BLOCKED_NO_SAFE_QUALIFIED_OFFICIAL_ENTRYPOINT"
+    )
+    assert outcome.reason_code == reason_code
+    assert outcome.census.cleanup_complete is True
+    assert process.stdin.writes == [
+        EXPECTED_INITIALIZE_REQUEST,
+        EXPECTED_AUTHENTICATE_REQUEST,
+    ]
+    assert process.stdin.flush_count == 2
+    assert process.stdin.closed is True
+    assert drains == [process.pid]
+    assert credential._closed is True
+    assert len(launches) == 1
+    _argv, kwargs = launches[0]
+    assert kwargs == {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "env": {},
+        "close_fds": True,
+        "pass_fds": (credential.descriptor,),
+        "start_new_session": True,
+    }
+
+
+def test_la_r02_runner_pin_recheck_failure_closes_without_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, credential = _runner_inputs(tmp_path, monkeypatch)
+
+    def fail_builder(_spec: object, _credential: object) -> list[str]:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_PIN_RECHECK_FAILED")
+
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "build_local_auth_bwrap_argv",
+        fail_builder,
+    )
+    outcome = local_auth_runtime.run_local_auth(
+        spec,
+        credential,
+        process_factory=lambda *_args, **_kwargs: pytest.fail(
+            "pin failure launched a process"
+        ),
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.protocol.credential_state is LocalCredentialState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_PIN_RECHECK_FAILED"
+    assert outcome.census.cleanup_complete is True
+    assert credential._closed is True
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected_reason"),
+    [
+        (
+            _line({"jsonrpc": "2.0", "id": 99, "result": {}}),
+            None,
+            "UNEXPECTED_RESPONSE_ID",
+        ),
+        (b"", 7, "LOCAL_AUTH_PROCESS_CRASH"),
+        (b"", -signal.SIGSYS, "LOCAL_AUTH_NETWORK_POLICY_VIOLATION"),
+        (
+            b"x" * 65_537 + b"\n",
+            None,
+            "LOCAL_AUTH_STDOUT_FRAME_LIMIT",
+        ),
+        (
+            INITIALIZE_SUCCESS
+            + AUTHENTICATE_SUCCESS
+            + _line({"jsonrpc": "2.0", "method": "session/update", "params": {}}),
+            None,
+            "UNEXPECTED_CALLBACK",
+        ),
+    ],
+)
+def test_la_r02_r03_runner_blocks_wrong_crash_sigsys_overflow_and_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+    returncode: int | None,
+    expected_reason: str,
+) -> None:
+    process = _ScriptedProcess(io.BytesIO(stdout), returncode=returncode)
+    outcome, credential, launches, drains = _run_scripted_process(
+        tmp_path, monkeypatch, process
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.protocol.credential_state is LocalCredentialState.BLOCKED
+    assert outcome.protocol.auth_state == "LOCAL_ONLY"
+    assert outcome.reason_code == expected_reason
+    assert outcome.census.cleanup_complete is True
+    assert credential._closed is True
+    assert len(launches) == 1
+    assert drains == [process.pid]
+
+
+def test_la_r03_runner_blocks_bounded_stderr_overflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS),
+        stderr=io.BytesIO(b"e" * 65_537),
+    )
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path, monkeypatch, process
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_STDERR_LIMIT"
+    assert drains == [process.pid]
+
+
+def test_la_r03_runner_drains_delayed_stderr_before_closing_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS),
+        stderr=_CloseSensitiveDelayedOverflow(),
+    )
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path, monkeypatch, process
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_STDERR_LIMIT"
+    assert outcome.census.cleanup_complete is True
+    assert drains == [process.pid]
+
+
+def test_la_r01_runner_uses_one_nonresetting_timeout_and_drains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delayed = _DelayedLines(
+        INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS,
+        delay_seconds=0.015,
+    )
+    process = _ScriptedProcess(delayed)
+    outcome, credential, launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        timeout_seconds=0.02,
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_TIMEOUT"
+    assert outcome.census.cleanup_complete is True
+    assert credential._closed is True
+    assert len(launches) == 1
+    assert drains == [process.pid]
+    assert process.stdin.writes == [
+        EXPECTED_INITIALIZE_REQUEST,
+        EXPECTED_AUTHENTICATE_REQUEST,
+    ]
+
+
+def test_la_r03_stuck_reader_blocks_even_after_valid_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocked = _LinesThenBlock(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    process = _ScriptedProcess(blocked)
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "LOCAL_AUTH_READER_JOIN_SECONDS",
+        0.01,
+    )
+    try:
+        outcome, _credential, _launches, drains = _run_scripted_process(
+            tmp_path, monkeypatch, process
+        )
+    finally:
+        blocked.release()
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_CAPTURE_READER_STUCK"
+    assert outcome.census.cleanup_complete is False
+    assert drains == [process.pid]
+
+
+def test_la_r05_r07_descendant_or_cleanup_uncertainty_cannot_succeed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        census=_valid_runner_census(descendant_count=1),
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_CENSUS_POLICY"
+    assert outcome.census.descendant_count == 1
+    assert outcome.census.cleanup_complete is True
+    assert drains == [process.pid]
+
+
+def test_la_r07_drain_uncertainty_blocks_valid_authentication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        drain_error=True,
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.protocol.credential_state is LocalCredentialState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_CLEANUP_FAILED"
+    assert outcome.census.cleanup_complete is False
+    assert drains == [process.pid]
+
+
+@pytest.mark.parametrize(
+    "census",
+    [
+        replace(
+            _valid_runner_census(),
+            environment_names=(*_valid_runner_census().environment_names, "TOKEN"),
+        ),
+        replace(_valid_runner_census(), fd_classes=("pipe", "socket")),
+        replace(_valid_runner_census(), network_namespace="host-net"),
+        replace(_valid_runner_census(), external_endpoint_count=1),
+        replace(_valid_runner_census(), session_artifact_count=1),
+    ],
+)
+def test_la_r05_r06_every_census_policy_violation_blocks_without_raw_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    census: object,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        census=census,
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.protocol.credential_state is LocalCredentialState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_CENSUS_POLICY"
+    assert "TOKEN" not in outcome.reason_code
+    assert drains == [process.pid]
+
+
+def test_la_r06_content_free_artifact_census_covers_workspace_home_and_tmp(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox-root"
+    (sandbox / "workspace").mkdir(parents=True)
+    (sandbox / "tmp").mkdir()
+    kimi_home = sandbox / "home" / "aos" / "kimi"
+    (kimi_home / "agents").mkdir(parents=True)
+    (kimi_home / "credentials").mkdir()
+    (kimi_home / "config.toml").write_text("synthetic config\n", encoding="utf-8")
+    (kimi_home / "agents" / "agent.md").write_text(
+        "synthetic agent\n", encoding="utf-8"
+    )
+    (kimi_home / "credentials" / "kimi-code.json").write_text(
+        "synthetic credential never read by production\n",
+        encoding="utf-8",
+    )
+
+    assert local_auth_runtime._count_sandbox_artifacts(sandbox) == 0
+    (sandbox / "workspace" / "unexpected-state").write_text(
+        "synthetic workspace canary\n", encoding="utf-8"
+    )
+    (kimi_home / "sessions").mkdir()
+    (sandbox / "tmp" / "model-cache").write_text(
+        "synthetic temp canary\n", encoding="utf-8"
+    )
+    assert local_auth_runtime._count_sandbox_artifacts(sandbox) == 3
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [Path("workspace"), Path("tmp"), Path("home/aos/kimi")],
+)
+def test_la_r06_artifact_census_fails_closed_on_missing_sandbox_root(
+    tmp_path: Path,
+    relative: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox-root"
+    (sandbox / "workspace").mkdir(parents=True)
+    (sandbox / "tmp").mkdir()
+    (sandbox / "home" / "aos" / "kimi").mkdir(parents=True)
+    shutil.rmtree(sandbox / relative)
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        local_auth_runtime._count_sandbox_artifacts(sandbox)
+    assert rejected.value.code == "LOCAL_AUTH_CENSUS_FAILED"
+
+
+def _write_scope_files(
+    root: Path,
+    *,
+    maximum: str = "21",
+    current: str = "1",
+    events: str = "max 0",
+    memory: str = "1073741824",
+) -> str:
+    relative = "/user.slice/aos-kimi-level1-local-auth.scope"
+    scope = root / relative.removeprefix("/")
+    scope.mkdir(parents=True)
+    (scope / "pids.max").write_text(maximum + "\n", encoding="ascii")
+    (scope / "pids.current").write_text(current + "\n", encoding="ascii")
+    (scope / "pids.events").write_text(events + "\n", encoding="ascii")
+    (scope / "memory.max").write_text(memory + "\n", encoding="ascii")
+    return f"0::{relative}\n"
+
+
+def test_la_r05_scope_admits_only_exact_finite_fresh_budget(tmp_path: Path) -> None:
+    cgroup_text = _write_scope_files(tmp_path)
+    assert (
+        local_auth_runtime.validate_local_auth_scope(
+            cgroup_text,
+            cgroup_root=tmp_path,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_code"),
+    [
+        ("maximum", "max", "LOCAL_AUTH_SCOPE_TASKS_MAX"),
+        ("maximum", "20", "LOCAL_AUTH_SCOPE_TASKS_MAX"),
+        ("maximum", "22", "LOCAL_AUTH_SCOPE_TASKS_MAX"),
+        ("current", "2", "LOCAL_AUTH_SCOPE_NOT_EMPTY"),
+        ("events", "max 1", "LOCAL_AUTH_SCOPE_EXHAUSTED"),
+        ("memory", "1073741823", "LOCAL_AUTH_SCOPE_MEMORY_MAX"),
+        ("memory", "max", "LOCAL_AUTH_SCOPE_MEMORY_MAX"),
+    ],
+)
+def test_la_r05_scope_rejects_every_budget_drift(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    expected_code: str,
+) -> None:
+    values = {
+        "maximum": "21",
+        "current": "1",
+        "events": "max 0",
+        "memory": "1073741824",
+    }
+    values[field] = value
+    cgroup_text = _write_scope_files(tmp_path, **values)
+
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        local_auth_runtime.validate_local_auth_scope(
+            cgroup_text,
+            cgroup_root=tmp_path,
+        )
+    assert rejected.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    "cgroup_text",
+    [
+        "",
+        "0::/user.slice/aos-kimi-owner-login.scope\n",
+        "0::/user.slice/aos-kimi-level1-local-auth.scope/child\n",
+        "0::/user.slice/../aos-kimi-level1-local-auth.scope\n",
+        "0::/first/aos-kimi-level1-local-auth.scope\n0::/second\n",
+    ],
+)
+def test_la_r05_scope_rejects_wrong_or_ambiguous_membership(
+    tmp_path: Path,
+    cgroup_text: str,
+) -> None:
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        local_auth_runtime.validate_local_auth_scope(
+            cgroup_text,
+            cgroup_root=tmp_path,
+        )
+    assert rejected.value.code == "LOCAL_AUTH_SCOPE_REQUIRED"
+
+
+def test_la_r05_systemd_vector_is_fixed_and_has_no_shell_or_redirect() -> None:
+    command = local_auth_runtime.local_auth_systemd_command(CANDIDATE_COMMIT)
+    assert command == [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--unit=aos-kimi-level1-local-auth",
+        "--property=KillMode=control-group",
+        "--property=TimeoutStopSec=5s",
+        "--property=TasksMax=21",
+        "--property=MemoryMax=1G",
+        "/usr/bin/python3",
+        "/home/brand/src/AgenticOS/scripts/run_kimi_local_auth.py",
+        "--expected-commit",
+        CANDIDATE_COMMIT,
+    ]
+    assert not any(
+        item in command
+        for item in ("sh", "bash", "tee", ">", "--retry", "--network")
+    )
+
+
+def _install_cli_happy_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[list[str], object]:
+    calls: list[str] = []
+    spec = KimiLocalAuthSpec(
+        executable=Path("/qualified/kimi"),
+        bundle=Path("/qualified/bundle"),
+        namespace_launcher=Path("/qualified/launcher.py"),
+        state_root=Path("/real/state"),
+        evidence_root=Path("/real/evidence"),
+    )
+
+    class Credential:
+        descriptor = 9
+        _closed = False
+
+        def close(self) -> None:
+            self._closed = True
+
+    credential = Credential()
+    outcome = local_auth_runtime.LocalAuthRunOutcome(
+        protocol=LocalAuthProtocolOutcome(
+            qualification=QualificationState.COMPLETE,
+            credential_state=LocalCredentialState.LOADABLE,
+        ),
+        census=replace(_valid_runner_census(), cleanup_complete=True),
+        reason_code="ACP_LOCAL_AUTH_SUCCESS",
+    )
+
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_validate_local_auth_script",
+        lambda: calls.append("script"),
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_read_self_cgroup",
+        lambda: "0::/user.slice/aos-kimi-level1-local-auth.scope\n",
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "validate_local_auth_scope",
+        lambda _text: calls.append("scope"),
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "validate_repository_identity",
+        lambda _root, _commit: calls.append("repository"),
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "default_local_auth_spec",
+        lambda: calls.append("spec_factory") or spec,
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "validate_local_auth_spec",
+        lambda _spec, **_kwargs: calls.append("runtime"),
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "validate_pre_real_gate",
+        lambda _root, _commit: calls.append("gate"),
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "open_validated_credential_leaf",
+        lambda *_args, **_kwargs: calls.append("credential") or credential,
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "claim_real_attempt",
+        lambda *_args, **_kwargs: calls.append("marker"),
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "run_local_auth",
+        lambda *_args, **_kwargs: calls.append("runner") or outcome,
+    )
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "persist_typed_result",
+        lambda *_args, **_kwargs: calls.append("persist"),
+    )
+    return calls, credential
+
+
+def test_la_r04_cli_orders_all_gates_before_marker_and_one_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, credential = _install_cli_happy_path(monkeypatch, tmp_path)
+    output: list[str] = []
+    assert (
+        local_auth_runtime.cli_main(
+            ["--expected-commit", CANDIDATE_COMMIT],
+            output=output.append,
+        )
+        == 0
+    )
+    assert calls == [
+        "script",
+        "scope",
+        "repository",
+        "spec_factory",
+        "runtime",
+        "gate",
+        "credential",
+        "marker",
+        "runner",
+        "scope",
+        "persist",
+    ]
+    assert credential._closed is True
+    assert output == [
+        "F1_KIMI_LEVEL1_LOCAL_AUTH_QUALIFICATION=COMPLETE",
+        "F1_KIMI_LOCAL_CREDENTIAL_STATE=LOADABLE",
+        "F1_KIMI_AUTH_STATE=LOCAL_ONLY",
+        (
+            "F1_KIMI_LEVEL2_NON_INFERENCE_STATUS="
+            "BLOCKED_NO_SAFE_QUALIFIED_OFFICIAL_ENTRYPOINT"
+        ),
+        "F1_KIMI_LEVEL1_LOCAL_AUTH_REASON=ACP_LOCAL_AUTH_SUCCESS",
+    ]
+
+
+@pytest.mark.parametrize("failing_gate", ["scope", "repository", "runtime", "gate"])
+def test_la_r04_cli_gate_failure_bombs_before_credential_marker_or_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_gate: str,
+) -> None:
+    calls, _credential = _install_cli_happy_path(monkeypatch, tmp_path)
+    names = {
+        "scope": "validate_local_auth_scope",
+        "repository": "validate_repository_identity",
+        "runtime": "validate_local_auth_spec",
+        "gate": "validate_pre_real_gate",
+    }
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        calls.append(f"{failing_gate}-failed")
+        raise KimiLocalAuthRuntimeError(f"{failing_gate.upper()}_BLOCKED")
+
+    monkeypatch.setattr(local_auth_runtime, names[failing_gate], fail)
+    output: list[str] = []
+    assert (
+        local_auth_runtime.cli_main(
+            ["--expected-commit", CANDIDATE_COMMIT],
+            output=output.append,
+        )
+        == 2
+    )
+    assert "credential" not in calls
+    assert "marker" not in calls
+    assert "runner" not in calls
+    assert output == [
+        f"F1_KIMI_LEVEL1_LOCAL_AUTH_ERROR={failing_gate.upper()}_BLOCKED"
+    ]
+
+
+def test_la_r04_cli_evidence_failure_is_typed_and_never_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, credential = _install_cli_happy_path(monkeypatch, tmp_path)
+
+    def fail_persist(*_args: object, **_kwargs: object) -> None:
+        calls.append("persist-failed")
+        raise KimiLocalAuthRuntimeError("RESULT_EVIDENCE_WRITE_FAILED")
+
+    monkeypatch.setattr(local_auth_runtime, "persist_typed_result", fail_persist)
+    output: list[str] = []
+    assert (
+        local_auth_runtime.cli_main(
+            ["--expected-commit", CANDIDATE_COMMIT],
+            output=output.append,
+        )
+        == 2
+    )
+    assert calls.count("marker") == 1
+    assert calls.count("runner") == 1
+    assert calls.count("persist-failed") == 1
+    assert credential._closed is True
+    assert output == [
+        "F1_KIMI_LEVEL1_LOCAL_AUTH_ERROR=RESULT_EVIDENCE_WRITE_FAILED"
+    ]
+
+
+def test_la_r07_post_run_scope_drift_persists_blocked_cleanup_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, credential = _install_cli_happy_path(monkeypatch, tmp_path)
+    scope_checks = 0
+    persisted: list[tuple[LocalAuthProtocolOutcome, dict[str, int | bool]]] = []
+
+    def scope_check(_text: str) -> None:
+        nonlocal scope_checks
+        scope_checks += 1
+        calls.append(f"scope-{scope_checks}")
+        if scope_checks == 2:
+            raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_EXHAUSTED")
+
+    def persist(
+        _root: Path,
+        protocol: LocalAuthProtocolOutcome,
+        census: dict[str, int | bool],
+        **_kwargs: object,
+    ) -> None:
+        calls.append("persist-blocked")
+        persisted.append((protocol, census))
+
+    monkeypatch.setattr(local_auth_runtime, "validate_local_auth_scope", scope_check)
+    monkeypatch.setattr(local_auth_runtime, "persist_typed_result", persist)
+    output: list[str] = []
+
+    assert (
+        local_auth_runtime.cli_main(
+            ["--expected-commit", CANDIDATE_COMMIT],
+            output=output.append,
+        )
+        == 2
+    )
+    assert scope_checks == 2
+    assert calls.count("marker") == 1
+    assert calls.count("runner") == 1
+    assert calls.count("persist-blocked") == 1
+    assert credential._closed is True
+    protocol, census = persisted[0]
+    assert protocol.qualification is QualificationState.BLOCKED
+    assert protocol.credential_state is LocalCredentialState.BLOCKED
+    assert protocol.reason_code == "ACP_LOCAL_AUTH_BLOCKED"
+    assert census["cleanup_complete"] is False
+    assert output == [
+        "F1_KIMI_LEVEL1_LOCAL_AUTH_QUALIFICATION=BLOCKED",
+        "F1_KIMI_LOCAL_CREDENTIAL_STATE=BLOCKED",
+        "F1_KIMI_AUTH_STATE=LOCAL_ONLY",
+        (
+            "F1_KIMI_LEVEL2_NON_INFERENCE_STATUS="
+            "BLOCKED_NO_SAFE_QUALIFIED_OFFICIAL_ENTRYPOINT"
+        ),
+        "F1_KIMI_LEVEL1_LOCAL_AUTH_REASON=LOCAL_AUTH_SCOPE_EXHAUSTED",
+    ]
+
+
+def test_la_r04_cli_rejects_every_command_or_path_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_auth_runtime,
+        "_validate_local_auth_script",
+        lambda: pytest.fail("invalid arguments reached the script gate"),
+    )
+    output: list[str] = []
+    assert (
+        local_auth_runtime.cli_main(
+            [
+                "--expected-commit",
+                CANDIDATE_COMMIT,
+                "--command",
+                "session/new",
+            ],
+            output=output.append,
+        )
+        == 2
+    )
+    assert output == ["F1_KIMI_LEVEL1_LOCAL_AUTH_ERROR=CLI_ARGUMENT"]

@@ -2,20 +2,34 @@
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
 import os
+import queue
 import re
+import signal
 import stat
+import subprocess
+import sys
+import threading
+import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Final
+from typing import Callable, Final
 
 from agenticos.providers.kimi_local_auth import (
+    KimiLocalAuthError,
+    KimiLocalAuthSession,
     LocalAuthProtocolOutcome,
     LocalCredentialState,
     QualificationState,
+)
+from agenticos.providers.kimi_login import (
+    KimiLoginError,
+    terminate_and_drain_process,
+    validate_repository_identity,
 )
 from agenticos.providers.kimi_policy import (
     PINNED_EXECUTABLE_SHA256,
@@ -55,6 +69,23 @@ _CANONICAL_LOCAL_AUTH_LAUNCHER: Final = Path(__file__).with_name(
 _PINNED_LOCAL_AUTH_LAUNCHER_SHA256: Final = (
     "861c5fecbf9599e158000fb732c661e51c9592c20be55e0eef458d1d663e60db"
 )
+LOCAL_AUTH_SCRIPT: Final = REPO_ROOT / "scripts" / "run_kimi_local_auth.py"
+PRE_REAL_GATE: Final = (
+    REPO_ROOT
+    / "docs"
+    / "phase-zero"
+    / "first-autonomous-build-slice-f1-kimi-local-auth-pre-real.md"
+)
+
+QUALIFIED_LOCAL_AUTH_TASKS_MAX: Final = 21
+LOCAL_AUTH_MEMORY_MAX_BYTES: Final = 1_073_741_824
+LOCAL_AUTH_TIMEOUT_SECONDS: Final = 30.0
+LOCAL_AUTH_MAX_FRAMES: Final = 4
+LOCAL_AUTH_MAX_FRAME_BYTES: Final = 65_536
+LOCAL_AUTH_MAX_STDERR_BYTES: Final = 65_536
+LOCAL_AUTH_READER_JOIN_SECONDS: Final = 2.0
+_LOCAL_AUTH_SCOPE_SUFFIX: Final = "/aos-kimi-level1-local-auth.scope"
+_NETWORK_NAMESPACE: Final = re.compile(r"net:\[[0-9]+\]\Z")
 
 _ATTEMPT_FILE: Final = "attempt.json"
 _RESULT_FILE: Final = "result.json"
@@ -95,6 +126,25 @@ class KimiLocalAuthRuntimeError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAuthCensus:
+    process_count: int
+    descendant_count: int
+    environment_names: tuple[str, ...]
+    fd_classes: tuple[str, ...]
+    network_namespace: str
+    external_endpoint_count: int
+    session_artifact_count: int
+    cleanup_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAuthRunOutcome:
+    protocol: LocalAuthProtocolOutcome
+    census: LocalAuthCensus
+    reason_code: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +545,158 @@ def default_local_auth_spec() -> KimiLocalAuthSpec:
     )
 
 
+def validate_local_auth_scope(
+    cgroup_text: str,
+    *,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> None:
+    """Admit only the fresh, exact finite Level-1 systemd scope."""
+
+    if type(cgroup_text) is not str:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_REQUIRED")
+    lines = [line for line in cgroup_text.splitlines() if line]
+    if len(lines) != 1 or not lines[0].startswith("0::"):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_REQUIRED")
+    relative = lines[0][3:]
+    parts = Path(relative).parts
+    if (
+        not relative.startswith("/")
+        or not relative.endswith(_LOCAL_AUTH_SCOPE_SUFFIX)
+        or ".." in parts
+        or not isinstance(cgroup_root, Path)
+        or not cgroup_root.is_absolute()
+    ):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_REQUIRED")
+    scope_root = cgroup_root.joinpath(*parts[1:])
+    try:
+        maximum = (scope_root / "pids.max").read_text(encoding="ascii").strip()
+        current = (scope_root / "pids.current").read_text(encoding="ascii").strip()
+        events = (scope_root / "pids.events").read_text(encoding="ascii").strip()
+        memory = (scope_root / "memory.max").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_INVALID") from exc
+    if not maximum.isdecimal() or int(maximum) != QUALIFIED_LOCAL_AUTH_TASKS_MAX:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_TASKS_MAX")
+    if not current.isdecimal():
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_INVALID")
+    if int(current) != 1:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_NOT_EMPTY")
+    event_parts = events.split()
+    if (
+        len(event_parts) != 2
+        or event_parts[0] != "max"
+        or not event_parts[1].isdecimal()
+    ):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_INVALID")
+    if int(event_parts[1]) != 0:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_EXHAUSTED")
+    if not memory.isdecimal() or int(memory) != LOCAL_AUTH_MEMORY_MAX_BYTES:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_MEMORY_MAX")
+
+
+def local_auth_systemd_command(candidate_commit: str) -> list[str]:
+    """Return the only admitted owner vector for the conditional real attempt."""
+
+    if type(candidate_commit) is not str or _COMMIT_ID.fullmatch(candidate_commit) is None:
+        raise KimiLocalAuthRuntimeError("CLI_ARGUMENT")
+    return [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--unit=aos-kimi-level1-local-auth",
+        "--property=KillMode=control-group",
+        "--property=TimeoutStopSec=5s",
+        f"--property=TasksMax={QUALIFIED_LOCAL_AUTH_TASKS_MAX}",
+        "--property=MemoryMax=1G",
+        "/usr/bin/python3",
+        str(LOCAL_AUTH_SCRIPT),
+        "--expected-commit",
+        candidate_commit,
+    ]
+
+
+def _validate_local_auth_script() -> None:
+    try:
+        lexical = LOCAL_AUTH_SCRIPT.lstat()
+        resolved = LOCAL_AUTH_SCRIPT.resolve(strict=True)
+        invoked = Path(sys.argv[0]).resolve(strict=True)
+    except OSError as exc:
+        raise KimiLocalAuthRuntimeError("SCRIPT_IDENTITY") from exc
+    if (
+        resolved != LOCAL_AUTH_SCRIPT
+        or invoked != LOCAL_AUTH_SCRIPT
+        or LOCAL_AUTH_SCRIPT.is_symlink()
+        or not stat.S_ISREG(lexical.st_mode)
+        or lexical.st_uid != os.getuid()
+        or stat.S_IMODE(lexical.st_mode) not in (0o644, 0o755)
+        or lexical.st_nlink != 1
+    ):
+        raise KimiLocalAuthRuntimeError("SCRIPT_IDENTITY")
+
+
+def _read_self_cgroup() -> str:
+    try:
+        return Path("/proc/self/cgroup").read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_SCOPE_INVALID") from exc
+
+
+def validate_local_auth_spec(
+    spec: KimiLocalAuthSpec,
+    *,
+    expected_uid: int,
+) -> None:
+    """Recheck the immutable runtime and the two fixed external roots."""
+
+    if (
+        not isinstance(spec, KimiLocalAuthSpec)
+        or type(expected_uid) is not int
+        or expected_uid < 0
+        or spec != default_local_auth_spec()
+    ):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_RUNTIME_ARGUMENT")
+    _verify_local_auth_launch_artifacts(spec)
+    state = _resolve_existing(spec.state_root, "CREDENTIAL_DIRECTORY_PATH")
+    evidence = _resolve_existing(spec.evidence_root, "EVIDENCE_ROOT_PATH")
+    if state != REAL_PROVIDER_STATE_ROOT or evidence != REAL_EVIDENCE_ROOT:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_RUNTIME_PATH")
+    evidence_fd = _open_validated_evidence_root(spec.evidence_root, expected_uid)
+    os.close(evidence_fd)
+
+
+def validate_pre_real_gate(repo_root: Path, candidate_commit: str) -> None:
+    """Require the fixed Task-7 GO checkpoint before marker or credential open."""
+
+    if (
+        repo_root != REPO_ROOT
+        or type(candidate_commit) is not str
+        or _COMMIT_ID.fullmatch(candidate_commit) is None
+        or PRE_REAL_GATE.parent != repo_root / "docs" / "phase-zero"
+    ):
+        raise KimiLocalAuthRuntimeError("PRE_REAL_GATE_BLOCKED")
+    try:
+        payload = PRE_REAL_GATE.read_bytes()
+        text = payload.decode("utf-8", errors="strict")
+    except (OSError, UnicodeError) as exc:
+        raise KimiLocalAuthRuntimeError("PRE_REAL_GATE_BLOCKED") from exc
+    if len(payload) > 65_536:
+        raise KimiLocalAuthRuntimeError("PRE_REAL_GATE_BLOCKED")
+    required = (
+        "F1_KIMI_LEVEL1_PRE_REAL_GATE=GO",
+        "UNRESOLVED_CRITICAL=0",
+        "UNRESOLVED_IMPORTANT=0",
+        "REAL_ATTEMPT_COUNT=0",
+        "REAL_LOGIN_EXECUTED=NO",
+        "REAL_PROMPT_EXECUTED=NO",
+        "REAL_INFERENCE_EXECUTED=NO",
+    )
+    lines = text.splitlines()
+    if any(lines.count(line) != 1 for line in required):
+        raise KimiLocalAuthRuntimeError("PRE_REAL_GATE_BLOCKED")
+
+
 def _validate_candidate(candidate_commit: str, expected_uid: int) -> None:
     if (
         type(candidate_commit) is not str
@@ -753,3 +955,540 @@ def persist_typed_result(
         )
     finally:
         os.close(directory_fd)
+
+
+class _LocalAuthRunFailure(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def _blocked_protocol() -> LocalAuthProtocolOutcome:
+    return LocalAuthProtocolOutcome(
+        qualification=QualificationState.BLOCKED,
+        credential_state=LocalCredentialState.BLOCKED,
+        reason_code="ACP_LOCAL_AUTH_BLOCKED",
+    )
+
+
+def _empty_census(*, cleanup_complete: bool) -> LocalAuthCensus:
+    return LocalAuthCensus(
+        process_count=0,
+        descendant_count=0,
+        environment_names=(),
+        fd_classes=(),
+        network_namespace="UNKNOWN",
+        external_endpoint_count=0,
+        session_artifact_count=0,
+        cleanup_complete=cleanup_complete,
+    )
+
+
+def _process_exit_code(process: object) -> str:
+    returncode = getattr(process, "poll")()
+    if returncode == -signal.SIGSYS:
+        return "LOCAL_AUTH_NETWORK_POLICY_VIOLATION"
+    return "LOCAL_AUTH_PROCESS_CRASH"
+
+
+def _read_proc_environment_names(pid: int) -> tuple[str, ...]:
+    try:
+        payload = (Path("/proc") / str(pid) / "environ").read_bytes()
+    except OSError as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED") from exc
+    names: set[str] = set()
+    try:
+        for item in payload.split(b"\0"):
+            if not item:
+                continue
+            name, separator, _value = item.partition(b"=")
+            if not separator:
+                raise ValueError
+            decoded = name.decode("ascii", errors="strict")
+            if not decoded or "=" in decoded:
+                raise ValueError
+            names.add(decoded)
+    except (UnicodeError, ValueError) as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED") from exc
+    return tuple(sorted(names))
+
+
+def _classify_fd_target(target: str) -> str:
+    if target.startswith("pipe:["):
+        return "pipe"
+    if target.startswith("socket:["):
+        return "socket"
+    if target.startswith("anon_inode:"):
+        return "anon_inode"
+    if target.startswith("/"):
+        return "path"
+    return "other"
+
+
+def _read_fd_classes(pid: int) -> tuple[str, ...]:
+    root = Path("/proc") / str(pid) / "fd"
+    try:
+        entries = tuple(root.iterdir())
+        if {entry.name for entry in entries} != {"0", "1", "2"}:
+            raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FD")
+        classes = {
+            _classify_fd_target(os.readlink(entry))
+            for entry in entries
+        }
+    except KimiLocalAuthRuntimeError:
+        raise
+    except OSError as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED") from exc
+    return tuple(sorted(classes))
+
+
+def _process_group_members(pid: int) -> tuple[int, ...]:
+    try:
+        process_group = os.getpgid(pid)
+        members = tuple(
+            candidate
+            for entry in Path("/proc").iterdir()
+            if entry.name.isdecimal()
+            for candidate in (int(entry.name),)
+            if _safe_process_group(candidate) == process_group
+        )
+    except (OSError, ValueError) as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED") from exc
+    if pid not in members:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED")
+    return tuple(sorted(members))
+
+
+def _safe_process_group(pid: int) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except (ProcessLookupError, PermissionError):
+        return None
+
+
+def _count_inet_rows(pid: int) -> int:
+    total = 0
+    for name in ("tcp", "tcp6", "udp", "udp6"):
+        try:
+            rows = (Path("/proc") / str(pid) / "net" / name).read_text(
+                encoding="ascii"
+            ).splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED") from exc
+        total += max(0, len(rows) - 1)
+    return total
+
+
+def _count_sandbox_artifacts(sandbox_root: Path) -> int:
+    if not isinstance(sandbox_root, Path) or not sandbox_root.is_absolute():
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED")
+    matches = 0
+    try:
+        workspace = sandbox_root / "workspace"
+        kimi_home = sandbox_root / "home" / "aos" / "kimi"
+        temporary = sandbox_root / "tmp"
+        for required in (workspace, kimi_home, temporary):
+            info = required.lstat()
+            if required.is_symlink() or not stat.S_ISDIR(info.st_mode):
+                raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED")
+        for _current, directories, files in os.walk(workspace, followlinks=False):
+            matches += len(directories) + len(files)
+        for root in (kimi_home, temporary):
+            for _current, directories, files in os.walk(root, followlinks=False):
+                for name in (*directories, *files):
+                    folded = name.casefold()
+                    if any(
+                        token in folded
+                        for token in ("session", "history", "model")
+                    ):
+                        matches += 1
+    except OSError as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED") from exc
+    return matches
+
+
+def _count_session_artifacts(pid: int) -> int:
+    root = Path("/proc") / str(pid) / "root"
+    return _count_sandbox_artifacts(root)
+
+
+def _sample_local_auth_census(
+    process: object,
+    argv: list[str],
+) -> LocalAuthCensus:
+    """Reduce live /proc state to names, classes, counts, and one namespace ID."""
+
+    pid = getattr(process, "pid", None)
+    if type(pid) is not int or pid <= 0 or type(argv) is not list:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED")
+    proc_root = Path("/proc") / str(pid)
+    try:
+        cmdline = (proc_root / "cmdline").read_bytes()
+        executable = Path(os.readlink(proc_root / "exe"))
+        namespace = os.readlink(proc_root / "ns" / "net")
+    except OSError as exc:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_FAILED") from exc
+    expected_bwrap = b"\0".join(item.encode("utf-8") for item in argv) + b"\0"
+    expected_kimi = b"kimi-code\0acp\0"
+    if cmdline == expected_bwrap:
+        if executable != kimi_runtime.BWRAP:
+            raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_EXECUTABLE")
+    elif cmdline == expected_kimi:
+        if executable != _CANONICAL_LOCAL_AUTH_EXECUTABLE:
+            raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_EXECUTABLE")
+    else:
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_ARGV")
+    members = _process_group_members(pid)
+    return LocalAuthCensus(
+        process_count=len(members),
+        descendant_count=len(members) - 1,
+        environment_names=_read_proc_environment_names(pid),
+        fd_classes=_read_fd_classes(pid),
+        network_namespace=namespace,
+        external_endpoint_count=_count_inet_rows(pid),
+        session_artifact_count=_count_session_artifacts(pid),
+        cleanup_complete=False,
+    )
+
+
+def _validate_live_census(census: LocalAuthCensus) -> None:
+    expected_environment = tuple(sorted(build_kimi_environment()))
+    if (
+        type(census) is not LocalAuthCensus
+        or type(census.process_count) is not int
+        or census.process_count != 1
+        or type(census.descendant_count) is not int
+        or census.descendant_count != 0
+        or census.environment_names != expected_environment
+        or census.fd_classes != ("pipe",)
+        or _NETWORK_NAMESPACE.fullmatch(census.network_namespace) is None
+        or type(census.external_endpoint_count) is not int
+        or census.external_endpoint_count != 0
+        or type(census.session_artifact_count) is not int
+        or census.session_artifact_count != 0
+        or type(census.cleanup_complete) is not bool
+        or census.cleanup_complete
+    ):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_CENSUS_POLICY")
+
+
+def _close_stream(stream: object | None) -> None:
+    if stream is None:
+        return
+    try:
+        getattr(stream, "close")()
+    except (OSError, ValueError):
+        pass
+
+
+def run_local_auth(
+    spec: KimiLocalAuthSpec,
+    credential: CredentialLeafHandle,
+    *,
+    process_factory: Callable[..., object] = subprocess.Popen,
+    census_sampler: Callable[[object, list[str]], LocalAuthCensus] = (
+        _sample_local_auth_census
+    ),
+    drain_process: Callable[[object], None] = terminate_and_drain_process,
+    timeout_seconds: float = LOCAL_AUTH_TIMEOUT_SECONDS,
+) -> LocalAuthRunOutcome:
+    """Run one bounded initialize/authenticate exchange and drain exactly once."""
+
+    if (
+        not isinstance(spec, KimiLocalAuthSpec)
+        or not callable(process_factory)
+        or not callable(census_sampler)
+        or not callable(drain_process)
+        or type(timeout_seconds) not in (int, float)
+        or not 0.01 <= float(timeout_seconds) <= LOCAL_AUTH_TIMEOUT_SECONDS
+    ):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_RUN_ARGUMENT")
+    try:
+        argv = build_local_auth_bwrap_argv(spec, credential)
+    except KimiLocalAuthRuntimeError as exc:
+        credential.close()
+        return LocalAuthRunOutcome(
+            protocol=_blocked_protocol(),
+            census=_empty_census(cleanup_complete=True),
+            reason_code=exc.code,
+        )
+    session = KimiLocalAuthSession()
+    process: object | None = None
+    census: LocalAuthCensus | None = None
+    reason_code: str | None = None
+    cleanup_complete = False
+    records: queue.Queue[tuple[str, object]] = queue.Queue()
+    shutdown = threading.Event()
+    readers: tuple[threading.Thread, ...] = ()
+    deadline = time.monotonic() + float(timeout_seconds)
+
+    def stdout_reader(stream: object) -> None:
+        frame_count = 0
+        try:
+            while True:
+                frame = getattr(stream, "readline")(LOCAL_AUTH_MAX_FRAME_BYTES + 2)
+                if not frame:
+                    records.put(("stdout_eof", None))
+                    return
+                if type(frame) is not bytes:
+                    records.put(("error", "LOCAL_AUTH_CAPTURE_READER_FAILED"))
+                    return
+                frame_count += 1
+                if len(frame) > LOCAL_AUTH_MAX_FRAME_BYTES or not frame.endswith(b"\n"):
+                    records.put(("error", "LOCAL_AUTH_STDOUT_FRAME_LIMIT"))
+                    return
+                if frame_count > LOCAL_AUTH_MAX_FRAMES:
+                    records.put(("error", "LOCAL_AUTH_STDOUT_FRAME_COUNT"))
+                    return
+                records.put(("frame", frame))
+        except BaseException:
+            if not shutdown.is_set():
+                records.put(("error", "LOCAL_AUTH_CAPTURE_READER_FAILED"))
+
+    def stderr_reader(stream: object) -> None:
+        captured = 0
+        try:
+            while True:
+                chunk = getattr(stream, "read")(8_192)
+                if not chunk:
+                    records.put(("stderr_eof", None))
+                    return
+                if type(chunk) is not bytes:
+                    records.put(("error", "LOCAL_AUTH_CAPTURE_READER_FAILED"))
+                    return
+                captured += len(chunk)
+                if captured > LOCAL_AUTH_MAX_STDERR_BYTES:
+                    records.put(("error", "LOCAL_AUTH_STDERR_LIMIT"))
+                    return
+        except BaseException:
+            if not shutdown.is_set():
+                records.put(("error", "LOCAL_AUTH_CAPTURE_READER_FAILED"))
+
+    def next_frame() -> bytes:
+        while True:
+            observed = getattr(process, "poll")()
+            if observed is not None:
+                raise _LocalAuthRunFailure(_process_exit_code(process))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _LocalAuthRunFailure("LOCAL_AUTH_TIMEOUT")
+            try:
+                kind, value = records.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise _LocalAuthRunFailure("LOCAL_AUTH_TIMEOUT") from exc
+            if kind == "frame":
+                assert type(value) is bytes
+                return value
+            if kind == "error":
+                assert type(value) is str
+                raise _LocalAuthRunFailure(value)
+            if kind == "stdout_eof":
+                if getattr(process, "poll")() is not None:
+                    raise _LocalAuthRunFailure(_process_exit_code(process))
+                raise _LocalAuthRunFailure("LOCAL_AUTH_STDOUT_CLOSED")
+
+    try:
+        process = process_factory(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={},
+            close_fds=True,
+            pass_fds=(credential.descriptor,),
+            start_new_session=True,
+        )
+        credential.close()
+        stdin = getattr(process, "stdin", None)
+        stdout = getattr(process, "stdout", None)
+        stderr = getattr(process, "stderr", None)
+        if stdin is None or stdout is None or stderr is None:
+            raise _LocalAuthRunFailure("LOCAL_AUTH_PIPE_SETUP")
+        readers = (
+            threading.Thread(target=stdout_reader, args=(stdout,), daemon=True),
+            threading.Thread(target=stderr_reader, args=(stderr,), daemon=True),
+        )
+        for reader in readers:
+            reader.start()
+        if getattr(process, "poll")() is not None:
+            raise _LocalAuthRunFailure(_process_exit_code(process))
+        initialize = session.initialize_request()
+        getattr(stdin, "write")(initialize)
+        getattr(stdin, "flush")()
+        session.accept(next_frame())
+        authentication = session.authenticate_request()
+        getattr(stdin, "write")(authentication)
+        getattr(stdin, "flush")()
+        session.accept(next_frame())
+        _close_stream(stdin)
+        if getattr(process, "poll")() is not None:
+            raise _LocalAuthRunFailure(_process_exit_code(process))
+        census = census_sampler(process, argv)
+        _validate_live_census(census)
+    except KimiLocalAuthError as exc:
+        reason_code = exc.code
+    except KimiLocalAuthRuntimeError as exc:
+        reason_code = exc.code
+    except _LocalAuthRunFailure as exc:
+        reason_code = exc.code
+    except (BrokenPipeError, OSError, ValueError, TypeError):
+        reason_code = "LOCAL_AUTH_PROCESS_IO"
+    finally:
+        if process is None:
+            credential.close()
+        else:
+            _close_stream(getattr(process, "stdin", None))
+            try:
+                drain_process(process)
+                cleanup_complete = True
+            except BaseException:
+                reason_code = "LOCAL_AUTH_CLEANUP_FAILED"
+                cleanup_complete = False
+            for reader in readers:
+                reader.join(timeout=LOCAL_AUTH_READER_JOIN_SECONDS)
+            shutdown.set()
+            _close_stream(getattr(process, "stdout", None))
+            _close_stream(getattr(process, "stderr", None))
+            for reader in readers:
+                if reader.is_alive():
+                    reader.join(timeout=LOCAL_AUTH_READER_JOIN_SECONDS)
+            if any(reader.is_alive() for reader in readers):
+                reason_code = "LOCAL_AUTH_CAPTURE_READER_STUCK"
+                cleanup_complete = False
+
+    if process is not None:
+        while True:
+            try:
+                kind, value = records.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "error" and reason_code is None:
+                assert type(value) is str
+                reason_code = value
+            elif kind == "frame" and reason_code is None:
+                assert type(value) is bytes
+                try:
+                    session.accept(value)
+                except KimiLocalAuthError as exc:
+                    reason_code = exc.code
+    if census is None:
+        census = _empty_census(cleanup_complete=cleanup_complete)
+    else:
+        census = replace(census, cleanup_complete=cleanup_complete)
+    if not cleanup_complete and reason_code is None:
+        reason_code = "LOCAL_AUTH_CLEANUP_FAILED"
+    if reason_code is None:
+        try:
+            protocol = session.finish()
+        except KimiLocalAuthError as exc:
+            reason_code = exc.code
+            protocol = _blocked_protocol()
+        else:
+            reason_code = protocol.reason_code
+    else:
+        protocol = _blocked_protocol()
+    return LocalAuthRunOutcome(
+        protocol=protocol,
+        census=census,
+        reason_code=reason_code,
+    )
+
+
+def _persisted_census(census: LocalAuthCensus) -> dict[str, int | bool]:
+    return {
+        "process_count": census.process_count,
+        "descendant_count": census.descendant_count,
+        "environment_name_count": len(census.environment_names),
+        "fd_class_count": len(census.fd_classes),
+        "external_endpoint_count": census.external_endpoint_count,
+        "session_artifact_count": census.session_artifact_count,
+        "cleanup_complete": census.cleanup_complete,
+    }
+
+
+class _FailClosedArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise KimiLocalAuthRuntimeError("CLI_ARGUMENT")
+
+
+def cli_main(
+    argv: list[str] | None = None,
+    *,
+    output: Callable[[str], object] = print,
+) -> int:
+    """Fail-closed fixed entry point; output contains typed fields only."""
+
+    parser = _FailClosedArgumentParser(add_help=False)
+    parser.add_argument("--expected-commit", required=True)
+    credential: CredentialLeafHandle | None = None
+    try:
+        arguments = parser.parse_args(argv)
+        if _COMMIT_ID.fullmatch(arguments.expected_commit) is None:
+            raise KimiLocalAuthRuntimeError("CLI_ARGUMENT")
+        _validate_local_auth_script()
+        validate_local_auth_scope(_read_self_cgroup())
+        validate_repository_identity(REPO_ROOT, arguments.expected_commit)
+        spec = default_local_auth_spec()
+        expected_uid = os.getuid()
+        validate_local_auth_spec(spec, expected_uid=expected_uid)
+        validate_pre_real_gate(REPO_ROOT, arguments.expected_commit)
+        credential = open_validated_credential_leaf(
+            spec.state_root,
+            trusted_state_root=spec.state_root,
+            expected_uid=expected_uid,
+        )
+        claim_real_attempt(
+            spec.evidence_root,
+            candidate_commit=arguments.expected_commit,
+            expected_uid=expected_uid,
+        )
+        outcome = run_local_auth(spec, credential)
+        if type(outcome) is not LocalAuthRunOutcome:
+            raise KimiLocalAuthRuntimeError("LOCAL_AUTH_RUN_OUTCOME")
+        try:
+            validate_local_auth_scope(_read_self_cgroup())
+        except KimiLocalAuthRuntimeError as exc:
+            outcome = LocalAuthRunOutcome(
+                protocol=_blocked_protocol(),
+                census=replace(outcome.census, cleanup_complete=False),
+                reason_code=exc.code,
+            )
+        persist_typed_result(
+            spec.evidence_root,
+            outcome.protocol,
+            _persisted_census(outcome.census),
+            candidate_commit=arguments.expected_commit,
+            expected_uid=expected_uid,
+        )
+        output(
+            "F1_KIMI_LEVEL1_LOCAL_AUTH_QUALIFICATION="
+            f"{outcome.protocol.qualification.value}"
+        )
+        output(
+            "F1_KIMI_LOCAL_CREDENTIAL_STATE="
+            f"{outcome.protocol.credential_state.value}"
+        )
+        output(f"F1_KIMI_AUTH_STATE={outcome.protocol.auth_state}")
+        output(
+            "F1_KIMI_LEVEL2_NON_INFERENCE_STATUS="
+            f"{outcome.protocol.level2_status}"
+        )
+        output(f"F1_KIMI_LEVEL1_LOCAL_AUTH_REASON={outcome.reason_code}")
+        return (
+            0
+            if outcome.protocol.qualification is QualificationState.COMPLETE
+            and outcome.protocol.credential_state is LocalCredentialState.LOADABLE
+            else 2
+        )
+    except (KimiLocalAuthRuntimeError, KimiLoginError) as exc:
+        output(f"F1_KIMI_LEVEL1_LOCAL_AUTH_ERROR={exc.code}")
+        return 2
+    except (OSError, UnicodeError):
+        output("F1_KIMI_LEVEL1_LOCAL_AUTH_ERROR=LOCAL_VALIDATION_FAILED")
+        return 2
+    except Exception:
+        output("F1_KIMI_LEVEL1_LOCAL_AUTH_ERROR=LOCAL_AUTH_UNEXPECTED")
+        return 2
+    finally:
+        if credential is not None:
+            credential.close()
