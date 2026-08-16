@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 import stat
@@ -17,8 +18,11 @@ from agenticos.providers.kimi_local_auth import (
     QualificationState,
 )
 from agenticos.providers.kimi_local_auth_runtime import (
+    KimiLocalAuthSpec,
     KimiLocalAuthRuntimeError,
+    build_local_auth_bwrap_argv,
     claim_real_attempt,
+    default_local_auth_spec,
     open_validated_credential_leaf,
     persist_typed_result,
 )
@@ -223,6 +227,8 @@ def test_la_c10_validated_credential_leaf_is_opath_not_read_authority(
     )
     descriptor = handle.descriptor
     try:
+        descriptor_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+        assert descriptor_flags & fcntl.FD_CLOEXEC == fcntl.FD_CLOEXEC
         with pytest.raises(OSError) as rejected:
             os.read(descriptor, 1)
         assert rejected.value.errno == errno.EBADF
@@ -242,6 +248,222 @@ def test_la_c10_validated_credential_leaf_is_opath_not_read_authority(
     assert closed.value.errno == errno.EBADF
     handle.close()
     assert leaf.read_bytes() == before == SYNTHETIC_CREDENTIAL_BYTES
+
+
+def _local_auth_spec(tmp_path: Path) -> KimiLocalAuthSpec:
+    executable = tmp_path / "runtime" / "bin" / "kimi"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"synthetic executable never invoked")
+    executable.chmod(0o555)
+    bundle = tmp_path / "qualification"
+    (bundle / "agents").mkdir(parents=True)
+    (bundle / "config.toml").write_text("synthetic\n", encoding="utf-8")
+    (bundle / "agents" / "agent.md").write_text("synthetic\n", encoding="utf-8")
+    state_root = make_structurally_valid_synthetic_state(tmp_path / "state")
+    evidence_root = make_private_evidence_root(tmp_path / "evidence")
+    launcher = tmp_path / "kimi_local_auth_namespace.py"
+    launcher.write_text("# synthetic launcher never invoked\n", encoding="utf-8")
+    return KimiLocalAuthSpec(
+        executable=executable.resolve(),
+        bundle=bundle.resolve(),
+        namespace_launcher=launcher.resolve(),
+        state_root=state_root.resolve(),
+        evidence_root=evidence_root.resolve(),
+    )
+
+
+def test_la_c12_bwrap_mounts_exactly_one_credential_leaf_by_descriptor(
+    tmp_path: Path,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    leaf = spec.state_root / "credentials" / "kimi-code.json"
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        argv = build_local_auth_bwrap_argv(spec, credential)
+    finally:
+        credential.close()
+
+    mount_index = argv.index("--ro-bind-fd")
+    assert argv.count("--ro-bind-fd") == 1
+    assert argv[mount_index : mount_index + 3] == [
+        "--ro-bind-fd",
+        str(credential.descriptor),
+        "/home/aos/kimi/credentials/kimi-code.json",
+    ]
+    assert "--bind-fd" not in argv
+    assert str(leaf) not in argv
+    assert str(spec.state_root) not in argv
+    assert str(spec.evidence_root) not in argv
+
+
+def test_la_c13_credential_parent_is_created_then_remounted_read_only(
+    tmp_path: Path,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        argv = build_local_auth_bwrap_argv(spec, credential)
+    finally:
+        credential.close()
+
+    parent = "/home/aos/kimi/credentials"
+    create_index = next(
+        index
+        for index in range(len(argv) - 1)
+        if argv[index : index + 2] == ["--dir", parent]
+    )
+    mount_index = argv.index("--ro-bind-fd")
+    remount_index = next(
+        index
+        for index in range(len(argv) - 1)
+        if argv[index : index + 2] == ["--remount-ro", parent]
+    )
+    assert create_index < mount_index < remount_index
+    assert argv[remount_index : remount_index + 2] == ["--remount-ro", parent]
+    assert "--bind" not in argv
+
+
+def test_la_n01_namespace_is_route_less_without_host_network_files(
+    tmp_path: Path,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        argv = build_local_auth_bwrap_argv(spec, credential)
+    finally:
+        credential.close()
+
+    for flag in (
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--disable-userns",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+    ):
+        assert flag in argv
+    assert ["--tmpfs", "/workspace"] in [
+        argv[index : index + 2] for index in range(len(argv) - 1)
+    ]
+    assert ["--chdir", "/workspace"] in [
+        argv[index : index + 2] for index in range(len(argv) - 1)
+    ]
+    assert "/etc" not in argv
+    assert "/run" not in argv
+    assert "/var" not in argv
+    joined = "\n".join(argv)
+    for forbidden in (
+        "resolv.conf",
+        "/mnt/c",
+        "/home/brand/src/AgenticOS",
+        ".git",
+        "socket",
+        "relay",
+    ):
+        assert forbidden not in joined
+
+
+def test_la_n02_argv_environment_is_exact_and_has_no_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://ambient-proxy.invalid")
+    monkeypatch.setenv("ALL_PROXY", "socks5://ambient-proxy.invalid")
+    monkeypatch.setenv("KIMI_API_KEY", "ambient-secret")
+    spec = _local_auth_spec(tmp_path)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        argv = build_local_auth_bwrap_argv(spec, credential)
+    finally:
+        credential.close()
+
+    environment = {
+        argv[index + 1]: argv[index + 2]
+        for index, item in enumerate(argv)
+        if item == "--setenv"
+    }
+    assert environment == {
+        "HOME": "/home/aos",
+        "KIMI_CODE_HOME": "/home/aos/kimi",
+        "KIMI_CODE_NO_AUTO_UPDATE": "1",
+        "KIMI_DISABLE_CRON": "1",
+        "KIMI_DISABLE_TELEMETRY": "1",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/opt/agenticos/kimi/bin:/usr/bin",
+        "PWD": "/workspace",
+        "TMPDIR": "/tmp",
+    }
+    assert not any("proxy" in name.casefold() for name in environment)
+    assert "ambient" not in repr(argv)
+
+
+def test_la_n03_argv_launcher_receives_only_device_and_inode_metadata(
+    tmp_path: Path,
+) -> None:
+    spec = _local_auth_spec(tmp_path)
+    credential = open_validated_credential_leaf(
+        spec.state_root,
+        trusted_state_root=spec.state_root,
+        expected_uid=os.getuid(),
+    )
+    try:
+        argv = build_local_auth_bwrap_argv(spec, credential)
+    finally:
+        credential.close()
+
+    separator = argv.index("--")
+    assert argv[separator:] == [
+        "--",
+        "/usr/bin/python3",
+        "/opt/agenticos/kimi/local_auth_namespace.py",
+        str(credential.device),
+        str(credential.inode),
+    ]
+
+
+def test_la_n04_default_argv_spec_names_fixed_qualified_and_external_roots() -> None:
+    spec = default_local_auth_spec()
+    assert spec == KimiLocalAuthSpec(
+        executable=Path(
+            "/home/brand/.local/share/agenticos/provider-qualification/"
+            "kimi-code/0.36.1/runtime/bin/kimi"
+        ),
+        bundle=Path(
+            "/home/brand/src/AgenticOS/qualification/kimi-code/0.36.1"
+        ),
+        namespace_launcher=Path(
+            "/home/brand/src/AgenticOS/src/agenticos/providers/"
+            "kimi_local_auth_namespace.py"
+        ),
+        state_root=Path(
+            "/home/brand/.local/share/agenticos/provider-state/kimi-code/0.36.1"
+        ),
+        evidence_root=Path(
+            "/home/brand/.local/share/agenticos/controller-evidence/"
+            "kimi-code/0.36.1/level1-local-auth"
+        ),
+    )
 
 
 @pytest.mark.parametrize(

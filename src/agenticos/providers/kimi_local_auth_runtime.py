@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -19,8 +20,10 @@ from agenticos.providers.kimi_local_auth import (
 from agenticos.providers.kimi_policy import (
     PINNED_EXECUTABLE_SHA256,
     KimiPolicyError,
+    build_kimi_environment,
     validate_future_credential_directory,
 )
+from agenticos.providers.kimi_runtime import BWRAP, SANDBOX_EXECUTABLE
 
 
 REAL_PROVIDER_STATE_ROOT: Final = Path(
@@ -30,6 +33,14 @@ REAL_EVIDENCE_ROOT: Final = Path(
     "/home/brand/.local/share/agenticos/controller-evidence/kimi-code/0.36.1/level1-local-auth"
 )
 SANDBOX_WORKSPACE_ROOT: Final = Path("/workspace")
+REPO_ROOT: Final = Path("/home/brand/src/AgenticOS")
+SANDBOX_LOCAL_AUTH_LAUNCHER: Final = (
+    "/opt/agenticos/kimi/local_auth_namespace.py"
+)
+SANDBOX_CREDENTIAL_ROOT: Final = "/home/aos/kimi/credentials"
+SANDBOX_CREDENTIAL_LEAF: Final = (
+    "/home/aos/kimi/credentials/kimi-code.json"
+)
 
 _ATTEMPT_FILE: Final = "attempt.json"
 _RESULT_FILE: Final = "result.json"
@@ -70,6 +81,26 @@ class KimiLocalAuthRuntimeError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+@dataclass(frozen=True, slots=True)
+class KimiLocalAuthSpec:
+    executable: Path
+    bundle: Path
+    namespace_launcher: Path
+    state_root: Path
+    evidence_root: Path
+
+    def __post_init__(self) -> None:
+        paths = (
+            self.executable,
+            self.bundle,
+            self.namespace_launcher,
+            self.state_root,
+            self.evidence_root,
+        )
+        if any(not isinstance(path, Path) or not path.is_absolute() for path in paths):
+            raise KimiLocalAuthRuntimeError("LOCAL_AUTH_RUNTIME_PATH")
 
 
 @dataclass(slots=True)
@@ -246,6 +277,151 @@ def open_validated_credential_leaf(
         uid=opened.st_uid,
         mode=stat.S_IMODE(opened.st_mode),
         link_count=opened.st_nlink,
+    )
+
+
+def _assert_launchable_credential(credential: CredentialLeafHandle) -> None:
+    if (
+        not isinstance(credential, CredentialLeafHandle)
+        or credential._closed
+        or credential.descriptor < 3
+        or credential.device < 0
+        or credential.inode <= 0
+        or credential.uid < 0
+        or credential.mode != 0o600
+        or credential.link_count != 1
+    ):
+        raise KimiLocalAuthRuntimeError("CREDENTIAL_HANDLE_INVALID")
+    try:
+        info = os.fstat(credential.descriptor)
+        descriptor_flags = fcntl.fcntl(credential.descriptor, fcntl.F_GETFD)
+        status_flags = fcntl.fcntl(credential.descriptor, fcntl.F_GETFL)
+    except OSError as exc:
+        raise KimiLocalAuthRuntimeError("CREDENTIAL_HANDLE_INVALID") from exc
+    o_path = getattr(os, "O_PATH", None)
+    if (
+        type(o_path) is not int
+        or status_flags & o_path != o_path
+        or descriptor_flags & fcntl.FD_CLOEXEC != fcntl.FD_CLOEXEC
+        or not stat.S_ISREG(info.st_mode)
+        or (info.st_dev, info.st_ino) != (credential.device, credential.inode)
+        or info.st_uid != credential.uid
+        or stat.S_IMODE(info.st_mode) != credential.mode
+        or info.st_nlink != credential.link_count
+    ):
+        raise KimiLocalAuthRuntimeError("CREDENTIAL_HANDLE_INVALID")
+
+
+def build_local_auth_bwrap_argv(
+    spec: KimiLocalAuthSpec,
+    credential: CredentialLeafHandle,
+) -> list[str]:
+    """Build the route-less namespace around exactly one credential leaf."""
+
+    if not isinstance(spec, KimiLocalAuthSpec):
+        raise KimiLocalAuthRuntimeError("LOCAL_AUTH_RUNTIME_ARGUMENT")
+    _assert_launchable_credential(credential)
+    argv = [
+        str(BWRAP),
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--disable-userns",
+        "--die-with-parent",
+        "--new-session",
+        "--hostname",
+        "agenticos-kimi-local-auth",
+        "--clearenv",
+        "--tmpfs",
+        "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/lib",
+        "/lib",
+        "--ro-bind",
+        "/lib64",
+        "/lib64",
+        "--dir",
+        "/opt",
+        "--dir",
+        "/opt/agenticos",
+        "--dir",
+        "/opt/agenticos/kimi",
+        "--dir",
+        "/opt/agenticos/kimi/bin",
+        "--ro-bind",
+        str(spec.executable),
+        SANDBOX_EXECUTABLE,
+        "--ro-bind",
+        str(spec.namespace_launcher),
+        SANDBOX_LOCAL_AUTH_LAUNCHER,
+        "--dir",
+        "/home",
+        "--dir",
+        "/home/aos",
+        "--tmpfs",
+        "/home/aos/kimi",
+        "--ro-bind",
+        str(spec.bundle / "config.toml"),
+        "/home/aos/kimi/config.toml",
+        "--ro-bind",
+        str(spec.bundle / "agents"),
+        "/home/aos/kimi/agents",
+        "--tmpfs",
+        SANDBOX_CREDENTIAL_ROOT,
+        "--dir",
+        SANDBOX_CREDENTIAL_ROOT,
+        "--ro-bind-fd",
+        str(credential.descriptor),
+        SANDBOX_CREDENTIAL_LEAF,
+        "--remount-ro",
+        SANDBOX_CREDENTIAL_ROOT,
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/workspace",
+        "--chdir",
+        "/workspace",
+    ]
+    for name, value in build_kimi_environment().items():
+        argv.extend(("--setenv", name, value))
+    argv.extend(
+        (
+            "--",
+            "/usr/bin/python3",
+            SANDBOX_LOCAL_AUTH_LAUNCHER,
+            str(credential.device),
+            str(credential.inode),
+        )
+    )
+    return argv
+
+
+def default_local_auth_spec() -> KimiLocalAuthSpec:
+    return KimiLocalAuthSpec(
+        executable=Path(
+            "/home/brand/.local/share/agenticos/provider-qualification/"
+            "kimi-code/0.36.1/runtime/bin/kimi"
+        ),
+        bundle=REPO_ROOT / "qualification" / "kimi-code" / "0.36.1",
+        namespace_launcher=(
+            REPO_ROOT
+            / "src"
+            / "agenticos"
+            / "providers"
+            / "kimi_local_auth_namespace.py"
+        ),
+        state_root=REAL_PROVIDER_STATE_ROOT,
+        evidence_root=REAL_EVIDENCE_ROOT,
     )
 
 
