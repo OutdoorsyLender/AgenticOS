@@ -1981,6 +1981,10 @@ class _StaticCaptureStream:
     def close(self) -> None:
         self._stream.close()
 
+    @property
+    def closed(self) -> bool:
+        return self._stream.closed
+
 
 class _ScriptedProcess:
     def __init__(
@@ -2094,6 +2098,8 @@ def _run_scripted_process(
     drain_effect: Callable[[_ScriptedProcess], None] | None = None,
     drain_is_controller: bool = False,
     drain_error: bool = False,
+    freeze_pending_reason: str | None = None,
+    drain_pending_reason: str | None = None,
     monotonic: Callable[[], float] | None = None,
     timeout_seconds: float = 0.5,
 ):
@@ -2118,6 +2124,8 @@ def _run_scripted_process(
             member_pids=(process.pid,),
             controller_stop_sent=True,
             all_members_stopped=True,
+            pending_signals_clear=freeze_pending_reason is None,
+            pending_reason_code=freeze_pending_reason,
         )
 
     def drain(
@@ -2149,6 +2157,14 @@ def _run_scripted_process(
         return local_auth_runtime.LocalAuthDrainProvenance(
             frozen=frozen,
             frozen_state_observed=frozen_state_observed,
+            pending_signals_clear_before_kill=(
+                frozen_state_observed and drain_pending_reason is None
+            ),
+            pending_reason_code=(
+                drain_pending_reason
+                if frozen_state_observed
+                else "LOCAL_AUTH_PROCESS_CRASH"
+            ),
             controller_signal=controller_signal,
             controller_signal_sent=controller_signal is not None,
             group_disappeared=process.returncode is not None,
@@ -2403,6 +2419,213 @@ def test_la_r03_stuck_reader_blocks_even_after_valid_terminal(
     assert elapsed < 0.5
 
 
+def test_la_r03_sustained_readable_stdout_stops_at_first_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    stdout_fd = process.stdout.fileno()
+    original_read = os.read
+    clock = [0.0]
+    select_calls = [0]
+    stdout_reads = [0]
+
+    def always_readable(
+        descriptors: list[int],
+        _writable: list[int],
+        _exceptional: list[int],
+        _timeout: float,
+    ) -> tuple[list[int], list[int], list[int]]:
+        select_calls[0] += 1
+        clock[0] += 0.001
+        if select_calls[0] > 20:
+            raise OSError("synthetic select budget exhausted")
+        return list(descriptors), [], []
+
+    def sustained_read(descriptor: int, size: int) -> bytes:
+        if descriptor != stdout_fd:
+            return original_read(descriptor, size)
+        stdout_reads[0] += 1
+        if stdout_reads[0] == 1:
+            return original_read(descriptor, size)
+        return b"x" * 8_192
+
+    monkeypatch.setattr(local_auth_runtime.select, "select", always_readable)
+    monkeypatch.setattr(local_auth_runtime.os, "read", sustained_read)
+
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        monotonic=lambda: clock[0],
+        timeout_seconds=0.05,
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_STDOUT_FRAME_LIMIT"
+    assert drains == [process.pid]
+    assert stdout_reads == [10]
+    assert select_calls == [10]
+    assert process.stdout.closed is True
+    assert process.stderr.closed is True
+
+
+def test_la_r03_repeated_eagain_makes_bounded_no_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    stdout_fd = process.stdout.fileno()
+    original_read = os.read
+    clock = [0.0]
+    select_calls = [0]
+    stdout_reads = [0]
+
+    def spuriously_readable(
+        descriptors: list[int],
+        _writable: list[int],
+        _exceptional: list[int],
+        _timeout: float,
+    ) -> tuple[list[int], list[int], list[int]]:
+        select_calls[0] += 1
+        clock[0] += 0.001
+        if select_calls[0] > 12:
+            raise OSError("synthetic EAGAIN spin budget exhausted")
+        return list(descriptors), [], []
+
+    def eagain_after_terminal(descriptor: int, size: int) -> bytes:
+        if descriptor != stdout_fd:
+            return original_read(descriptor, size)
+        stdout_reads[0] += 1
+        if stdout_reads[0] == 1:
+            return original_read(descriptor, size)
+        raise BlockingIOError(errno.EAGAIN, "synthetic no progress")
+
+    monkeypatch.setattr(local_auth_runtime.select, "select", spuriously_readable)
+    monkeypatch.setattr(local_auth_runtime.os, "read", eagain_after_terminal)
+
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        monotonic=lambda: clock[0],
+        timeout_seconds=0.05,
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_CAPTURE_READER_STUCK"
+    assert outcome.census.cleanup_complete is False
+    assert drains == [process.pid]
+    assert stdout_reads[0] <= 4
+    assert select_calls[0] <= 4
+    assert process.stdout.closed is True
+    assert process.stderr.closed is True
+
+
+def test_la_r03_capture_discards_retained_bytes_at_first_limit() -> None:
+    stdout = _StaticCaptureStream(b"")
+    stderr = _StaticCaptureStream(b"")
+    capture = local_auth_runtime._LocalAuthCapture(stdout, stderr)
+    try:
+        capture._consume_stdout(b"x" * (65_536 + 1))
+        with pytest.raises(local_auth_runtime._LocalAuthRunFailure) as rejected:
+            capture._raise_error()
+        assert rejected.value.code == "LOCAL_AUTH_STDOUT_FRAME_LIMIT"
+        assert capture._stdout_buffer == bytearray()
+        assert tuple(capture._frames) == ()
+
+        capture._consume_stdout(b"must-not-be-retained")
+        assert capture._stdout_buffer == bytearray()
+        assert tuple(capture._frames) == ()
+    finally:
+        stdout.close()
+        stderr.close()
+
+
+def test_la_r03_capture_preserves_exact_frame_and_count_bounds() -> None:
+    stdout = _StaticCaptureStream(b"")
+    stderr = _StaticCaptureStream(b"")
+    capture = local_auth_runtime._LocalAuthCapture(stdout, stderr)
+    try:
+        capture._consume_stdout((b"x" * 65_535) + b"\n")
+        capture._raise_error()
+        assert tuple(map(len, capture._frames)) == (65_536,)
+
+        capture._frames.clear()
+        capture._frame_count = 0
+        capture._consume_stdout(b"{}\n" * 4)
+        capture._raise_error()
+        assert tuple(capture._frames) == (b"{}\n",) * 4
+
+        capture._consume_stdout(b"{}\n")
+        with pytest.raises(local_auth_runtime._LocalAuthRunFailure) as rejected:
+            capture._raise_error()
+        assert rejected.value.code == "LOCAL_AUTH_STDOUT_FRAME_COUNT"
+        assert capture._stdout_buffer == bytearray()
+        assert tuple(capture._frames) == ()
+    finally:
+        stdout.close()
+        stderr.close()
+
+
+def test_la_r03_select_error_is_typed_and_drains_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+
+    def fail_select(*_args: object) -> tuple[list[int], list[int], list[int]]:
+        raise OSError("synthetic select failure")
+
+    monkeypatch.setattr(local_auth_runtime.select, "select", fail_select)
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+    )
+
+    assert outcome.reason_code == "LOCAL_AUTH_CAPTURE_READER_FAILED"
+    assert drains == [process.pid]
+    assert process.stdout.closed is True
+    assert process.stderr.closed is True
+
+
+@pytest.mark.parametrize("fault_stream", ["stdout", "stderr"])
+def test_la_r03_stream_read_error_is_typed_and_drains_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_stream: str,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    fault_fd = getattr(process, fault_stream).fileno()
+    original_read = os.read
+
+    def fail_one_stream(descriptor: int, size: int) -> bytes:
+        if descriptor == fault_fd:
+            raise OSError("synthetic stream read failure")
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(local_auth_runtime.os, "read", fail_one_stream)
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+    )
+
+    assert outcome.reason_code == "LOCAL_AUTH_CAPTURE_READER_FAILED"
+    assert drains == [process.pid]
+    assert process.stdout.closed is True
+    assert process.stderr.closed is True
+
+
 def test_la_r05_r07_descendant_or_cleanup_uncertainty_cannot_succeed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2516,12 +2739,11 @@ def test_la_r07_independent_signal_during_drain_cannot_retain_complete(
     assert drains == [process.pid]
 
 
-@pytest.mark.parametrize("controller_signal", [signal.SIGTERM, signal.SIGKILL])
-def test_la_r07_only_typed_controller_signal_action_can_complete(
+def test_la_r07_only_typed_controller_sigkill_action_can_complete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    controller_signal: int,
 ) -> None:
+    controller_signal = signal.SIGKILL
     process = _ScriptedProcess(
         io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
     )
@@ -2553,6 +2775,154 @@ def test_la_r07_only_typed_controller_signal_action_can_complete(
     assert process.frozen is True
     assert frozen_at_census == [True]
     assert process.controller_signals == [controller_signal]
+    assert drains == [process.pid]
+
+
+def test_la_r07_injected_controller_sigterm_cannot_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        drain_effect=lambda observed: setattr(
+            observed,
+            "returncode",
+            -signal.SIGTERM,
+        ),
+        drain_is_controller=True,
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == "LOCAL_AUTH_PROCESS_CRASH"
+    assert outcome.census.cleanup_complete is True
+    assert process.controller_signals == [signal.SIGTERM]
+    assert drains == [process.pid]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_clear", "expected_reason"),
+    [
+        (
+            "Name:\tpython3\nSigPnd:\t0000000000000000\n"
+            "ShdPnd:\t0000000000000000\n",
+            True,
+            None,
+        ),
+        (
+            "Name:\tpython3\nSigPnd:\t0000000000000000\n"
+            f"ShdPnd:\t{1 << (signal.SIGTERM - 1):016x}\n",
+            False,
+            "LOCAL_AUTH_PROCESS_CRASH",
+        ),
+        (
+            f"SigPnd:\t{1 << (signal.SIGSYS - 1):016x}\n"
+            "ShdPnd:\t0000000000000000\n",
+            False,
+            "LOCAL_AUTH_NETWORK_POLICY_VIOLATION",
+        ),
+    ],
+)
+def test_la_r07_pending_signal_status_reduces_to_typed_provenance(
+    status: str,
+    expected_clear: bool,
+    expected_reason: str | None,
+) -> None:
+    observed = local_auth_runtime._parse_pending_signal_status(status)
+
+    assert observed == (expected_clear, expected_reason)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "SigPnd:\t0000000000000000\n",
+        "ShdPnd:\t0000000000000000\n",
+        (
+            "SigPnd:\t0000000000000000\n"
+            "SigPnd:\t0000000000000000\n"
+            "ShdPnd:\t0000000000000000\n"
+        ),
+        "SigPnd:\tgarbage\nShdPnd:\t0000000000000000\n",
+        "SigPnd:\t00000000000000000\nShdPnd:\t0000000000000000\n",
+    ],
+)
+def test_la_r07_pending_signal_status_is_strict_and_fail_closed(
+    status: str,
+) -> None:
+    with pytest.raises(KimiLocalAuthRuntimeError) as rejected:
+        local_auth_runtime._parse_pending_signal_status(status)
+    assert rejected.value.code == "LOCAL_AUTH_FREEZE_FAILED"
+
+
+@pytest.mark.parametrize(
+    "pending_reason",
+    [
+        "LOCAL_AUTH_PROCESS_CRASH",
+        "LOCAL_AUTH_NETWORK_POLICY_VIOLATION",
+    ],
+)
+def test_la_r07_pre_census_pending_signal_blocks_with_typed_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_reason: str,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    census_calls: list[int] = []
+
+    def forbidden_census(
+        observed: _ScriptedProcess,
+        _argv: list[str],
+    ) -> local_auth_runtime.LocalAuthCensus:
+        census_calls.append(observed.pid)
+        return _valid_runner_census()
+
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        census_effect=forbidden_census,
+        freeze_pending_reason=pending_reason,
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == pending_reason
+    assert census_calls == []
+    assert drains == [process.pid]
+
+
+@pytest.mark.parametrize(
+    "pending_reason",
+    [
+        "LOCAL_AUTH_PROCESS_CRASH",
+        "LOCAL_AUTH_NETWORK_POLICY_VIOLATION",
+    ],
+)
+def test_la_r07_pre_kill_pending_signal_blocks_with_typed_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_reason: str,
+) -> None:
+    process = _ScriptedProcess(
+        io.BytesIO(INITIALIZE_SUCCESS + AUTHENTICATE_SUCCESS)
+    )
+    outcome, _credential, _launches, drains = _run_scripted_process(
+        tmp_path,
+        monkeypatch,
+        process,
+        drain_pending_reason=pending_reason,
+    )
+
+    assert outcome.protocol.qualification is QualificationState.BLOCKED
+    assert outcome.reason_code == pending_reason
+    assert outcome.census.cleanup_complete is True
+    assert process.controller_signals == [signal.SIGKILL]
     assert drains == [process.pid]
 
 
@@ -2618,7 +2988,7 @@ def test_la_r01_slow_cleanup_cannot_complete_after_absolute_deadline(
 
     def slow_drain(observed: _ScriptedProcess) -> None:
         clock[0] = 0.6
-        observed.returncode = -signal.SIGTERM
+        observed.returncode = -signal.SIGKILL
 
     outcome, _credential, _launches, drains = _run_scripted_process(
         tmp_path,

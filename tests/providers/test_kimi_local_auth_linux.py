@@ -318,6 +318,8 @@ def test_controller_freezes_then_kills_exact_process_group_with_typed_provenance
         assert frozen.member_pids == (process.pid,)
         assert frozen.controller_stop_sent is True
         assert frozen.all_members_stopped is True
+        assert frozen.pending_signals_clear is True
+        assert frozen.pending_reason_code is None
 
         provenance = local_auth_runtime._drain_local_auth_process_group(
             process,
@@ -325,10 +327,62 @@ def test_controller_freezes_then_kills_exact_process_group_with_typed_provenance
         )
         assert provenance.frozen == frozen
         assert provenance.frozen_state_observed is True
+        assert provenance.pending_signals_clear_before_kill is True
+        assert provenance.pending_reason_code is None
         assert provenance.controller_signal == signal.SIGKILL
         assert provenance.controller_signal_sent is True
         assert provenance.group_disappeared is True
         assert provenance.final_returncode == -signal.SIGKILL
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("queued_signal", "expected_reason"),
+    [
+        (signal.SIGTERM, "LOCAL_AUTH_PROCESS_CRASH"),
+        (signal.SIGSYS, "LOCAL_AUTH_NETWORK_POLICY_VIOLATION"),
+    ],
+)
+def test_frozen_pending_fatal_signal_cannot_be_masked_by_controller_sigkill(
+    queued_signal: int,
+    expected_reason: str,
+) -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={},
+        close_fds=True,
+        start_new_session=True,
+    )
+    try:
+        frozen = local_auth_runtime._freeze_local_auth_process_group(
+            process,
+            local_auth_runtime.time.monotonic() + 1.0,
+            local_auth_runtime.time.monotonic,
+        )
+        os.killpg(process.pid, queued_signal)
+
+        provenance = local_auth_runtime._drain_local_auth_process_group(
+            process,
+            frozen,
+        )
+
+        assert provenance.frozen_state_observed is True
+        assert provenance.controller_signal == signal.SIGKILL
+        assert provenance.controller_signal_sent is True
+        assert provenance.group_disappeared is True
+        assert provenance.final_returncode == -signal.SIGKILL
+        assert provenance.pending_signals_clear_before_kill is False
+        assert provenance.pending_reason_code == expected_reason
+        assert local_auth_runtime._controller_drain_succeeded(
+            frozen,
+            provenance,
+        ) is False
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
