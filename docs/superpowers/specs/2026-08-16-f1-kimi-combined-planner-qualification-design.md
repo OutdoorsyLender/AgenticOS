@@ -3,7 +3,7 @@
 ## Status and authorization boundary
 
 ```text
-F1_KIMI_PLANNER_QUALIFICATION_DESIGN=READY_FOR_FINAL_REVIEW
+F1_KIMI_PLANNER_QUALIFICATION_DESIGN=RECONCILIATION_REVIEW_CANDIDATE
 DESIGN_WORK_AUTHORIZED=YES
 WRITTEN_SPEC_APPROVED=NO
 IMPLEMENTATION_AUTHORIZED=NO
@@ -17,7 +17,8 @@ REAL_CREDENTIAL_ACCESS_AUTHORIZED=NO
 PROVIDER_NETWORK_AUTHORIZED=NO
 MODEL_INFERENCE_AUTHORIZED=NO
 F2_AUTHORIZED=NO
-AUTHORITATIVE_BASELINE=b08a6ddf2955f56dce50a86b03c8b9bf2824b48e
+RECONCILIATION_STARTING_COMMIT=ea3df47ced709c7d8be2ebca15b75eedf91a091f
+SPECIFICATION_PREDECESSOR_COMMIT=ea3df47ced709c7d8be2ebca15b75eedf91a091f
 KIMI_VERSION=0.36.1
 KIMI_SOURCE_COMMIT=13d86f8b7bb2443a3b8222e7d94deb0a66429f8e
 KIMI_EXECUTABLE_SHA256=78c07b255e0bdc8dfe90d0cbd3204a3d862957394a08ca99c6e31144732451c7
@@ -53,8 +54,34 @@ or obscure that historical record.
 - **Active Model:** OpenAI GPT-5 (Codex). The runtime exposed no finer service
   point-version identifier; no unexposed version is inferred.
 - **Task Scope:** Level-A design remediation for F1 Kimi Planner Qualification
-  (Strategy B) against the completed independent review
+  (Strategy B) against the recoverable review record
 - **Work Mode:** Pure design and documentation (no source code implementation, no network egress, no credential access)
+
+## Reconciliation provenance and governing status
+
+This section records what was actually recovered. It is normative whenever an
+older statement in this document conflicts with it.
+
+| Artifact or claim | Classification | Reconciliation result |
+| --- | --- | --- |
+| Original independent eight-finding review artifact | `E. NOT_RECOVERABLE` | Repository history, both clone reflogs, registered worktrees, stashes, unreachable objects, and local task artifacts contained no original reviewer-authored artifact. |
+| Eight finding texts | `B. RETAINED_EXTERNAL_OR_LOCAL_EVIDENCE` | The exact two Critical, four Important, and two Minor finding texts survive only in a local derivative remediation authorization/transcription. This is enough to reconcile the specification, but not to claim the original review was independently preserved. |
+| Historical Level-1 `attempt.json` / `result.json` | `B. RETAINED_EXTERNAL_OR_LOCAL_EVIDENCE`, uncommitted controller-format evidence | The evidence remains outside Git under the historical `level1-local-auth` namespace. `attempt.json` SHA-256 is `0ebda5f82ecbe1a974043d85b000e9a6e2dba3fddb5a3b8db0ce68c6d2fe1216`; `result.json` SHA-256 is `df1fc78cfd887632853b7476100f328134e4ba1029714b7673b8020d79e0de40`. It records attempt 1 and `BLOCKED` / `AUTH_METHOD_SHAPE`. Neither file contains a timestamp, and neither digest was committed contemporaneously; artifact presence/content is verified, but contemporaneity and chain of custody are not independently verifiable. |
+| Earlier resolution table in this document | `C. COMMITTED_ATTESTATION` / remediation-author self-assessment | It was not an independently recoverable review result. Its labels are superseded by the candidate disposition table below and by a new independent review. |
+| Redirect-multiplication blocker at `741a3b50` | `D. RECONSTRUCTABLE_FROM_IMMUTABLE_TECHNICAL_ARTIFACTS` | This blocker alone is independently auditable from committed Git history. |
+| `ea3df47ced709c7d8be2ebca15b75eedf91a091f` | `RECONCILIATION_STARTING_COMMIT` | This is chronology and input identity only. It is not approval, reviewer endorsement, or proof that its claims were earned. |
+
+The historical evidence path observed during archaeology is user-specific and
+non-normative. No credential file or provider authentication state was read.
+Future implementations must receive a controller-owned
+`AOS_CONTROLLER_EVIDENCE_ROOT` and derive versioned role paths beneath it.
+
+```text
+INDEPENDENT_REVIEW_SOURCE_STATE=PARTIAL
+HISTORICAL_LEVEL1_PRIMARY_EVIDENCE=PRESENT
+HISTORICAL_LEVEL1_EVIDENCE_LIMITATION=CONTEMPORANEITY_AND_CHAIN_OF_CUSTODY_NOT_INDEPENDENTLY_VERIFIABLE
+REVIEW_TRANSCRIPTION_AUTHORITY=DERIVATIVE_ONLY
+```
 
 ## Strategy decision
 
@@ -93,9 +120,11 @@ NO_GENERAL_PROVIDER_INTERNET=YES
 CREDENTIAL_CONTENT_ACCESSED_BY_AGENTICOS=NO
 ```
 
-This remains `STRATEGY_B=VIABLE_WITH_CORRECTIONS`; the corrections in this
-document make the selected strategy internally consistent but do not authorize
-implementation or a real run.
+This remains
+`STRATEGY_B=CONDITIONALLY_VIABLE_BLOCKED_BEFORE_REAL_GATE`. The design is
+reviewable, but a real gate requires the synthetic qualifications and explicit
+owner request-multiplication risk choice specified below. Nothing here
+authorizes implementation or a real run.
 
 ## Exact-source findings that constrain the design
 
@@ -106,17 +135,51 @@ and the exact production configuration. They are not live-provider evidence.
 | Concern | Source-bound conclusion |
 | --- | --- |
 | OAuth transport | `packages/oauth/src/oauth.ts::postForm()` calls global `fetch()` without `redirect: "manual"` or another explicit redirect-deny policy. |
-| OAuth retry loop | `refreshAccessToken()` uses `maxRetries ?? 3` as the total top-level fetch-call loop bound. It does not bound requests produced inside one fetch by redirects. |
+| OAuth retry loop | `refreshAccessToken()` uses `maxRetries ?? 3` as exactly three total top-level fetch calls, with 1-second and 2-second retry delays. It does not bound requests produced inside one fetch by redirects. |
 | Credential storage | `FileTokenStorage` selects `credentials/kimi-code.json`. `save()` creates `kimi-code.json.tmp.<decimal-pid>.<8-lowercase-hex>`, writes the complete JSON, calls file `fsync`, closes, `chmod(0600)`, and renames over the leaf. It does not fsync the parent directory. |
-| Refresh lock | Production passes the Kimi home as `configDir`. On Linux the OAuth manager prepares task-local `oauth/kimi-code`, and `proper-lockfile` transiently creates `oauth/kimi-code.lock`; failure to prepare or acquire the lock fails refresh. |
-| Model transport | The OpenAI legacy adapter constructs pinned `openai@6.34.0` with `maxRetries: 0`, but supplies no explicit redirect-deny policy. |
-| Model 401 recovery | `KimiForCodingProvider.resolveAuth()` may force one refresh and replay after a structured in-process `APIStatusError` 401. The live opaque mediator cannot see that status; revoking auth and consuming the model-tunnel allowance makes the replay unreachable on the network. |
-| Proxy installation | The exact CLI installs its global proxy dispatcher before constructing clients and recognizes lowercase `https_proxy`; exact-binary testing must still prove both OAuth and model traffic use only the admitted proxy. |
+| Refresh lock and ordering | Production passes the Kimi home as `configDir`. On Linux the OAuth manager prepares task-local `oauth/kimi-code`; `proper-lockfile` transiently creates sibling `oauth/kimi-code.lock`. The lock covers the re-read, refresh, save/tombstone, and is released in `finally`; a changed stored token can short-circuit a waiting forced refresh. |
+| Fetch redirect engine | The Kimi source declares Node `24.15.0` in `.nvmrc` and its release workflow consumes that file; Node `24.15.0` bundles Undici `7.24.4`. That source defaults fetch to `redirect="follow"` and permits the initial request plus 20 redirects. A `301`/`302` after POST and `303` after a non-GET/HEAD change the next request to GET with no body; `307`/`308` preserve POST method and body. The qualified executable's embedded runtime identity still needs exact-binary proof. |
+| Model transport | The OpenAI legacy adapter constructs pinned `openai@6.34.0` with `maxRetries: 0`, supplies no explicit redirect policy, and calls fetch without `redirect`. Therefore SDK retry count zero does not disable fetch redirects. |
+| Model 401 recovery and ordering | `resolveAuth()` calls `buildAuth(false)` before the first model request. It may then force one refresh and replay after a structured in-process `APIStatusError` 401; a second 401 fails. The live opaque mediator cannot see that status. Process exclusion, storage freezing, and permanently spent tunnel authority must make the replay unreachable on the network. |
+| Proxy installation | The exact CLI installs its global proxy dispatcher before constructing clients. It recognizes lowercase proxy variables before uppercase variants. Invalid proxy configuration is source-level fail-open to direct networking, so AgenticOS must reject it before launch and must scrub all alternate proxy variables. |
+| Update/telemetry suppression | The pinned source exits update preflight when `KIMI_CODE_NO_AUTO_UPDATE` is set. Production config disables telemetry. Exact-binary loopback tests must still prove that no background DNS, CONNECT, update, or telemetry request occurs. |
 
 Therefore a single admitted end-to-end TLS tunnel is not proof of one HTTP
 request. The same-origin `301`, `302`, `303`, `307`, or `308` behavior of both
 transports is compatibility evidence to characterize, not a mediator-enforced
 request-count invariant.
+
+These are immutable-source conclusions, not exact-binary runtime proof. The
+source locations were verified at Kimi commit
+`13d86f8b7bb2443a3b8222e7d94deb0a66429f8e`, Node commit
+`848430679556aed0bd073f2bc263331ad84fa119`, and OpenAI Node commit
+`35feb5357e8be6e8a720dee01a899d401d3486cb`. Binary provenance, redirect
+connection reuse, proxy behavior, TLS handshake shape, and background behavior
+remain synthetic-qualification obligations.
+
+`KIMI_NAMESPACE_LAUNCHER_SHA256` is the SHA-256 of the canonical Git blob
+content for
+`src/agenticos/providers/kimi_local_auth_namespace.py` at
+`RECONCILIATION_STARTING_COMMIT=ea3df47ced709c7d8be2ebca15b75eedf91a091f`,
+as emitted by native WSL Git and hashed as LF bytes. It is not a hash
+of a Windows working-tree rendering. The executable, config, source commit,
+dependency lock, and this launcher blob identity must all match before
+synthetic qualification or a later real authorization can be considered.
+
+The immutable source observations are reproducible at these exact locations:
+
+| Repository commit | Location | Observation |
+| --- | --- | --- |
+| Kimi `13d86f8` | `.nvmrc` and `.github/workflows/release.yml` | source/release workflow selects Node `24.15.0`; this does not alone prove the embedded runtime in the qualified executable |
+| Kimi `13d86f8` | `packages/oauth/src/oauth.ts:59-82,226-289` | fetch has no redirect override; three total refresh calls |
+| Kimi `13d86f8` | `packages/oauth/src/storage.ts:41-117` | sibling temp, write, file fsync, close, chmod, rename; no parent fsync |
+| Kimi `13d86f8` | `packages/oauth/src/oauth-manager.ts:175-235,303-397` | lock layout, retry/stale policy, lock scope, re-read, refresh/save/tombstone, release |
+| Kimi `13d86f8` | `packages/agent-core/src/utils/proxy.ts:51-100,260-317` and `apps/kimi-code/src/main.ts:144-150` | proxy precedence, invalid-proxy direct fallback, early global dispatcher installation |
+| Kimi `13d86f8` | `packages/agent-core-v2/src/kosong/provider/bases/openai/openai-legacy.ts:758-780` | OpenAI client uses `maxRetries: 0` without redirect policy |
+| Kimi `13d86f8` | `packages/node-sdk/src/kimi-code-model-provider.ts:106-140` | auth before request; one structured-401 forced-refresh replay path |
+| Kimi `13d86f8` | `apps/kimi-code/src/cli/update/preflight.ts:425-434,698-709` | `KIMI_CODE_NO_AUTO_UPDATE` disables update preflight |
+| Node `8484306` | `deps/undici/src/lib/web/fetch/request.js:908` and `index.js:1249-1329` | redirect default, 20-redirect limit, and method/body transitions |
+| OpenAI Node `35feb53` | `src/client.ts:430-448,625-700,862-895,996-1005` | retry default/override path and fetch call without redirect override |
 
 ## Normative request accounting
 
@@ -129,33 +192,89 @@ The six counts are distinct and must never be collapsed into a generic
 | `MODEL_ALLOWANCE_CLAIM_COUNT` | `<= 1` | `DIRECT_MEDIATOR_ENFORCEMENT`; remains consumed after any post-claim failure |
 | `MODEL_TUNNEL_ADMISSION_COUNT` | `<= 1` | `DIRECT_MEDIATOR_ENFORCEMENT` |
 | `AUTH_TUNNEL_ADMISSION_COUNT` | `<= 3` | `DIRECT_MEDIATOR_ENFORCEMENT`; three is the separately approved defense-in-depth tunnel bound |
-| `MODEL_HTTP_REQUEST_COUNT` | No live exact bound | `NOT_DIRECTLY_OBSERVABLE_UNDER_OPAQUE_TLS` |
-| `AUTH_HTTP_REQUEST_COUNT` | No live exact bound | `NOT_DIRECTLY_OBSERVABLE_UNDER_OPAQUE_TLS` |
+| `MODEL_HTTP_REQUEST_COUNT` | Source-only upper bound `<= 42`; composed AgenticOS target `<= 21`; no live observation | Kimi permits an initial model fetch chain and one post-401 replay chain; each is an initial request plus at most 20 redirects. The target requires synthetic proof that forced refresh cannot complete and the replay callback cannot execute. |
+| `AUTH_HTTP_REQUEST_COUNT` | Source-only upper bound `<= 126`; composed AgenticOS target `<= 63`; no live observation | Initial `buildAuth(false)` and post-401 `buildAuth(true)` can each cause a three-fetch refresh episode; every top-level fetch can contain an initial request plus 20 redirects. The target requires proof that the second episode is unreachable. |
 | `PLANNER_PROPOSAL_COUNT` | `<= 1` | `DIRECT_CONTROLLER_ENFORCEMENT` |
 | `SDK_RETRY_CONFIGURATION` | `0` for the model SDK | `SOURCE_BOUND_CONFIGURATION` |
-| `OAUTH_TOP_LEVEL_FETCH_CALL_BOUND` | `<= 3` when refresh runs | `SOURCE_BOUND_CONFIGURATION`, not a wire-request observation |
+| `OAUTH_TOP_LEVEL_FETCH_CALL_BOUND` | Source-only `<= 6` across two possible refresh episodes; composed target `<= 3` | `SOURCE_BOUND_CONFIGURATION` plus unimplemented AgenticOS exclusion, not a wire-request observation |
 | `LOOP_ATTEMPT_COUNT` | `<= 1` | `DIRECT_CONTROLLER_OBSERVATION` plus `SOURCE_BOUND_CONFIGURATION` |
 | `LOOP_STEP_COUNT` | `<= 1` | `DIRECT_CONTROLLER_OBSERVATION` plus `SOURCE_BOUND_CONFIGURATION` |
 
-The earned live security claim is limited to one controller prompt, one model
-tunnel admission, no second model tunnel, no cross-host redirect egress, no
-auth reopening after model admission, model SDK retries configured to zero,
-one loop attempt, one loop step, and at most one accepted proposal. Same-origin
-HTTP request multiplication remains not directly observable by AgenticOS under
-opaque TLS.
+A later implemented, synthetically qualified, separately authorized successful
+live run could earn only: one controller prompt, one model tunnel admission, no
+second model tunnel, no cross-host redirect egress, no auth reopening after
+model admission, model SDK retries configured to zero, one loop attempt, one
+loop step, and at most one accepted proposal. None is earned by this design
+document. Same-origin HTTP request multiplication remains not directly
+observable by AgenticOS under opaque TLS. The source-derived bounds constrain
+risk; they are not direct live counts and do not prove billing, quota, or
+provider execution semantics.
 
 ```text
 ACP_REAL_PROMPT_COUNT<=1
 MODEL_TUNNEL_ADMISSION_COUNT<=1
-NO_SECOND_MODEL_TUNNEL=GUARANTEED
-NO_CROSS_HOST_REDIRECT_EGRESS=GUARANTEED
-NO_AUTH_REOPEN_AFTER_MODEL_ADMISSION=GUARANTEED
+NO_SECOND_MODEL_TUNNEL=DESIGN_REQUIRED_GUARANTEE
+NO_CROSS_HOST_REDIRECT_EGRESS=DESIGN_REQUIRED_GUARANTEE
+NO_AUTH_REOPEN_AFTER_MODEL_ADMISSION=DESIGN_REQUIRED_GUARANTEE
 SDK_CONFIGURED_RETRIES=0
 LOOP_ATTEMPTS=1
 LOOP_STEPS=1
-MODEL_HTTP_REQUEST_COUNT=NOT_DIRECTLY_OBSERVABLE_UNDER_OPAQUE_TLS
-AUTH_HTTP_REQUEST_COUNT=NOT_DIRECTLY_OBSERVABLE_UNDER_OPAQUE_TLS
+SOURCE_ONLY_MODEL_HTTP_REQUEST_COUNT<=42_NOT_LIVE_OBSERVED
+SOURCE_ONLY_AUTH_HTTP_REQUEST_COUNT<=126_NOT_LIVE_OBSERVED
+COMPOSED_TARGET_MODEL_HTTP_REQUEST_COUNT<=21_CONDITIONAL_ON_SYNTHETIC_PROOF
+COMPOSED_TARGET_AUTH_HTTP_REQUEST_COUNT<=63_CONDITIONAL_ON_SYNTHETIC_PROOF
 ```
+
+### Request multiplication adjudication
+
+Four designs were considered:
+
+1. **Strict one upstream HTTP request with the stock binary:** rejected as
+   unprovable. An opaque tunnel counts connections, not encrypted HTTP
+   requests.
+2. **One ACP prompt and one model tunnel, accepting bounded opaque
+   multiplication:** technically representable, but owner risk acceptance is
+   still required. Before the AgenticOS exclusions are proved, the source-only
+   envelope is up to 42 model HTTP requests, including up to 42 POST-equivalent
+   executions through `307`/`308`, and up to 126 OAuth HTTP requests. The
+   composed target is 21 model and 63 OAuth only after exact-binary synthetic
+   proof makes the post-401 forced-refresh/replay episode unreachable.
+3. **Disable redirects in the client:** preferred for a strict one-request
+   claim, but not available through the pinned stock Kimi artifact. It requires
+   a new client/wrapper build, new executable identity, and complete
+   requalification.
+4. **TLS-terminating/counting mediator:** can count HTTP requests but is rejected
+   because it exposes credential and prompt traffic to AgenticOS and violates
+   the selected credential-blind end-to-end TLS boundary.
+
+For the stock-artifact option, the consequence envelope is:
+
+| Behavior | Bound and consequence |
+| --- | --- |
+| Model `307`/`308` chains on reused connections | Source-only: two chains of at most 21 body-preserving model POST requests, hence up to 42 provider-side executions, quota charges, or billable events. Composed target: one chain and at most 21. AgenticOS cannot tell whether the provider executes or charges any member. |
+| Model `301`/`302`/`303` chains | Each chain's initial POST can be followed by GET requests without the body. The source-only HTTP bound is 42, but it does not make every member a source-proven POST execution. Provider quota/rate-limit treatment remains opaque. |
+| Redirect requiring a new TCP/TLS connection | Any second model CONNECT must be denied by the composed design. Whether Undici reuses the admitted tunnel or reaches that denial for each exact response shape is an exact-binary synthetic fact, not a source-only guarantee. |
+| OAuth redirect/retry sequence | Source-only: at most 126 HTTP requests across six top-level fetch calls in two refresh episodes. Composed target: at most 63 across the initial episode. These are not model executions, but may consume authentication rate quota or trigger account/provider controls. |
+| Model 401 recovery | The source can force refresh and replay once, yielding the 42/126 pre-proof envelope. The composed design must spend/revoke network authority so refresh cannot complete and the replay callback cannot execute; exact process/storage exclusion must also prove that stored-token change, concurrency, or a pre-open connection cannot bypass that result. |
+
+The 64-KiB upstream model quota does not independently tighten the numeric bound
+until an exact-binary loopback fixture measures a conservative minimum
+encrypted-byte cost per request:
+
+```text
+SOURCE_ONLY_MODEL_HTTP_REQUEST_BOUND =
+  min(42, floor(65536 / MIN_EXACT_TLS_UPSTREAM_BYTES_PER_REQUEST))
+COMPOSED_TARGET_MODEL_HTTP_REQUEST_BOUND =
+  min(21, floor(65536 / MIN_EXACT_TLS_UPSTREAM_BYTES_PER_REQUEST))
+```
+
+The exact encoded request size and redirect response/connection shape are not
+established by this design. Plaintext prompt length is not a valid substitute.
+The real gate remains
+blocked until either a newly qualified redirect-disabled artifact exists or the
+owner explicitly accepts the composed 21-model/63-auth target after synthetic
+proof reduces the pre-proof 42-model/126-auth source envelope. Until then, the
+larger source-only bounds govern risk.
 
 ## Component trust boundaries and non-reuse rationale
 
@@ -320,7 +439,14 @@ servers:
   authority alone is never trusted as a fallback.
 - Any second ClientHello after the first accepted ClientHello, including a
   HelloRetryRequest-driven re-handshake, yields `BLOCKED` and closes the tunnel.
-  Renegotiation or re-handshake cannot obtain a second SNI decision.
+  Renegotiation or re-handshake cannot obtain a second SNI decision. TLS 1.3
+  permits a legitimate second ClientHello after HelloRetryRequest; therefore
+  this conservative rule has a known compatibility risk and is not earned
+  until the exact binary passes both no-HRR and forced-HRR loopback fixtures.
+  A future relaxation may accept exactly one syntactically valid HRR-driven
+  second ClientHello only after separate parser/state-machine qualification
+  proving the same visible SNI, no ECH, no extra authority, and no third
+  ClientHello.
 - The mediator does not modify, intercept, or resign TLS certificates.
 - The Kimi client independently verifies the Moonshot origin X.509 certificate
   against the bundled CA trust store.
@@ -443,11 +569,88 @@ The normative network state machine governs all egress authority:
 | **ClientHello Buffer Max** | 4,096 bytes | Incremental fail-closed SNI/ECH inspection; exact-binary qualification required |
 | **DNS Resolution Timeout** | 2.0 seconds | Async DNS deadline |
 | **Origin Connect Timeout** | 5.0 seconds | TCP handshake deadline |
-| **Handshake Idle Timeout** | 5.0 seconds | Post-CONNECT TLS handshake deadline |
-| **Encrypted Relay Idle Timeout** | 30.0 seconds | Byte-inactivity deadline; mediator does not parse SSE |
+| **Initial TLS Server-Progress Timeout** | 5.0 seconds | From CONNECT success to the first downstream origin TLS record; this opaque progress check does not claim handshake completion and does not end the 90-second first-ACP-content deadline |
 | **Max Upstream Model Bytes** | 65,536 bytes (64 KiB) | Bidirectional stream byte counter |
 | **Max Downstream Model Bytes** | 262,144 bytes (256 KiB) | Bidirectional stream byte counter |
-| **Total Task Execution Timeout** | 60.0 seconds | Global controller process deadline |
+| **Pre-Auth Startup/Control Timeout** | 10.0 seconds | From `T0` immediately before namespace/process launch through controller dispatch of `authenticate` |
+| **Auth/ACP-to-Model-Admission Timeout** | 100.0 seconds | From immediately before controller dispatch of `authenticate` through successful auth drain/freeze and model CONNECT success; covers three source-owned 30-second OAuth attempts, 1+2 seconds backoff, and 7 seconds for bounded ACP/control work |
+| **Model Time-to-First-Allowed-ACP-Content** | 90.0 seconds | Controller-owned absolute deadline from model CONNECT success/tunnel admission to the first non-empty content-bearing `session/update` accepted by the ACP validator |
+| **Pre-Result Encrypted Relay Idle Timeout** | 90.0 seconds | Mediator idle allowance from model admission until an authenticated controller transition; TLS handshake/application bytes do not end the controller's absolute first-content deadline |
+| **Established-Output Encrypted Relay Idle Timeout** | 30.0 seconds | Begins only after the controller signals `FIRST_ALLOWED_MODEL_CONTENT_OBSERVED`; resets on encrypted relay progress, without parsing TLS/SSE |
+| **Worst-Case Active Response Allocation** | 28.0 seconds | Remaining workload budget when startup, auth, and first-ACP-content phases each consume their maximum |
+| **Cleanup Reserve** | 12.0 seconds | Reserved after every terminal/failure path; cannot be consumed by provider phases |
+| **Total Task Execution Timeout** | 240.0 seconds | Global controller deadline including reserved cleanup |
+
+### Single-attempt timeout, lifecycle, and background-risk disposition
+
+`T0` is sampled immediately before namespace/process launch. Four
+non-overlapping workload clocks then run in order: pre-auth startup/control
+ends immediately before controller dispatches `authenticate`; auth/ACP begins
+at that same boundary and ends only after the first model CONNECT has completed
+auth drain/freeze and received CONNECT success; model first-content begins at
+CONNECT success and ends only when the controller's ACP validator accepts the
+first non-empty content-bearing `session/update`; then active-response time
+runs until terminal output or the workload cutoff.
+
+The opaque mediator never interprets handshake, application, HTTP, SSE, or model
+bytes. Before first accepted ACP content it uses the 90-second pre-result relay
+idle allowance while the controller independently enforces the absolute
+90-second first-content deadline. On first accepted content, the controller
+sends one authenticated, task/generation-bound
+`FIRST_ALLOWED_MODEL_CONTENT_OBSERVED` transition over the private control
+channel. Only that transition enables the 30-second established-output idle
+policy. Missing, duplicate, wrong-task, early, or late transitions fail closed.
+
+The complete worst-case inequality is:
+
+```text
+10s PRE_AUTH_STARTUP_CONTROL
++ 100s AUTH_ACP_TO_MODEL_ADMISSION
++ 90s MODEL_TIME_TO_FIRST_ALLOWED_ACP_CONTENT
++ 28s ACTIVE_RESPONSE
+= 228s WORKLOAD_CUTOFF
++ 12s CLEANUP_RESERVE
+= 240s HARD_CONTROLLER_DEADLINE
+```
+
+At `T0 + 228 seconds` the controller must revoke authority and begin cleanup,
+leaving the separate 12-second reserve before `T0 + 240 seconds`. Phase caps
+never extend either absolute deadline. Faster/no-refresh phases donate unused
+time to the active-response interval only; they never widen any individual
+phase cap. Synthetic qualification must demonstrate deterministic clock
+transitions and that no timeout path consumes the cleanup reserve.
+
+The earlier 60-second total could terminate the source-owned OAuth sequence
+before its third allowed attempt and was not a sound one-shot envelope. The
+reconciled limits above are candidate bounds, not implemented or qualified
+facts. Before any real gate, loopback-only exact-binary tests must cover:
+
+- boundary cases immediately below and above DNS, connect, handshake, auth,
+  first-ACP-content, pre-result relay idle, established-output inter-byte idle,
+  cleanup, and total deadlines, including
+  startup 9.9/10.1, auth 99.9/100.1, 59.9/60.1 regression points,
+  completed TLS followed by provider inference silence for 89.9/90.1,
+  first-ACP-content 89.9/90.1, worst-case active response 27.9/28.1, workload cutoff
+  227.9/228.1, cleanup 11.9/12.1, and total 239.9/240.1 seconds;
+- keep-alive, response-close, reconnect, redirect reuse/new-tunnel, half-close,
+  stuck relay, parent death, and termination at every state transition;
+- one, two, and three OAuth top-level fetch calls; refresh temp creation,
+  file-fsync, rename, lock release, freeze/revalidation, and interruption on
+  both sides of every durability transition;
+- forced TLS 1.3 HelloRetryRequest, normal no-HRR, oversized ClientHello, ECH,
+  changed SNI, second/third ClientHello, and cleanup after each rejection;
+- valid lowercase proxy routing, invalid-proxy preflight rejection, alternate
+  upper/lowercase and `ALL_PROXY`/`NO_PROXY` scrubbing, and proof that the
+  source's invalid-proxy direct fallback is unreachable;
+- exactly the approved auth/model DNS and CONNECT census, with
+  `KIMI_CODE_NO_AUTO_UPDATE=1` and telemetry disabled, proving no update,
+  telemetry, background, fallback, or hidden inference attempt; and
+- existing cgroup/freezer composition, recursive kill, bounded cleanup within
+  the reserved 12 seconds, and zero process, namespace, listener, socket,
+  tunnel, mount, temp, lock, or frozen-orphan residue.
+
+No one-shot risk acceptance is implied by writing these bounds. The disposition
+remains `SYNTHETIC_QUALIFICATION_AND_OWNER_RISK_ACCEPTANCE_REQUIRED`.
 
 ## Credential and authentication boundary
 
@@ -605,8 +808,9 @@ Controller                                             Kimi 0.36.1 Client
 2. **`authenticate`:** The controller sends `methodId="login"`. The Kimi client
    validates local credentials. If authentication fails, the controller halts
    immediately before any session or network model request is attempted.
-3. **`session/new`:** Sent with `workDir="/workspace"` and `mcpServers=[]`. The
-   controller verifies that the session binds the immutable default model.
+3. **`session/new`:** Sent with `workDir="/workspace"` and `mcpServers=[]`. Its
+   result proves only ACP protocol progression and returns a session identifier;
+   it does not independently attest the provider, base URL, or model identity.
 4. **`session/prompt`:** Exactly one prompt is sent for the lifetime of the
    controller (`ACP_REAL_PROMPT_COUNT <= 1`).
 5. **Terminal Result:** The controller accumulates streaming message chunks
@@ -656,6 +860,13 @@ loop_control.max_steps_per_turn = 1
 - **Single Step Turn:** `LoopService.run()` is constrained to
   `max_steps_per_turn=1` and `max_attempts_per_step=1`.
 - **No Fallback Provider:** No secondary or fallback model configurations exist.
+
+The model identity claim is earned only by positive equality of immutable
+`config.toml` bytes and digest, validated read-only mount/blob identity, the
+pinned source/executable/dependency/launcher identities, a sterile environment
+that cannot mutate configuration, and exact-binary synthetic qualification of
+the resolved adapter/model/base URL. Neither `session/new` nor a successful
+response independently attests model identity.
 
 ## Planner runtime, prompt, and output boundary
 
@@ -723,18 +934,24 @@ schema `AOS_KIMI_PLANNER_PROMPT/1` (< 4 KiB):
 - **Validation Pipeline:**
   1. Strict JSON parsing (no trailing commas, no duplicate keys, no markdown fences);
   2. `PlannerProposal.from_dict` schema validation;
-  3. DAG compiler dry-run (validates dependencies and policy bounds);
-  4. Authoritative task ID assignment check.
-- **No Direct Board Mutation:** Qualification proves compiler acceptance only; no live board state is modified.
+  3. future pure compile-preview validation of dependencies and policy bounds;
+  4. future non-mutating authoritative task-ID preview check.
+- **No Direct Board Mutation:** The current
+  `compile_planner_proposal` implementation mutates board state through
+  `add_tasks` and stage completion; it has no dry-run mode. It must not be
+  invoked by qualification. A separately implemented and reviewed pure
+  compile-preview interface is new work and is required before the synthetic
+  gate. Until then, compiler acceptance and no-board-mutation are unearned.
 
 ## Evidence architecture and versioned schemas
 
 ### Dedicated qualification namespace
 
-Evidence is stored in a completely separate, versioned namespace:
+Future evidence must be stored in a completely separate, versioned,
+controller-selected namespace:
 
 ```text
-/home/brand/.local/share/agenticos/controller-evidence/
+$AOS_CONTROLLER_EVIDENCE_ROOT/
   kimi-code/0.36.1/planner-qualification-v1/
     attempt.json
     result.json
@@ -744,6 +961,10 @@ The historical Level-1 evidence directory (`.../level1-local-auth/`) is
 immutable and never modified.
 
 ### Versioned schemas
+
+Every schema and field in this section is
+`PROPOSED_NOT_IMPLEMENTED_OR_QUALIFIED`. Naming it in this document creates no
+writer, durability, authority, or evidence claim.
 
 #### Attempt schema: `AOS_KIMI_PLANNER_QUALIFICATION_ATTEMPT/1`
 
@@ -834,7 +1055,7 @@ inference failures use the conservative class below.
 
 Planner lifecycle must compose the already-qualified
 `agenticos.providers.kimi_local_auth_freezer` controller-excluding
-systemd/cgroup-v2 design. The independent review called this subsystem
+systemd/cgroup-v2 design. The retained derivative review transcription called this subsystem
 `KimiLocalAuthFreezer`; at the authorized baseline its concrete lifecycle API
 is the module's identity-bound `WorkloadCgroup` and associated controller APIs.
 Implementation must reuse that qualified behavior, not invent a parallel
@@ -932,7 +1153,7 @@ HTTP request count into a mediator-enforced invariant.
 | 36 | A valid exact-client ClientHello of at most 4096 bytes is accepted under exact production TLS/config. |
 | 37 | A ClientHello larger than 4096 bytes is rejected without truncation or relay. |
 | 38 | ECH extension `0xfe0d`, hidden/missing SNI, and every qualified obscuring ECH form reject. |
-| 39 | Any second ClientHello, renegotiation, re-handshake, or HelloRetryRequest path blocks and closes the tunnel. |
+| 39 | Normal no-HRR and forced TLS 1.3 HRR are characterized. Under the conservative candidate policy, HRR's legitimate second ClientHello blocks and closes the tunnel; this compatibility risk is explicit rather than treated as proof of malformed traffic. |
 | 40 | Exact lowercase `https_proxy=http://127.0.0.1:18080` is honored by OAuth. |
 | 41 | The same exact lowercase proxy is honored by the Kimi/OpenAI model stack. |
 | 42 | No default route, ambient DNS, uppercase proxy, `ALL_PROXY`, SOCKS, `no_proxy`, or inherited network FD exists. |
@@ -943,7 +1164,7 @@ HTTP request count into a mediator-enforced invariant.
 | 47 | Pending auth DNS/connect work is cancelled, active relays are interrupted, workers join by deadline, registry empties, and queued accepts are absent before model admission. |
 | 48 | Failure or crash after model allowance claim but before admission leaves the allowance spent, auth revoked, model unadmitted, and qualification blocked. |
 | 49 | A source-owned model authorization recovery attempt cannot reopen auth or obtain a second model tunnel. |
-| 50 | Exactly one `session/new` binds the exact immutable provider/model/base URL with empty workspace and no MCP. |
+| 50 | Exactly one `session/new` proves protocol progression with empty workspace and no MCP; separate immutable config/mount/source/binary evidence binds provider/model/base URL. |
 | 51 | Exactly one controller `session/prompt` is admitted; duplicate, concurrent, or post-terminal prompts reject. |
 | 52 | Exactly one bounded Planner proposal may be accepted; a second candidate rejects. |
 | 53 | Model SDK retries are zero, loop attempts are one, loop steps are one, and no fallback/background inference obtains another tunnel. |
@@ -951,7 +1172,7 @@ HTTP request count into a mediator-enforced invariant.
 | 55 | Exact pinned source and runtime testing establish the allowed ACP callback/event set; every unknown, tool, filesystem, terminal, permission, elicitation, MCP, skill, plugin, hook, or subagent callback blocks. |
 | 56 | ACP frame/transcript, prompt, output, byte, fd, pid, memory, connection, idle, and total-time bounds fail closed. |
 | 57 | The canonical public prompt is byte-stable, under 4 KiB, and contains no secret, repository, or user-private data. |
-| 58 | One strict one-task `AOSPLAN/1` object validates and compilation dry-run assigns authority only in the controller. |
+| 58 | One strict one-task `AOSPLAN/1` object validates through a new pure compile-preview interface; the current mutating `compile_planner_proposal` is never invoked by qualification. |
 | 59 | Duplicate keys, extra fields, prose/fences, multiple tasks, invalid DAG/enums/limits, and compiler-policy failures reject with no board mutation. |
 | 60 | Credential, Authorization, Cookie, prompt, response, and TLS synthetic canaries are absent from controller, mediator, ACP, evidence, exceptions, and logs. |
 | 61 | The live evidence schema records each field's observation/inference provenance and rejects direct TLS-version, HTTP-status, server-auth, and HTTP-count overclaims. |
@@ -962,6 +1183,13 @@ HTTP request count into a mediator-enforced invariant.
 | 66 | SIGTERM, SIGKILL, parent death, EOF, stuck half-close, cleanup deadline, and evidence-write failure all fail closed without restored authority. |
 | 67 | Historical `level1-local-auth` evidence remains byte-for-byte unchanged and disjoint from `planner-qualification-v1`. |
 | 68 | Exact candidate passes focused native WSL tests, broader regressions, Windows portable regressions, static/compile checks, secret scan, complete diff review, and `git diff --check`. |
+| 69 | Pinned Undici follows at most 20 redirects per top-level fetch; model 307/308 preserve POST/body; source-only 42-model/126-auth envelopes and composed 21-model/63-auth targets are reproduced locally without provider contact. |
+| 70 | Exact encrypted upstream bytes are measured for redirect cases and any byte-quota-derived request bound uses the conservative TLS-byte minimum, never plaintext size. |
+| 71 | Source-level ordering is reproduced: `buildAuth(false)` precedes the initial model call, exactly one 401 recovery is attempted, storage-change short-circuit remains process-excluded, and no recovery obtains new auth or model authority. |
+| 72 | The exact non-overlapping clock origins and complete 10+100+90+28=228 workload inequality are enforced; startup, OAuth attempts 1/2/3 and 1+2-second backoffs, completed TLS followed by 89.9/90.1 seconds of inference silence, first allowed ACP content, authenticated transition to 30-second established-output idle, active response, 227.9/228.1 workload cutoff, 12-second cleanup, and 240-second total boundaries pass just below and fail just above. |
+| 73 | Keep-alive, response-close, reconnect, redirect reuse/new-tunnel, half-close, stuck relay, parent death, and every cgroup/process termination transition preserve spent authority and zero residue. |
+| 74 | `KIMI_CODE_NO_AUTO_UPDATE=1`, telemetry-off config, sterile proxy variables, and loopback census prove no update, telemetry, background DNS/CONNECT, fallback provider, or hidden inference attempt. |
+| 75 | `AOS_CONTROLLER_EVIDENCE_ROOT` is controller-selected and user-independent; all planner schemas remain proposed until their writer, durability, and fail-closed behavior are implemented and qualified. |
 
 ## Conditional implementation outline (not authorized)
 
@@ -1010,45 +1238,52 @@ Checkpoint `741a3b50` correctly identified
 `OPAQUE_SAME_ORIGIN_REDIRECT_REQUEST_MULTIPLICATION`: one opaque TLS tunnel can
 carry more than one same-origin HTTP request. Checkpoint `b08a6ddf` removed the
 blocker text without resolving that protocol fact. This remediation does not
-rewrite either commit. It resolves the specification error by separating
+rewrite either commit. It corrects the specification by separating
 tunnel and HTTP accounting, requiring exact-binary redirect characterization,
 preserving one-prompt and one-model-tunnel enforcement, and retaining
 end-to-end TLS plus credential blindness. Redirect characterization is
 compatibility evidence, not a new live HTTP-count guarantee.
 
-## Self-review against the independent findings
+## Remediation-author candidate disposition against the retained finding transcription
 
-| Severity | Independent finding | Result | Specification resolution |
+This table is a self-assessment against derivative finding text. It is not the
+missing original review and cannot substitute for the new independent review.
+
+| Severity | Transcribed finding | Candidate disposition | Specification correction |
 | --- | --- | --- | --- |
-| Critical 1 | Opaque TLS does not prove one HTTP request | `RESOLVED` | Six distinct counts, normative authority table, redirect reality, ten exact-binary redirect cases, earned/prohibited claims, and permanent history note. |
-| Critical 2 | Credential refresh requires directory write authority | `RESOLVED` | Descriptor/kernel-identity-bound dedicated credential directory, exact temp/save behavior, ephemeral OAuth lock tmpfs, metadata-only validation, refresh-state gate, and interruption/ambiguity rules. |
-| Important 1 | Opaque mediator cannot directly classify HTTP status | `RESOLVED` | Status-derived live classes removed; `PROVIDER_INFERENCE_FAILED` added; free-form parsing prohibited; no structured subset claimed. |
-| Important 2 | Reuse the qualified M4B address classifier | `RESOLVED` | Direct composition of `validate_address` and `AOSADDR/1`; parallel table forbidden; complete applicable class coverage required. |
-| Important 3 | Correct ClientHello, ECH, and second-ClientHello handling | `RESOLVED` | Proposed 4096-byte qualified bound, fail-closed oversize, explicit `0xfe0d`/ECH rejection, and second-ClientHello closure. |
-| Important 4 | Reuse the qualified process/cgroup lifecycle | `RESOLVED` | Existing `kimi_local_auth_freezer`/`WorkloadCgroup` behavior is normative; parallel process-group cleanup is forbidden. |
-| Minor 1 | ACP terminology was ambiguous | `RESOLVED` | Negotiated wire protocol is ACP Protocol Version 1 (`protocolVersion=1`); "ACP v2" is forbidden for the wire protocol. |
-| Minor 2 | Evidence confused observation and inference | `RESOLVED` | Per-field provenance, `END_TO_END_ORIGIN_TLS`, synthetic-only negotiated version, and inferred server-auth wording replace direct overclaims. |
+| Critical 1 | Opaque TLS does not prove one HTTP request | `CORRECTED_REAL_GATE_BLOCKED` | The false one-wire-request claim is prohibited; source-only 42-model/126-auth envelopes, conditional composed 21-model/63-auth targets, four options, byte-quota limits, synthetic proof, and explicit owner risk acceptance are normative. |
+| Critical 2 | Credential refresh requires directory write authority | `CORRECTED_PENDING_SYNTHETIC_PROOF` | Descriptor/kernel-identity-bound dedicated credential directory, exact temp/save behavior, ephemeral OAuth lock tmpfs, metadata-only validation, refresh-state gate, and interruption/ambiguity rules. |
+| Important 1 | Opaque mediator cannot directly classify HTTP status | `CORRECTED` | Status-derived live classes removed; `PROVIDER_INFERENCE_FAILED` added; free-form parsing prohibited; no structured subset claimed. |
+| Important 2 | Reuse the qualified M4B address classifier | `CORRECTED_PENDING_IMPLEMENTATION` | Direct composition of `validate_address` and `AOSADDR/1`; parallel table forbidden; complete applicable class coverage required. |
+| Important 3 | Correct ClientHello, ECH, and second-ClientHello handling | `CORRECTED_PENDING_SYNTHETIC_PROOF` | Proposed 4096-byte bound, ECH rejection, and explicit legitimate-HRR compatibility risk require no-HRR and forced-HRR qualification. |
+| Important 4 | Reuse the qualified process/cgroup lifecycle | `CORRECTED_PENDING_IMPLEMENTATION` | Existing `kimi_local_auth_freezer`/`WorkloadCgroup` behavior is normative; parallel process-group cleanup is forbidden. |
+| Minor 1 | ACP terminology was ambiguous | `CORRECTED` | Negotiated wire protocol is ACP Protocol Version 1 (`protocolVersion=1`); "ACP v2" is forbidden for the wire protocol. |
+| Minor 2 | Evidence confused observation and inference | `CORRECTED` | Per-field provenance, `END_TO_END_ORIGIN_TLS`, synthetic-only negotiated version, and inferred server-auth wording replace direct overclaims. |
 
 ```text
-CRITICAL_UNRESOLVED=0
-IMPORTANT_UNRESOLVED=0
-MINOR_UNRESOLVED=0
+CANDIDATE_AUTHOR_CRITICAL_UNRESOLVED=0
+CANDIDATE_AUTHOR_IMPORTANT_UNRESOLVED=0
+CANDIDATE_AUTHOR_MINOR_UNRESOLVED=0
+INDEPENDENT_REVIEW_NOT_YET_RECORDED=YES
 ```
 
 ## Next gate
 
 ```text
-F1_KIMI_PLANNER_QUALIFICATION_DESIGN=READY_FOR_FINAL_REVIEW
+F1_KIMI_PLANNER_QUALIFICATION_DESIGN=RECONCILIATION_REVIEW_CANDIDATE
 STRATEGY_B_COMBINED_SINGLE_REAL_PLANNER_QUALIFICATION=SELECTED
-STRATEGY_B=VIABLE_WITH_CORRECTIONS
+STRATEGY_B=CONDITIONALLY_VIABLE_BLOCKED_BEFORE_REAL_GATE
 IMPLEMENTATION_AUTHORIZED=NO
 REAL_PLANNER_REQUEST_AUTHORIZED=NO
 REAL_LEVEL1_RETRY_AUTHORIZED=NO
 HISTORICAL_REAL_ATTEMPT_COUNT=1
-CRITICAL_UNRESOLVED=0
-IMPORTANT_UNRESOLVED=0
-MINOR_UNRESOLVED=0
-NEXT_GATE=FINAL_INDEPENDENT_ARCHITECTURAL_REVIEW_REQUIRED
+CANDIDATE_AUTHOR_CRITICAL_UNRESOLVED=0
+CANDIDATE_AUTHOR_IMPORTANT_UNRESOLVED=0
+CANDIDATE_AUTHOR_MINOR_UNRESOLVED=0
+REQUEST_MULTIPLICATION_DISPOSITION=SOURCE_ENVELOPE_42_126_COMPOSED_TARGET_21_63_PENDING_SYNTHETIC_PROOF_AND_OWNER_RISK_ACCEPTANCE
+KIMI_UPSTREAM_ASSUMPTIONS=PARTIAL
+SINGLE_ATTEMPT_RISK_DISPOSITION=SYNTHETIC_QUALIFICATION_AND_OWNER_RISK_ACCEPTANCE_REQUIRED
+NEXT_GATE=NEW_INDEPENDENT_ADVERSARIAL_REVIEW_REQUIRED
 ```
 
 HARD STOP.
